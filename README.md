@@ -15,6 +15,8 @@
 | gpt.qt.cool 签到 | gpt.qt.cool 签到，Playwright + OpenCV 滑动验证码自动识别，登录态 storage_state 缓存复用 | [gptqtcool_checkin/README.md](gptqtcool_checkin/README.md) | `task gptqtcool_checkin/gptqtcool_checkin.py` |
 | 司机社签到 | xsijishe 司机社签到，Cookie 直签或邮箱 + 本地 ddddocr OCR 登录，Cookie 缓存复用 | [xsijishe_checkin/README.md](xsijishe_checkin/README.md) | `task xsijishe_checkin/xsijishe_checkin.py` |
 | 采蘑菇论坛回帖签到 | caimogu.cc 自动回帖刷活跃度，Playwright 驱动 + AI/模板双模式评论生成（反套话词库、REPLY/SKIP 判定、防重复回帖） | [caimogu_checkin/README.md](caimogu_checkin/README.md) | `task caimogu_checkin/caimogu_checkin.py` |
+| DZZI.AI 自动签到 | New API 站签到，多账号批量、已签到自动跳过（幂等） | [dzzi-auto-checkin/README.md](dzzi-auto-checkin/README.md) | `task dzzi-auto-checkin/checkin.py` |
+| 雨云自动签到 | 雨云服务器签到 + 自动续费，多账号 + 验证码识别，专为青龙面板优化 | [Rainyun/README.md](Rainyun/README.md) | `task Rainyun/main.py` |
 | 天翼云盘签到 | cloud189-sdk 登录签到，多账号 + 个人/家庭容量统计，复用 sendNotify.js 全通道推送 | [Cloud189Checkin/README.md](Cloud189Checkin/README.md) | `task Cloud189Checkin/src/app.js` |
 
 ## 迁移提醒
