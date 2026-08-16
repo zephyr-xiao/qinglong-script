@@ -1,0 +1,258 @@
+# whos.tv 签到
+
+适配青龙面板的 whos.tv 签到脚本，支持 **Cookie** 和 **账号密码** 两种认证方式。
+
+> ⚠️ **浏览器方案说明**：whos.tv 已启用 Cloudflare Managed Challenge 人机验证，
+> 纯 HTTP 库（`requests` / `curl_cffi`）即使伪造 UA、Cookie、TLS 指纹也会被
+> 403 挑战页拦截（已实测）。因此脚本改为 **DrissionPage 驱动真实浏览器内核**，
+> 自动通过挑战后，再在浏览器会话内调用接口。这是目前唯一可行的方案。
+
+站点：`https://whos.tv/`
+
+签到页：`https://whos.tv/points-center/tasks`
+
+## 功能特点
+
+- 支持 **Cookie 认证**（直接复制 Cookie 字符串）；
+- 支持 **账号密码认证**（自动登录获取 Cookie，无需手动维护）；
+- 两种方式可同时使用；
+- 支持多账号，使用 `&` 分隔；
+- 支持代理，适合大陆网络访问受限场景；
+- 自动通过 Cloudflare 人机验证挑战；
+- 自动探测签到接口；
+- 支持"已签到"幂等识别；
+- 支持青龙 `notify.py` 推送；
+- Debug 模式可输出探测路径、状态码和响应片段。
+
+## 环境要求
+
+| 依赖 | 说明 |
+|---|---|
+| Python 包 | `drissionpage`（青龙「依赖管理」-「Python」中安装） |
+| 系统 | `chromium` + `xvfb`（青龙容器内执行下面的安装命令） |
+
+> 脚本启动 chromium 时已自动附带容器必备参数：`--no-sandbox`、`--disable-dev-shm-usage`
+> （Docker 容器 `/dev/shm` 默认仅 64MB，chromium 渲染进程会因共享内存不足而崩溃）、
+> `--disable-gpu`、`--no-first-run` 等，无需手动配置。
+>
+> 浏览器由脚本手动预启动（等待调试端口就绪最长 `WHOSTV_BROWSER_WAIT` 秒），启动日志
+> 全程写入 `/tmp/whostv_profile/<端口>/crash.log`，失败时据此定位启动卡死原因。
+
+青龙容器内安装命令：
+
+```bash
+docker exec -it qinglong bash
+apt-get update && apt-get install -y chromium xvfb
+pip install drissionpage
+```
+
+> `chromium` 包会自动带齐浏览器运行所需的系统依赖库。
+
+## 青龙任务命令
+
+> ⚠️ **必须用 `xvfb-run` 运行**：headless 无头模式实测会被 Cloudflare 拦截，
+> 青龙容器内没有显示器，需要用 xvfb 提供虚拟显示，浏览器以有头模式运行。
+
+```text
+xvfb-run -a task whos_tv_checkin/whos_tv_checkin.py
+```
+
+建议定时：
+
+```text
+15 8 * * *
+```
+
+## 环境变量
+
+| 变量名 | 必填 | 默认值 | 说明 |
+|---|---:|---|---|
+| `WHOSTV_COOKIE` | 二选一 | - | 完整 Cookie 字符串，多账号用 `&` 分隔 |
+| `WHOSTV_ACCOUNT` | 二选一 | - | 账号密码，格式 `用户名#密码`，多账号用 `&` 分隔 |
+| `WHOSTV_PROXY` | 建议 | - | HTTP/SOCKS 代理，国内网络通常必填 |
+| `WHOSTV_BROWSER_PATH` | 否 | 自动探测 | 指定 chromium 可执行文件路径（默认自动查找） |
+| `WHOSTV_NOTIFY` | 否 | `true` | 是否调用青龙 `notify.py` 推送 |
+| `WHOSTV_NOTIFY_ONLY_FAIL` | 否 | `false` | 仅当存在失败时才推送（需 `WHOSTV_NOTIFY=true`，全部成功则静默） |
+| `WHOSTV_TIMEOUT` | 否 | `30` | 接口请求超时时间，单位秒 |
+| `WHOSTV_BROWSER_WAIT` | 否 | `180` | 启动 chromium 后等待调试端口就绪的最大秒数（受限容器冷启动可能超过 DrissionPage 默认 30s） |
+| `WHOSTV_BROWSER_PORT` | 否 | `9222` | 浏览器调试端口，被其他进程占用时换一个（profile 目录随端口生成） |
+| `WHOSTV_DEBUG` | 否 | `false` | 输出探测细节（试过哪些路径、状态码、响应片段） |
+
+> `WHOSTV_COOKIE` 和 `WHOSTV_ACCOUNT` 至少配置一个。两者都配时，Cookie 账号先执行，账号密码账号后执行。
+
+代理示例：
+
+```text
+WHOSTV_PROXY=http://172.17.0.1:7890
+```
+
+或：
+
+```text
+WHOSTV_PROXY=socks5://172.17.0.1:7891
+```
+
+> 注意：脚本每次运行都会启动一次真实浏览器并等待 Cloudflare 挑战通过
+> （实测约 5~90 秒，波动较大），单次任务总耗时约 1~3 分钟属正常现象。
+
+## 认证方式
+
+### 方式一：Cookie 认证
+
+1. 浏览器登录 `https://whos.tv/`；
+2. 打开开发者工具；
+3. 进入 Network / 网络；
+4. 刷新页面或打开任务页；
+5. 找到请求头中的 `Cookie`；
+6. 复制完整 Cookie 字符串到青龙环境变量 `WHOSTV_COOKIE`。
+
+多账号示例：
+
+```text
+WHOSTV_COOKIE=cookie_for_account_1&cookie_for_account_2
+```
+
+### 方式二：账号密码认证
+
+直接配置账号和密码，脚本自动登录后签到，无需手动复制 Cookie。
+
+格式：`用户名#密码`，多账号用 `&` 分隔：
+
+```text
+WHOSTV_ACCOUNT=user1@mail.com#password1&user2@mail.com#password2
+```
+
+> 用户名可以是注册邮箱或用户名（与网页登录框一致，支持"邮箱 / 用户名"输入）。
+> 密码中如果包含 `#` 或 `&` 特殊字符，请确保青龙环境变量保存完整，不要换行截断。
+
+### 混合使用
+
+两种方式可同时配置，例如有 2 个 Cookie 账号 + 1 个账号密码：
+
+```text
+WHOSTV_COOKIE=cookie1&cookie2
+WHOSTV_ACCOUNT=user3@mail.com#password3
+```
+
+## 本地调试
+
+Linux / macOS：
+
+```bash
+export WHOSTV_ACCOUNT="user@mail.com#password"
+export WHOSTV_PROXY="http://127.0.0.1:7890"
+export WHOSTV_NOTIFY=false
+export WHOSTV_DEBUG=true
+python whos_tv_checkin.py
+```
+
+Windows PowerShell：
+
+```powershell
+$env:WHOSTV_ACCOUNT="user@mail.com#password"
+$env:WHOSTV_PROXY="http://127.0.0.1:7890"
+$env:WHOSTV_NOTIFY="false"
+$env:WHOSTV_DEBUG="true"
+python .\whos_tv_checkin.py
+```
+
+> 本地运行会弹出浏览器窗口，属正常现象（headless 会被 Cloudflare 拦截）。
+
+## 通知
+
+- 青龙环境中自动复用青龙 `notify.py`；
+- 设置 `WHOSTV_NOTIFY=false` 可关闭推送；
+- 标题按成败分档显示：`✅ 全部成功（N/N）` / `⚠️ 部分失败（M/N）` / `❌ 全部失败（0/N）`；
+- 正文为 Markdown 分组格式，顶部带 ⏰ 执行时间、📊 账号统计，结果按「成功 / 失败」分组列出；
+- 设置 `WHOSTV_NOTIFY_ONLY_FAIL=true` 可在本次全部成功时静默不推送（仅在有失败时才通知）；
+- 推送失败会自动重试最多 3 次；
+- 本地运行找不到 `notify.py` 时会跳过推送。
+
+## 常见问题
+
+### 报错"浏览器启动或挑战失败: The browser connection fails. Address: 127.0.0.1:9222"？
+
+这是 chromium 启动后 DrissionPage 连不上调试端口。脚本已改为**手动预启动 chromium，最长等待 180 秒**（`WHOSTV_BROWSER_WAIT` 可调）就绪后再连接，**启动日志全程写入 `/tmp/whostv_profile/<端口>/crash.log`**，方便定位真实原因。请按顺序排查：
+
+1. **确认容器已装 chromium 和 xvfb**（见上文"环境要求"），任务命令带 `xvfb-run -a` 前缀；
+2. **预启动超时**（日志提示"chromium 在 180 秒内未就绪"）：读取 `/tmp/whostv_profile/9222/crash.log` 尾部，并结合脚本输出的**磁盘 / 内存 / 浏览器进程数 / 代理连通性**判断。常见原因：
+   - 磁盘满或内存不足（chromium 写 profile / 临时文件卡住）→ 清理容器空间；
+   - 容器 CPU 受限导致冷启动极慢 → 把 `WHOSTV_BROWSER_WAIT` 调大到 300；
+   - 代理不可达（脚本会输出"❌ 代理 ... 不可达"）→ 改用容器内可达的代理地址，如 `http://172.17.0.1:7890`。
+3. 开启 `WHOSTV_DEBUG=true` 重跑，失败时脚本会输出**完整环境诊断**（chromium 路径 / xvfb / DISPLAY / /dev/shm / 磁盘 / 内存 / 进程数 / 代理连通性 / 手动启动 chromium 的 stderr），据此定位；
+4. 也可进容器手动验证 chromium 能否启动：
+
+```bash
+# 容器内手动试启动 chromium 并 curl 调试端口：
+xvfb-run -a timeout 30 chromium --no-sandbox --disable-dev-shm-usage \
+  --headless=new --remote-debugging-port=9223 about:blank & sleep 8; \
+  curl -s http://127.0.0.1:9223/json/version | head -3; \
+  kill %1 2>/dev/null
+```
+
+### 报错"登录失败: 响应非 JSON (HTTP 403)"？
+
+这是 Cloudflare 人机验证拦截了请求。请确认：
+
+- 青龙容器已安装 `chromium` 和 `xvfb`（见上文"环境要求"）；
+- 任务命令使用 `xvfb-run -a` 前缀（headless 无头模式会被拦截）；
+- `WHOSTV_PROXY` 配置正确，代理出口 IP 信誉正常。
+
+### 报错"Cloudflare 挑战未通过"？
+
+脚本会等待挑战最长 120 秒并重试 1 次。若仍失败：
+
+- 检查代理是否可用、出口 IP 是否被 Cloudflare 判定为高风险（共享/机房 IP 更容易触发）；
+- 换一个代理节点后重试；
+- 可开启 `WHOSTV_DEBUG=true` 观察浏览器启动与挑战状态。
+
+### 请求超时或连接失败？
+
+whos.tv 在大陆网络通常需要代理。请确认 `WHOSTV_PROXY` 在青龙容器内可访问。
+
+Docker 青龙常见代理值：
+
+```text
+http://172.17.0.1:7890
+```
+
+### 提示 Cookie 失效？
+
+- **Cookie 模式**：重新登录 whos.tv，复制新的完整 Cookie 字符串并更新 `WHOSTV_COOKIE`。
+- **账号模式**：Cookie 由脚本自动登录获取，一般不会出现此问题。如果遇到，可能是账号密码错误或被封禁，检查日志中的具体错误信息。
+
+### 账号密码登录失败？
+
+常见原因：
+
+- **密码错误**：日志会明确提示"登录失败: 密码错误"
+- **账号不存在**：检查用户名是否拼写正确
+- **网络不通**：确保 `WHOSTV_PROXY` 配置正确
+- **账号被封禁**：日志会提示"账号已被封禁"
+
+### 不知道脚本试了哪些接口？
+
+开启：
+
+```text
+WHOSTV_DEBUG=true
+```
+
+脚本会输出探测路径、状态码和响应片段，便于排查站点接口变化。
+
+### 多账号怎么配置？
+
+Cookie 模式用 `&` 分隔：
+
+```text
+WHOSTV_COOKIE=cookie1&cookie2&cookie3
+```
+
+账号密码模式用 `&` 分隔，每个账号内部用 `#` 分隔用户名和密码：
+
+```text
+WHOSTV_ACCOUNT=user1@mail.com#pass1&user2@mail.com#pass2
+```
+
+> 多账号共用同一浏览器实例，切换账号时会清空业务 Cookie 但保留
+> `cf_clearance`（与浏览器指纹绑定，清掉会重新触发挑战）。

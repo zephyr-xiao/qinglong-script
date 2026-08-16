@@ -1,0 +1,2 @@
+# 统一以 LF 换行存储（青龙容器为 Linux，避免 Windows CRLF 干扰脚本运行）
+* text=auto eol=lf

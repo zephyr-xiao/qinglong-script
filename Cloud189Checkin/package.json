@@ -1,0 +1,16 @@
+{
+  "name": "cloud189-checkin",
+  "version": "1.0.0",
+  "description": "天翼云盘(189)自动签到脚本（青龙面板）",
+  "main": "src/app.js",
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "cloud189-sdk": "^1.0.9",
+    "dotenv": "^17.4.2",
+    "log4js": "^6.9.1",
+    "superagent": "^10.3.0",
+    "undici": "^8.10.0"
+  }
+}

@@ -1,0 +1,7 @@
+[
+  {
+    "name": "雨云自动签到",
+    "command": "python3 main.py",
+    "schedule": "0 9 * * *"
+  }
+]

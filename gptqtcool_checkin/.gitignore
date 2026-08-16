@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# 环境与密钥
+.env
+
+# 日志和截图
+*.log
+artifacts/
+*.png
+
+# 登录态缓存（含 cookie/token 敏感信息，勿提交）
+gptqtcool_state.json
+
+# 系统文件
+.DS_Store
+Thumbs.db

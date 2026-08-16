@@ -1,0 +1,23 @@
+# 依赖目录（体积大，由 package-lock.json / requirements.txt 重建）
+node_modules/
+
+# Python 缓存
+__pycache__/
+*.py[cod]
+*$py.class
+
+# 验证码调试产物
+gptqtcool_checkin/artifacts/
+
+# 凭证与缓存（个人账号信息，严禁提交）
+.token/
+*_cookie.json
+cookies.json
+cookies/
+*.log
+.env
+
+# IDE
+.vscode/
+.idea/
+*.swp
