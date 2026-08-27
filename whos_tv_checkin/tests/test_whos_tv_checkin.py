@@ -5,13 +5,14 @@ whos_tv_checkin 单元测试（unittest 标准库，零新依赖）。
 运行方式（在 whos_tv_checkin 目录下）：
   python -m unittest discover -s tests -v
 
-依赖：drissionpage（与脚本运行时一致；本机未安装时跳过浏览器相关用例，
+依赖：patchright（与脚本运行时一致；本机未安装时跳过浏览器相关用例，
       纯函数用例仍执行）。
 
 重点覆盖网络级失败链路（v3 增强）：
   - browser_fetch 的哨兵前缀分类（__TIMEOUT__ / __NETWORK__ / __JSERROR__）
   - fetch_with_retry 仅对网络级失败重试、业务响应不重试
   - _do_signin 网络断连短路（不再白跑白名单探测）
+  - reset_cookies_keep_cf 仅回写 cf_clearance
 """
 import sys
 import types
@@ -23,29 +24,26 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 try:
     import whos_tv_checkin as wtc
-    HAS_DP = True
+    HAS_PR = True
 except SystemExit:
-    # 本机无 drissionpage 时脚本会 print 提示并 sys.exit(1)，此处打桩后重新加载
-    dp_stub = types.ModuleType("DrissionPage")
-    dp_stub.ChromiumOptions = type("ChromiumOptions", (), {})
-    dp_stub.ChromiumPage = type("ChromiumPage", (), {})
-    settings_mod = types.ModuleType("DrissionPage._functions.settings")
-    settings_mod.Settings = type("Settings", (), {"set_browser_connect_timeout": staticmethod(lambda v: None)})
-    dp_stub._functions = types.SimpleNamespace(settings=settings_mod)
-    sys.modules["DrissionPage"] = dp_stub
-    sys.modules["DrissionPage._functions"] = types.ModuleType("DrissionPage._functions")
-    sys.modules["DrissionPage._functions.settings"] = settings_mod
+    # 本机无 patchright 时脚本会 print 提示并 sys.exit(1)，此处打桩后重新加载
+    sync_api_stub = types.ModuleType("patchright.sync_api")
+    sync_api_stub.sync_playwright = lambda: None
+    pr_stub = types.ModuleType("patchright")
+    pr_stub.sync_api = sync_api_stub
+    sys.modules["patchright"] = pr_stub
+    sys.modules["patchright.sync_api"] = sync_api_stub
     import whos_tv_checkin as wtc
-    HAS_DP = False
+    HAS_PR = False
 
 
-@unittest.skipUnless(HAS_DP, "需要 drissionpage（仅影响 run_js 行为模拟的集成路径）")
+@unittest.skipUnless(HAS_PR, "需要 patchright（仅影响 evaluate 行为模拟的集成路径）")
 class TestBrowserFetch(unittest.TestCase):
-    """browser_fetch 哨兵前缀分类：模拟 DrissionPage run_js 的各种返回形态。"""
+    """browser_fetch 哨兵前缀分类：模拟 Patchright evaluate 的各种返回形态。"""
 
     def _page_returning(self, value):
         page = mock.MagicMock()
-        page.run_js.return_value = value
+        page.evaluate.return_value = value
         return page
 
     def test_success_response(self):
@@ -70,16 +68,16 @@ class TestBrowserFetch(unittest.TestCase):
         self.assertTrue(text.startswith("__NETWORK__"))
         self.assertIn("Failed to fetch", text)
 
-    def test_run_js_raises(self):
-        """run_js 抛 Python 异常 → __JSERROR__ 哨兵。"""
+    def test_evaluate_raises(self):
+        """evaluate 抛 Python 异常 → __JSERROR__ 哨兵。"""
         page = mock.MagicMock()
-        page.run_js.side_effect = Exception("CDP timeout")
+        page.evaluate.side_effect = Exception("CDP timeout")
         status, text = wtc.browser_fetch(page, "https://whos.tv/api/x")
         self.assertEqual(status, 0)
         self.assertTrue(text.startswith("__JSERROR__"))
 
     def test_non_dict_result(self):
-        """run_js 返回 None（老版本丢弃 promise 结果）→ __JSERROR__ 哨兵。"""
+        """evaluate 返回 None（异常形态丢弃结果）→ __JSERROR__ 哨兵。"""
         page = self._page_returning(None)
         status, text = wtc.browser_fetch(page, "https://whos.tv/api/x")
         self.assertEqual(status, 0)
@@ -172,6 +170,50 @@ class TestDoSigninShortCircuit(unittest.TestCase):
         ok, msg, call_cnt = self._run((False, "HTTP 500"))
         self.assertFalse(ok)
         self.assertGreater(call_cnt, 1, "业务失败应继续探测候选 URL")
+
+
+class TestResetCookiesKeepCf(unittest.TestCase):
+    """reset_cookies_keep_cf：清空业务 Cookie，仅回写 cf_clearance。"""
+
+    def _context_with(self, cookies):
+        ctx = mock.MagicMock()
+        ctx.cookies.return_value = cookies
+        return ctx
+
+    def test_keeps_only_cf_clearance(self):
+        cookies = [
+            {"name": "HYPERF_SESSION_ID", "value": "abc", "domain": ".whos.tv"},
+            {"name": "cf_clearance", "value": "tok", "domain": ".whos.tv"},
+            {"name": "other", "value": "x", "domain": "whos.tv"},
+        ]
+        ctx = self._context_with(cookies)
+        page = mock.MagicMock()
+        page.context = ctx
+        wtc.reset_cookies_keep_cf(page)
+        ctx.clear_cookies.assert_called_once()
+        # 回写的只有 cf_clearance 一条
+        written = ctx.add_cookies.call_args[0][0]
+        self.assertEqual(len(written), 1)
+        self.assertEqual(written[0]["name"], "cf_clearance")
+        self.assertEqual(written[0]["value"], "tok")
+
+    def test_no_cf_clearance_still_clears(self):
+        cookies = [{"name": "sid", "value": "abc", "domain": ".whos.tv"}]
+        ctx = self._context_with(cookies)
+        page = mock.MagicMock()
+        page.context = ctx
+        wtc.reset_cookies_keep_cf(page)
+        ctx.clear_cookies.assert_called_once()
+        ctx.add_cookies.assert_not_called()
+
+    def test_context_error_swallowed(self):
+        """Cookie 操作异常时不向外抛（登录会重设会话 Cookie）。"""
+        ctx = mock.MagicMock()
+        ctx.cookies.side_effect = Exception("context closed")
+        page = mock.MagicMock()
+        page.context = ctx
+        with mock.patch("builtins.print"):
+            wtc.reset_cookies_keep_cf(page)  # 不应抛异常
 
 
 class TestLoginMessage(unittest.TestCase):

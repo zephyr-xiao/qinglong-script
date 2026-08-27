@@ -4,8 +4,10 @@
 
 > ⚠️ **浏览器方案说明**：whos.tv 已启用 Cloudflare Managed Challenge 人机验证，
 > 纯 HTTP 库（`requests` / `curl_cffi`）即使伪造 UA、Cookie、TLS 指纹也会被
-> 403 挑战页拦截（已实测）。因此脚本改为 **DrissionPage 驱动真实浏览器内核**，
-> 自动通过挑战后，再在浏览器会话内调用接口。这是目前唯一可行的方案。
+> 403 挑战页拦截（已实测）。因此脚本改为 **Patchright（未检测版 Playwright）
+> 驱动真实浏览器内核**——无 `Runtime.enable` 等 CDP 自动化痕迹，可通过托管挑战；
+> 原版 Playwright 会被识别。自动通过挑战后，再在浏览器会话内调用接口。
+> 这是目前唯一可行的方案。
 
 站点：`https://whos.tv/`
 
@@ -28,22 +30,20 @@
 
 | 依赖 | 说明 |
 |---|---|
-| Python 包 | `drissionpage`（青龙「依赖管理」-「Python」中安装） |
+| Python 包 | `patchright`（青龙「依赖管理」-「Python」中安装） |
 | 系统 | `chromium` + `xvfb`（青龙容器内执行下面的安装命令） |
 
-> 脚本启动 chromium 时已自动附带容器必备参数：`--no-sandbox`、`--disable-dev-shm-usage`
-> （Docker 容器 `/dev/shm` 默认仅 64MB，chromium 渲染进程会因共享内存不足而崩溃）、
-> `--disable-gpu`、`--no-first-run` 等，无需手动配置。
->
-> 浏览器由脚本手动预启动（等待调试端口就绪最长 `WHOSTV_BROWSER_WAIT` 秒），启动日志
-> 全程写入 `/tmp/whostv_profile/<端口>/crash.log`，失败时据此定位启动卡死原因。
+> 脚本用 Patchright 的 `launch_persistent_context` 有头启动 chromium（启动超时上限
+> `WHOSTV_BROWSER_WAIT` 秒，失败时自动输出浏览器 stderr 摘要定位原因）；容器必需参数
+> （`--no-sandbox`、`--disable-dev-shm-usage` 等）已在 Patchright 默认参数表中，无需手动配置。
+> 若端口已有上次异常退出遗留的浏览器实例，脚本会走 CDP 接管复用，省一次冷启动。
 
 青龙容器内安装命令：
 
 ```bash
 docker exec -it qinglong bash
 apt-get update && apt-get install -y chromium xvfb
-pip install drissionpage
+pip install patchright
 ```
 
 > `chromium` 包会自动带齐浏览器运行所需的系统依赖库。
@@ -74,7 +74,7 @@ xvfb-run -a task whos_tv_checkin/whos_tv_checkin.py
 | `WHOSTV_NOTIFY` | 否 | `true` | 是否调用青龙 `notify.py` 推送 |
 | `WHOSTV_NOTIFY_ONLY_FAIL` | 否 | `false` | 仅当存在失败时才推送（需 `WHOSTV_NOTIFY=true`，全部成功则静默） |
 | `WHOSTV_TIMEOUT` | 否 | `30` | 接口请求超时时间，单位秒 |
-| `WHOSTV_BROWSER_WAIT` | 否 | `180` | 启动 chromium 后等待调试端口就绪的最大秒数（受限容器冷启动可能超过 DrissionPage 默认 30s） |
+| `WHOSTV_BROWSER_WAIT` | 否 | `180` | 启动 chromium 后等待就绪的最大秒数（受限容器冷启动可能较慢，同时作为 Patchright 启动超时） |
 | `WHOSTV_BROWSER_PORT` | 否 | `9222` | 浏览器调试端口，被其他进程占用时换一个（profile 目录随端口生成） |
 | `WHOSTV_DEBUG` | 否 | `false` | 输出探测细节（试过哪些路径、状态码、响应片段） |
 
@@ -175,16 +175,19 @@ python .\whos_tv_checkin.py
 
 ## 常见问题
 
-### 报错"浏览器启动或挑战失败: The browser connection fails. Address: 127.0.0.1:9222"？
+### 报错"浏览器启动或挑战失败: Timeout 180000ms exceeded"？
 
-这是 chromium 启动后 DrissionPage 连不上调试端口。脚本已改为**手动预启动 chromium，最长等待 180 秒**（`WHOSTV_BROWSER_WAIT` 可调）就绪后再连接，**启动日志全程写入 `/tmp/whostv_profile/<端口>/crash.log`**，方便定位真实原因。请按顺序排查：
+这是 chromium 启动超时（Patchright 等待 `WHOSTV_BROWSER_WAIT` 秒后放弃，报错自带
+浏览器 stderr 摘要）。请按顺序排查：
 
 1. **确认容器已装 chromium 和 xvfb**（见上文"环境要求"），任务命令带 `xvfb-run -a` 前缀；
-2. **预启动超时**（日志提示"chromium 在 180 秒内未就绪"）：读取 `/tmp/whostv_profile/9222/crash.log` 尾部，并结合脚本输出的**磁盘 / 内存 / 浏览器进程数 / 代理连通性**判断。常见原因：
+2. **启动超时**：结合报错中的 stderr 摘要，以及脚本输出的**磁盘 / 内存 / 浏览器进程数 /
+   代理连通性**判断。常见原因：
    - 磁盘满或内存不足（chromium 写 profile / 临时文件卡住）→ 清理容器空间；
    - 容器 CPU 受限导致冷启动极慢 → 把 `WHOSTV_BROWSER_WAIT` 调大到 300；
    - 代理不可达（脚本会输出"❌ 代理 ... 不可达"）→ 改用容器内可达的代理地址，如 `http://172.17.0.1:7890`。
-3. 开启 `WHOSTV_DEBUG=true` 重跑，失败时脚本会输出**完整环境诊断**（chromium 路径 / xvfb / DISPLAY / /dev/shm / 磁盘 / 内存 / 进程数 / 代理连通性 / 手动启动 chromium 的 stderr），据此定位；
+3. 开启 `WHOSTV_DEBUG=true` 重跑，失败时脚本会输出**完整环境诊断**（chromium 路径 /
+   xvfb / DISPLAY / /dev/shm / 磁盘 / 内存 / 进程数 / 代理连通性），据此定位；
 4. 也可进容器手动验证 chromium 能否启动：
 
 ```bash
@@ -220,8 +223,7 @@ HTTP 0 表示请求根本没拿到服务器响应（不是站点拒绝），脚�
   `WHOSTV_BROWSER_PATH` 指定；
 - 无需 xvfb（有真实显示），直接 `python whos_tv_checkin.py` 即可，浏览器会弹窗；
 - profile 目录用系统临时目录（`%TEMP%\whostv_profile\<端口>`），多端口天然隔离；
-  若预启动超时且 crash.log 提示"正在现有的浏览器会话中打开"，换一个
-  `WHOSTV_BROWSER_PORT` 即可。
+  若启动报错提示已有实例占用，换一个 `WHOSTV_BROWSER_PORT` 即可。
 
 ### 报错"Cloudflare 挑战未通过"？
 

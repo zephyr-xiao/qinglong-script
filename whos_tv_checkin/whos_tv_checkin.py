@@ -3,15 +3,17 @@
 new Env('whos.tv 签到');
 cron: 15 8 * * *
 
-适配青龙面板 - 浏览器方案(DrissionPage 驱动真实浏览器内核)
+适配青龙面板 - 浏览器方案(Patchright 驱动真实浏览器内核)
 
 背景:whos.tv 已启用 Cloudflare Managed Challenge 人机验证。
 纯 HTTP 库(requests / curl_cffi)即使伪造 UA、Cookie、TLS 指纹,
 也一律被 403 挑战页拦截(已实测)。唯一可行路径:真实浏览器内核
 自动通过挑战后,再在浏览器会话内 fetch 调用接口。
+选用 Patchright(未检测版 Playwright):无 Runtime.enable/Console.enable
+等 CDP 自动化痕迹,可通过 Managed Challenge(原版 Playwright 会被识别)。
 
 运行要求:
-  - Python 依赖:drissionpage
+  - Python 依赖:patchright
   - 系统依赖:chromium + xvfb(容器内无显示,需 xvfb 提供虚拟显示)
   - 青龙任务命令建议:
       xvfb-run -a task whos_tv_checkin/whos_tv_checkin.py
@@ -60,12 +62,9 @@ except Exception:
     pass
 
 try:
-    from DrissionPage import ChromiumOptions, ChromiumPage
-    # 内部连接浏览器超时默认仅 30s（Settings.browser_connect_timeout），
-    # 受限容器里 chromium 冷启动可能更慢，此处按预启动等待时长兜底调大
-    from DrissionPage._functions.settings import Settings as _DpSettings
+    from patchright.sync_api import sync_playwright
 except ImportError:
-    print("❌ 缺少 drissionpage，请在青龙「依赖管理」-「Python」中安装 drissionpage")
+    print("❌ 缺少 patchright，请在青龙「依赖管理」-「Python」中安装 patchright")
     sys.exit(1)
 
 
@@ -123,8 +122,9 @@ CF_CHALLENGE_RETRY = 1
 NETWORK_RETRY = 2
 NETWORK_RETRY_DELAY = 3
 
-# 浏览器调试端口与预启动等待上限。DrissionPage 自己 spawn 时最多等 30s 就抛错，
-# 受限容器里 chromium 冷启动可能远超该值，故由脚本手动预启动并长轮询等待。
+# 浏览器调试端口与启动等待上限。
+# Patchright launch 自带启动超时（受限容器里 chromium 冷启动可能远超默认值，
+# 通过 WHOSTV_BROWSER_WAIT 调大），端口同时用于孤儿实例的 CDP 复用检测。
 BROWSER_PORT_DEFAULT = 9222
 BROWSER_WAIT_DEFAULT = 180
 
@@ -324,7 +324,7 @@ def diagnose_browser_env(proxy: str = "") -> None:
     """
     浏览器启动失败时的环境诊断：打印 chromium / xvfb / DISPLAY / /dev/shm / 磁盘 /
     内存 / 浏览器进程数 / 代理连通性，并手动试启动一次 chromium 抓取崩溃原因
-    （DrissionPage 把 stderr 丢弃了）。仅用于 Linux 容器环境，Windows 本地跳过。
+    （框架自身不回传 stderr）。仅用于 Linux 容器环境，Windows 本地跳过。
     """
     if platform.system().lower() != "linux":
         return
@@ -431,7 +431,7 @@ def _http_json(port: int, path: str = "/json", timeout: float = 2) -> object:
 
 
 def browser_port_ready(port: int, timeout: float = 2) -> bool:
-    """调试端口是否就绪：/json 列表里已出现 page/webview 标签页，与 DrissionPage test_connect 判据一致。"""
+    """调试端口是否就绪：/json 列表里已出现 page/webview 标签页，与 CDP 调试协议判据一致。"""
     tabs = _http_json(port, "/json", timeout)
     if not isinstance(tabs, list):
         return False
@@ -447,13 +447,8 @@ def port_in_use(port: int, timeout: float = 1) -> bool:
         return False
 
 
-def _pre_launch_browser(chrome_path: str, proxy: str, port: int, profile_dir: str) -> subprocess.Popen:
-    """
-    Popen 预启动 chromium（启动参数与 DrissionPage 保持一致），stdout/stderr 全程落
-    crash.log 以便失败时定位。返回进程对象；启动前清理上次异常退出遗留的 Singleton 锁。
-    """
-    os.makedirs(profile_dir, exist_ok=True)
-    # 上次进程若未干净退出会遗留 Singleton 锁，删除后才能让新实例 attach 到调试端口
+def _clear_profile_locks(profile_dir: str) -> None:
+    """启动前清理上次异常退出遗留的 Singleton 锁，否则浏览器会判定已有实例而拒绝接管。"""
     for lock in ("SingletonLock", "SingletonSocket", "SingletonCookie"):
         lock_path = os.path.join(profile_dir, lock)
         if os.path.exists(lock_path):
@@ -462,180 +457,113 @@ def _pre_launch_browser(chrome_path: str, proxy: str, port: int, profile_dir: st
             except OSError:
                 pass
 
-    args = [
-        chrome_path,
-        f"--remote-debugging-port={port}",
-        f"--user-data-dir={profile_dir}",
-        "--no-sandbox",
-        "--disable-setuid-sandbox",
-        "--disable-dev-shm-usage",
-        "--disable-gpu",
-        "--no-first-run",
-        "--no-default-browser-check",
-        "--disable-extensions",
-        "--disable-background-networking",
-        "--disable-sync",
-        "--disable-translate",
-        "--remote-allow-origins=*",
-        "--enable-logging=stderr",  # 启动失败时能看清 chromium 内部报错
-        "--v=1",
-    ]
-    if proxy:
-        args.append(f"--proxy-server={proxy}")
-    args.append("about:blank")  # 保证就绪判定时至少有一个 page 标签页
 
-    log_path = os.path.join(profile_dir, "crash.log")
-    with open(log_path, "w", encoding="utf-8", errors="replace") as log:
-        log.write(f"===== {datetime.now():%Y-%m-%d %H:%M:%S} 预启动 chromium =====\n")
-        log.flush()
-        try:
-            proc = subprocess.Popen(args, stdout=log, stderr=subprocess.STDOUT, shell=False)
-        except FileNotFoundError:
-            raise RuntimeError(f"chromium 可执行文件不存在: {chrome_path}") from None
-        log.write(f"  PID: {proc.pid}\n")
-        log.flush()
-    return proc
+def _finalize_adopted_browser(pw, browser) -> None:
+    """
+    任务结束时收尾 CDP 接管的孤儿浏览器：先走 CDP Browser.close 强杀进程
+    （adopted 浏览器上 browser.close() 只断开连接不杀进程，会留幽灵实例占端口），
+    失败再退回 browser.close() 兜底；全程吞异常，不影响主流程收尾。
+    """
+    try:
+        browser.new_browser_cdp_session().send("Browser.close")
+    except Exception:
+        pass
+    try:
+        browser.close()
+    except Exception:
+        pass
+    try:
+        pw.stop()
+    except Exception:
+        pass
 
 
-def _wait_port_ready(port: int, wait: int) -> tuple:
-    """轮询调试端口直到 chromium 就绪。返回 (ready, elapsed_seconds)。"""
-    limit = max(wait, 1)
-    deadline = time.time() + limit
-    while time.time() < deadline:
-        if browser_port_ready(port):
-            return True, limit - (deadline - time.time())
-        time.sleep(2)
-    return False, limit
-
-
-def _dump_launch_failure(profile_dir: str, port: int, proc: subprocess.Popen) -> None:
-    """预启动超时：展示 crash.log 尾部与进程状态，定位 chromium 未就绪根因。"""
-    log_path = os.path.join(profile_dir, "crash.log")
-    print("  ── chromium 预启动超时诊断 ──")
-    print(f"  调试端口 {port} 未监听，启动日志: {log_path}")
-    if os.path.isfile(log_path):
-        with open(log_path, encoding="utf-8", errors="replace") as f:
-            raw_lines = f.read().splitlines()
-        # Windows 上 chromium 的 stderr 可能是本地编码（GBK），按系统编码再解一次
-        lines = []
-        for ln in raw_lines:
-            if "�" in ln:  # UTF-8 解出替换符 → 尝试本地编码
-                try:
-                    fixed = open(log_path, encoding="mbcs", errors="replace").read().splitlines()
-                    lines = fixed
-                    break
-                except Exception:
-                    lines = raw_lines
-            else:
-                lines = raw_lines
-        tail = lines[-30:] if len(lines) > 30 else lines
-        if tail:
-            print("  crash.log 尾部（最近 30 行）:")
-            for line in tail:
-                print(f"    {line}")
-    if proc.poll() is None:
-        print("  chromium 进程仍存活，正在终止...")
-    else:
-        print(f"  chromium 进程已退出（返回码 {proc.returncode}）")
+def _finalize_launched_context(pw, ctx) -> None:
+    """任务结束时收尾自启动的持久化上下文：ctx.close() 会连带终止浏览器进程。"""
+    try:
+        ctx.close()
+    except Exception:
+        pass
+    try:
+        pw.stop()
+    except Exception:
+        pass
 
 
 def create_browser(proxy: str, debug: bool, port: int = BROWSER_PORT_DEFAULT,
-                   wait: int = BROWSER_WAIT_DEFAULT) -> ChromiumPage:
+                   wait: int = BROWSER_WAIT_DEFAULT) -> tuple:
     """
-    创建真实浏览器实例。
+    创建真实浏览器实例，返回 (page, finalize)。
     ★ 必须使用有头模式：headless 无头模式实测被 Cloudflare 拦截，
     青龙容器内需通过 xvfb-run 提供虚拟显示（见文件头注释）。
 
-    由脚本手动预启动 chromium（stderr 全程落 crash.log），等调试端口就绪后再让
-    DrissionPage 连接已有实例——绕开其内部 30s 连接超时与丢弃 stderr 的问题。
-    若端口已有可用浏览器（上次异常退出的孤儿实例），直接复用省冷启动。
+    正常路径由 Patchright 的 launch_persistent_context 启动（官方最佳实践，
+    自带 180s 级启动超时与失败 stderr 摘要）；若端口已有上次异常退出遗留的
+    可用实例，改走 connect_over_cdp 接管复用，省一次冷启动。
+    finalize() 供任务结束时强杀浏览器进程，两路径语义一致。
     """
-    co = ChromiumOptions()
-    co.set_local_port(port)
-    co.headless(False)
-    # 容器内常以 root 运行，chromium 需要关闭沙箱才能启动
-    co.set_argument("--no-sandbox")
-    co.set_argument("--disable-setuid-sandbox")
-    # ★ 容器 /dev/shm 默认只有 64MB，chromium 渲染进程会因共享内存不足直接崩溃，
-    #   必须加 --disable-dev-shm-usage（同容器 gptqtcool 脚本已验证此参数必需）
-    co.set_argument("--disable-dev-shm-usage")
-    # 容器无 GPU，禁用避免启动崩溃；其余为无头服务器场景通用参数
-    co.set_argument("--disable-gpu")
-    co.set_argument("--no-first-run")
-    co.set_argument("--no-default-browser-check")
-    co.set_argument("--disable-extensions")
-    co.set_argument("--disable-background-networking")
-    co.set_argument("--disable-sync")
-    co.set_argument("--disable-translate")
-    # ★ 新版 chromium 对调试端口 WebSocket 增加 Origin 校验，不加会导致外部连接被拒
-    co.set_argument("--remote-allow-origins=*")
-    if proxy:
-        co.set_proxy(proxy)
-        if debug:
-            print(f"   [debug] 浏览器代理: {proxy}")
-    browser_path = (os.getenv("WHOSTV_BROWSER_PATH") or "").strip()
-    if browser_path:
-        co.set_browser_path(browser_path)
-        if debug:
-            print(f"   [debug] 浏览器路径: {browser_path}")
-
     # ★ profile 目录必须用规范 Windows/Linux 临时路径：不能写死 "/tmp/..."——
-    #   Windows 上 Python subprocess 不像 Git Bash 会做 MSYS 路径转换，Chrome 收到
-    #   字面量混合斜杠路径时 ProcessSingleton 判定异常，会把启动请求转交给"现有的
-    #   浏览器会话"后立即退出（返回码 0、调试端口永不监听）
+    #   Windows 上 Chrome 收到字面量混合斜杠路径时 ProcessSingleton 判定异常，
+    #   会把启动请求转交给"现有的浏览器会话"后立即退出（返回码 0、调试端口永不监听）
     profile_dir = os.path.abspath(os.path.join(tempfile.gettempdir(), "whostv_profile", str(port)))
+    os.makedirs(profile_dir, exist_ok=True)
+    _clear_profile_locks(profile_dir)
 
-    # ① 端口已有可用浏览器（上次异常退出遗留的孤儿实例）→ 直接连接复用，省冷启动
-    if browser_port_ready(port):
+    browser_path = (os.getenv("WHOSTV_BROWSER_PATH") or "").strip()
+    if proxy and debug:
+        print(f"   [debug] 浏览器代理: {proxy}")
+    if browser_path and debug:
+        print(f"   [debug] 浏览器路径: {browser_path}")
+
+    pw = sync_playwright().start()
+    try:
+        # ① 端口已有可用浏览器（上次异常退出遗留的孤儿实例）→ CDP 接管复用，省冷启动
+        if browser_port_ready(port):
+            if debug:
+                print(f"   [debug] 端口 {port} 已有可用浏览器，CDP 接管复用")
+            browser = pw.chromium.connect_over_cdp(
+                f"http://127.0.0.1:{port}", timeout=wait * 1000
+            )
+            ctx = browser.contexts[0] if browser.contexts else browser.new_context()
+            page = ctx.pages[0] if ctx.pages else ctx.new_page()
+            return page, lambda: _finalize_adopted_browser(pw, browser)
+
+        # ② 端口被占用但不是可用的 chromium 调试服务 → 换端口或清理占用进程
+        if port_in_use(port):
+            raise RuntimeError(
+                f"端口 {port} 已被其他进程占用但不是可用的浏览器调试端口，"
+                "请设置 WHOSTV_BROWSER_PORT 换一个端口"
+            )
+
+        # ③ 正常路径：Patchright 自己启动（持久化上下文，有头模式）
+        #   不传自定义 UA/headers（官方隐身最佳实践红线）；容器必需参数
+        #   （--no-sandbox、--disable-dev-shm-usage 等）已在默认参数表中
         if debug:
-            print(f"   [debug] 端口 {port} 已有可用浏览器，直接连接复用")
-        co.set_user_data_path(profile_dir)
-        return ChromiumPage(co)
-
-    # ② 端口被占用但不是可用的 chromium 调试服务 → 换端口或清理占用进程
-    if port_in_use(port):
-        raise RuntimeError(
-            f"端口 {port} 已被其他进程占用但不是可用的浏览器调试端口，"
-            "请设置 WHOSTV_BROWSER_PORT 换一个端口"
-        )
-
-    # ③ 预启动 chromium 并等待调试端口就绪
-    if debug:
-        print(f"   [debug] 预启动 chromium（等待端口 {port} 就绪，最长 {wait}s）...")
-    chrome_path = _find_chromium(browser_path)
-    if not chrome_path:
-        raise RuntimeError(
-            "未找到 chromium/chrome 可执行文件，请 apt 安装 chromium 或设置 WHOSTV_BROWSER_PATH"
-        )
-    proc = _pre_launch_browser(chrome_path, proxy, port, profile_dir)
-    ready, elapsed = _wait_port_ready(port, wait)
-
-    if not ready:
-        _dump_launch_failure(profile_dir, port, proc)
-        # 回收残留进程，避免幽灵实例占着端口影响下次任务
-        if proc.poll() is None:
-            try:
-                proc.terminate()
-                proc.wait(10)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                try:
-                    proc.wait(5)
-                except Exception:
-                    pass
-        raise RuntimeError(
-            f"chromium 在 {wait} 秒内未就绪（调试端口 {port} 未监听），"
-            f"启动日志见 {os.path.join(profile_dir, 'crash.log')}"
-        )
-
-    if debug:
-        print(f"   [debug] chromium 端口就绪，耗时约 {elapsed:.0f}s")
-    co.set_user_data_path(profile_dir)
-    # 不设 _new_env：否则 DrissionPage 会把刚预启动的实例 quit 掉再重启
-    return ChromiumPage(co)
+            print(f"   [debug] 启动 chromium（有头持久化上下文，超时上限 {wait}s）...")
+        chrome_path = _find_chromium(browser_path)
+        if not chrome_path:
+            raise RuntimeError(
+                "未找到 chromium/chrome 可执行文件，请 apt 安装 chromium 或设置 WHOSTV_BROWSER_PATH"
+            )
+        launch_kwargs = {
+            "user_data_dir": profile_dir,
+            "executable_path": chrome_path,
+            "headless": False,
+            "no_viewport": True,
+            "timeout": wait * 1000,
+        }
+        if proxy:
+            launch_kwargs["proxy"] = {"server": proxy}
+        ctx = pw.chromium.launch_persistent_context(**launch_kwargs)
+        page = ctx.pages[0] if ctx.pages else ctx.new_page()
+        return page, lambda: _finalize_launched_context(pw, ctx)
+    except Exception:
+        # 启动中途失败时释放 playwright 资源（成功路径交给 finalize）
+        pw.stop()
+        raise
 
 
-def wait_for_challenge(page: ChromiumPage, timeout: int = CF_CHALLENGE_TIMEOUT) -> bool:
+def wait_for_challenge(page, timeout: int = CF_CHALLENGE_TIMEOUT) -> bool:
     """
     等待 Cloudflare 挑战页自动通过。
     挑战页标题为「请稍候…」/「Just a moment...」，通过后跳转为站点真实标题。
@@ -644,7 +572,7 @@ def wait_for_challenge(page: ChromiumPage, timeout: int = CF_CHALLENGE_TIMEOUT) 
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
-            title = page.title or ""
+            title = page.title() or ""
         except Exception:
             title = ""
         if title and "请稍候" not in title and "Just a moment" not in title:
@@ -653,7 +581,7 @@ def wait_for_challenge(page: ChromiumPage, timeout: int = CF_CHALLENGE_TIMEOUT) 
     return False
 
 
-def browser_fetch(page: ChromiumPage, url: str, method: str = "POST",
+def browser_fetch(page, url: str, method: str = "POST",
                   data: dict = None, timeout: int = 30) -> tuple:
     """
     在浏览器会话内执行 fetch，自动携带浏览器 Cookie 与 TLS 指纹，
@@ -663,17 +591,17 @@ def browser_fetch(page: ChromiumPage, url: str, method: str = "POST",
     text 会带具体原因前缀：
       - "__TIMEOUT__|..."  AbortSignal 超时
       - "__NETWORK__|..."  连接失败（断网/代理抖动/DNS）
-      - "__JSERROR__|..."  JS 执行层异常（run_js 抛错等）
+      - "__JSERROR__|..."  JS 执行层异常（evaluate 抛错等）
     """
     url_js = json.dumps(url)
     method_js = json.dumps(method)
     # body 传 undefined 表示无请求体（GET）
     body_js = "undefined" if data is None else json.dumps(json.dumps(data))
-    # fetch 链路全程 catch：rejected promise 依赖 DrissionPage 转成 Python 异常，
+    # fetch 链路全程 catch：rejected promise 依赖 evaluate 转 Python 异常，
     # 不同版本行为不一（有的抛异常有的返回 None），错误语义会糊掉，
     # 因此在 JS 内部捕获并转成结构化结果，让 Python 层拿到确定性的失败分类
     js = (
-        f"return fetch({url_js}, {{method: {method_js}, "
+        f"(() => fetch({url_js}, {{method: {method_js}, "
         f"headers: {{'Content-Type': 'application/json', "
         f"'Accept': 'application/json, text/plain, */*', "
         f"'X-Requested-With': 'XMLHttpRequest'}}, "
@@ -682,10 +610,13 @@ def browser_fetch(page: ChromiumPage, url: str, method: str = "POST",
         f"}})"
         f".then(r => r.text().then(t => ({{ok: true, status: r.status, text: t}})))"
         f".catch(e => ({{ok: false, "
-        f"name: e && e.name || '', message: e && e.message || String(e)}}))"
+        f"name: e && e.name || '', message: e && e.message || String(e)}})))()"
     )
     try:
-        result = page.run_js(js)
+        # evaluate 会自动 await 返回的 Promise（CDP 层 awaitPromise:true），
+        # 拿到的就是 then 链产生的结构化对象；隔离 world 与主世界同源，
+        # fetch / Cookie / AbortSignal 行为一致
+        result = page.evaluate(js)
     except Exception as e:
         return 0, f"__JSERROR__|请求异常: {e}"
     if not isinstance(result, dict):
@@ -712,7 +643,7 @@ def network_fail_reason(text: str) -> str:
     return text
 
 
-def fetch_with_retry(page: ChromiumPage, url: str, method: str = "POST",
+def fetch_with_retry(page, url: str, method: str = "POST",
                      data: dict = None, timeout: int = 30,
                      retries: int = NETWORK_RETRY, debug: bool = False) -> tuple:
     """
@@ -734,39 +665,25 @@ def fetch_with_retry(page: ChromiumPage, url: str, method: str = "POST",
     return status, text
 
 
-def reset_cookies_keep_cf(page: ChromiumPage) -> None:
+def reset_cookies_keep_cf(page) -> None:
     """
     清空浏览器业务 Cookie，仅保留 cf_clearance。
     cf_clearance 与当前浏览器指纹绑定，清掉后新请求会重新触发挑战。
     多账号切换登录态时必须保留它，否则每个账号都要重过挑战。
     """
-    keep = {}
-    for c in page.cookies():
-        if c.get("name") == "cf_clearance":
-            keep = c
-            break
-    # ★ whos.tv 页面持续加载时 CDP 调用极慢甚至超时（实测默认 30s 超时仍失败），
-    #   先 stop_loading 停掉页面请求释放 CDP 通道，再用短超时清理——8s 内完成则清，
-    #   超时就跳过（登录本身会重设会话 Cookie，不影响签到）
+    context = page.context
     try:
-        page.stop_loading()
-    except Exception:
-        pass
-    try:
-        page.run_cdp('Network.clearBrowserCookies', _timeout=8)
+        keep = [c for c in context.cookies(HOME) if c.get("name") == "cf_clearance"]
+        context.clear_cookies()
+        if keep:
+            context.add_cookies(keep)
     except Exception as e:
-        print(f"   ⚠️ 清除 Cookie 超时/失败（跳过，登录会重设会话 Cookie）: {e}")
-        return
-    if keep:
-        try:
-            page.set.cookies(keep)
-        except Exception as e:
-            print(f"   ⚠️ 回写 cf_clearance 失败: {e}")
+        print(f"   ⚠️ 清除/回写 Cookie 失败（登录会重设会话 Cookie，不影响签到）: {e}")
 
 
 # ====================== 登录 ======================
 
-def login_one_account(page: ChromiumPage, username: str, password: str,
+def login_one_account(page, username: str, password: str,
                       timeout: int, debug: bool, label: str) -> tuple:
     """
     在浏览器会话内用账号密码登录 whos.tv。
@@ -897,7 +814,7 @@ def is_success_response(resp_text: str, status_code: int) -> tuple:
     return False, f"HTTP {status_code} | {short}"
 
 
-def try_signin_post(page: ChromiumPage, url: str, timeout: int, debug: bool) -> tuple:
+def try_signin_post(page, url: str, timeout: int, debug: bool) -> tuple:
     """对一个候选 URL 发 POST。返回 (success, msg)。"""
     status, text = fetch_with_retry(page, url, timeout=timeout, debug=debug)
 
@@ -912,7 +829,7 @@ def try_signin_post(page: ChromiumPage, url: str, timeout: int, debug: bool) -> 
     return ok, msg
 
 
-def _do_signin(page: ChromiumPage, label: str, timeout: int, debug: bool) -> tuple:
+def _do_signin(page, label: str, timeout: int, debug: bool) -> tuple:
     """
     对已认证的浏览器会话执行签到流程（Cookie 模式和账号模式共享）。
     返回 (success: bool, message: str)。
@@ -987,7 +904,7 @@ def _do_signin(page: ChromiumPage, label: str, timeout: int, debug: bool) -> tup
 # ====================== 两种模式的入口函数 ======================
 
 def signin_one_account(idx: int, cookie_str: str, timeout: int, debug: bool,
-                       page: ChromiumPage) -> tuple:
+                       page) -> tuple:
     """
     Cookie 模式：对单个账号执行签到流程。
     返回 (success: bool, message: str)。
@@ -999,8 +916,11 @@ def signin_one_account(idx: int, cookie_str: str, timeout: int, debug: bool,
     if not cookies:
         return False, f"{label}: ❌ Cookie 解析为空"
     reset_cookies_keep_cf(page)
-    for k, v in cookies.items():
-        page.set.cookies([{"name": k, "value": v, "domain": ".whos.tv"}])
+    # Playwright 的 add_cookies 要求 domain 与 path 成对，否则注入被拒
+    page.context.add_cookies([
+        {"name": k, "value": v, "domain": ".whos.tv", "path": "/"}
+        for k, v in cookies.items()
+    ])
 
     # 执行签到
     ok, msg = _do_signin(page, label, timeout, debug)
@@ -1010,7 +930,7 @@ def signin_one_account(idx: int, cookie_str: str, timeout: int, debug: bool,
 
 
 def signin_with_login(idx: int, username: str, password: str, timeout: int,
-                      debug: bool, page: ChromiumPage) -> tuple:
+                      debug: bool, page) -> tuple:
     """
     账号模式：先登录再签到。
     返回 (success: bool, message: str)。
@@ -1054,11 +974,6 @@ def main():
     proxy = (os.getenv("WHOSTV_PROXY") or "").strip()
     browser_wait = env_int("WHOSTV_BROWSER_WAIT", BROWSER_WAIT_DEFAULT)
     browser_port = env_int("WHOSTV_BROWSER_PORT", BROWSER_PORT_DEFAULT)
-    # DrissionPage 自带连接超时默认 30s，按预启动等待时长兜底调大，避免其内部 spawn 路径同样超时
-    try:
-        _DpSettings.set_browser_connect_timeout(browser_wait)
-    except Exception:
-        pass
 
     # 收集两类账号
     cookie_accounts = [c.strip() for c in raw_cookie.split("&") if c.strip()] if raw_cookie else []
@@ -1083,11 +998,12 @@ def main():
     print("\n🚀 启动浏览器，等待 Cloudflare 挑战通过（最长"
           f" {CF_CHALLENGE_TIMEOUT} 秒 × {CF_CHALLENGE_RETRY + 1} 次）...")
     page = None
+    finalize = None
     try:
-        page = create_browser(proxy, debug, browser_port, browser_wait)
+        page, finalize = create_browser(proxy, debug, browser_port, browser_wait)
         challenge_ok = False
         for attempt in range(CF_CHALLENGE_RETRY + 1):
-            page.get(HOME)
+            page.goto(HOME, timeout=(CF_CHALLENGE_TIMEOUT + 30) * 1000)
             challenge_ok = wait_for_challenge(page)
             if challenge_ok:
                 break
@@ -1099,25 +1015,22 @@ def main():
                 "（站点人机验证拦截，可能是出口 IP 信誉或网络问题）"
             )
         if debug:
-            print(f"   [debug] 挑战通过 | 标题: {page.title}")
+            print(f"   [debug] 挑战通过 | 标题: {page.title()}")
             try:
-                print(f"   [debug] UserAgent: {page.run_js('return navigator.userAgent')}")
+                print(f"   [debug] UserAgent: {page.evaluate('navigator.userAgent')}")
             except Exception:
                 pass
     except Exception as e:
         print(f"❌ 浏览器启动或挑战失败: {e}")
-        print("   💡 请确认容器内已安装 chromium 和 drissionpage，并用"
+        print("   💡 请确认容器内已安装 chromium 和 patchright，并用"
               " xvfb-run -a 运行脚本（headless 无头模式会被 Cloudflare 拦截）")
         # 挑战未通过（RuntimeError）时 chromium 已正常启动，环境诊断无意义且会多耗几秒；
         # 仅在浏览器启动/连接失败时输出环境诊断，定位 chromium 崩溃的真实原因
         if not isinstance(e, RuntimeError):
             diagnose_browser_env(proxy)
         # 释放浏览器实例（挑战失败后仍在内存中占用资源）
-        if page:
-            try:
-                page.quit()
-            except Exception:
-                pass
+        if finalize:
+            finalize()
         if notify:
             send_notify(f"❌ {title} 全部失败（0/{total}）", f"浏览器启动或挑战失败: {e}")
         sys.exit(1)
@@ -1155,7 +1068,7 @@ def main():
             if j < len(login_accounts):
                 time.sleep(2)
     finally:
-        page.quit()
+        finalize()
 
     # 汇总
     print("\n" + "=" * 60)
