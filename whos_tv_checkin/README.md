@@ -78,6 +78,11 @@ xvfb-run -a task whos_tv_checkin/whos_tv_checkin.py
 | `WHOSTV_BROWSER_PORT` | 否 | `9222` | 浏览器调试端口，被其他进程占用时换一个（profile 目录随端口生成） |
 | `WHOSTV_DEBUG` | 否 | `false` | 输出探测细节（试过哪些路径、状态码、响应片段） |
 
+> **网络级失败自动重试**：请求拿不到任何 HTTP 响应（超时 / 代理抖动断连）时自动重发
+> 最多 2 次（间隔 3 秒）；服务器已有响应（含 403/500）属业务结果不重复请求。
+> 网络失败的具体原因（超时 / Failed to fetch 等）无论是否开启 DEBUG 都会打印，
+> 且已知签到接口网络失败时会直接短路返回，不再白跑十几个候选接口逐个超时。
+
 > `WHOSTV_COOKIE` 和 `WHOSTV_ACCOUNT` 至少配置一个。两者都配时，Cookie 账号先执行，账号密码账号后执行。
 
 代理示例：
@@ -197,6 +202,26 @@ xvfb-run -a timeout 30 chromium --no-sandbox --disable-dev-shm-usage \
 - 青龙容器已安装 `chromium` 和 `xvfb`（见上文"环境要求"）；
 - 任务命令使用 `xvfb-run -a` 前缀（headless 无头模式会被拦截）；
 - `WHOSTV_PROXY` 配置正确，代理出口 IP 信誉正常。
+
+### 报错"响应非 JSON (HTTP 0)"或"登录网络异常"？
+
+HTTP 0 表示请求根本没拿到服务器响应（不是站点拒绝），脚本会打印具体原因并自动重试：
+
+- **`__TIMEOUT__|30s 内未收到响应`**：代理链路太慢或不通，检查 `WHOSTV_PROXY` 是否可达；
+- **`__NETWORK__|TypeError: Failed to fetch`**：连接被拒 / DNS 解析失败 / 代理瞬断，
+  重试仍失败说明网络持续异常，检查容器到代理的连通性；
+- 若日志出现"网络异常无法完成签到……请检查代理 WHOSTV_PROXY 与容器网络"，
+  说明已知接口和候选探测都拿不到响应，优先恢复代理再跑。
+
+### 本地 Windows 调试提示
+
+- Chrome 自动探测：脚本会依次查找 PATH 及 `C:\Program Files\Google\Chrome\Application\chrome.exe`
+  等 Windows 常见安装路径，一般无需手动设置；特殊安装位置可用
+  `WHOSTV_BROWSER_PATH` 指定；
+- 无需 xvfb（有真实显示），直接 `python whos_tv_checkin.py` 即可，浏览器会弹窗；
+- profile 目录用系统临时目录（`%TEMP%\whostv_profile\<端口>`），多端口天然隔离；
+  若预启动超时且 crash.log 提示"正在现有的浏览器会话中打开"，换一个
+  `WHOSTV_BROWSER_PORT` 即可。
 
 ### 报错"Cloudflare 挑战未通过"？
 

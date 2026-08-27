@@ -46,6 +46,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 import traceback
 import urllib.request
@@ -116,6 +117,11 @@ LOGIN_URL = f"{HOME}/api/login"
 CF_CHALLENGE_TIMEOUT = 120
 # 挑战未通过时的额外重试次数（挑战偶尔首次失败，重试可提高成功率）
 CF_CHALLENGE_RETRY = 1
+
+# 网络级失败（超时/断网，拿不到任何 HTTP 响应）的自动重试次数与间隔。
+# 仅网络层失败才重试；服务器已有响应（含 4xx/5xx）属业务结果，重试无意义
+NETWORK_RETRY = 2
+NETWORK_RETRY_DELAY = 3
 
 # 浏览器调试端口与预启动等待上限。DrissionPage 自己 spawn 时最多等 30s 就抛错，
 # 受限容器里 chromium 冷启动可能远超该值，故由脚本手动预启动并长轮询等待。
@@ -285,6 +291,18 @@ def _find_chromium(browser_path: str) -> str:
         p = shutil.which(name)
         if p:
             return p
+    # Windows 的 Chrome/Edge 不在 PATH，探测常见安装路径（本地调试用）
+    if platform.system().lower() == "windows":
+        candidates = [
+            r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+            r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+            os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe"),
+            r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+            r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+        ]
+        for c in candidates:
+            if os.path.isfile(c):
+                return c
     return ""
 
 
@@ -497,7 +515,19 @@ def _dump_launch_failure(profile_dir: str, port: int, proc: subprocess.Popen) ->
     print(f"  调试端口 {port} 未监听，启动日志: {log_path}")
     if os.path.isfile(log_path):
         with open(log_path, encoding="utf-8", errors="replace") as f:
-            lines = f.read().splitlines()
+            raw_lines = f.read().splitlines()
+        # Windows 上 chromium 的 stderr 可能是本地编码（GBK），按系统编码再解一次
+        lines = []
+        for ln in raw_lines:
+            if "�" in ln:  # UTF-8 解出替换符 → 尝试本地编码
+                try:
+                    fixed = open(log_path, encoding="mbcs", errors="replace").read().splitlines()
+                    lines = fixed
+                    break
+                except Exception:
+                    lines = raw_lines
+            else:
+                lines = raw_lines
         tail = lines[-30:] if len(lines) > 30 else lines
         if tail:
             print("  crash.log 尾部（最近 30 行）:")
@@ -549,7 +579,11 @@ def create_browser(proxy: str, debug: bool, port: int = BROWSER_PORT_DEFAULT,
         if debug:
             print(f"   [debug] 浏览器路径: {browser_path}")
 
-    profile_dir = os.path.join("/tmp", "whostv_profile", str(port))
+    # ★ profile 目录必须用规范 Windows/Linux 临时路径：不能写死 "/tmp/..."——
+    #   Windows 上 Python subprocess 不像 Git Bash 会做 MSYS 路径转换，Chrome 收到
+    #   字面量混合斜杠路径时 ProcessSingleton 判定异常，会把启动请求转交给"现有的
+    #   浏览器会话"后立即退出（返回码 0、调试端口永不监听）
+    profile_dir = os.path.abspath(os.path.join(tempfile.gettempdir(), "whostv_profile", str(port)))
 
     # ① 端口已有可用浏览器（上次异常退出遗留的孤儿实例）→ 直接连接复用，省冷启动
     if browser_port_ready(port):
@@ -624,13 +658,20 @@ def browser_fetch(page: ChromiumPage, url: str, method: str = "POST",
     """
     在浏览器会话内执行 fetch，自动携带浏览器 Cookie 与 TLS 指纹，
     可绕过 Cloudflare 对纯 HTTP 库的 403 拦截。
-    返回 (status_code: int, text: str)；请求异常时返回 (0, 错误信息)。
+    返回 (status_code: int, text: str)。
+    status 约定：>0 为真实 HTTP 状态码；0 表示网络级失败（拿不到任何响应），
+    text 会带具体原因前缀：
+      - "__TIMEOUT__|..."  AbortSignal 超时
+      - "__NETWORK__|..."  连接失败（断网/代理抖动/DNS）
+      - "__JSERROR__|..."  JS 执行层异常（run_js 抛错等）
     """
     url_js = json.dumps(url)
     method_js = json.dumps(method)
     # body 传 undefined 表示无请求体（GET）
     body_js = "undefined" if data is None else json.dumps(json.dumps(data))
-    # ★ run_js 必须以 return 开头，否则表达式结果被丢弃返回 None
+    # fetch 链路全程 catch：rejected promise 依赖 DrissionPage 转成 Python 异常，
+    # 不同版本行为不一（有的抛异常有的返回 None），错误语义会糊掉，
+    # 因此在 JS 内部捕获并转成结构化结果，让 Python 层拿到确定性的失败分类
     js = (
         f"return fetch({url_js}, {{method: {method_js}, "
         f"headers: {{'Content-Type': 'application/json', "
@@ -638,15 +679,59 @@ def browser_fetch(page: ChromiumPage, url: str, method: str = "POST",
         f"'X-Requested-With': 'XMLHttpRequest'}}, "
         f"body: {body_js}, "
         f"signal: AbortSignal.timeout({timeout * 1000})"
-        f"}}).then(r => r.text().then(t => ({{status: r.status, text: t}})))"
+        f"}})"
+        f".then(r => r.text().then(t => ({{ok: true, status: r.status, text: t}})))"
+        f".catch(e => ({{ok: false, "
+        f"name: e && e.name || '', message: e && e.message || String(e)}}))"
     )
     try:
         result = page.run_js(js)
     except Exception as e:
-        return 0, f"请求异常: {e}"
+        return 0, f"__JSERROR__|请求异常: {e}"
     if not isinstance(result, dict):
-        return 0, f"fetch 返回异常: {result}"
+        return 0, f"__JSERROR__|fetch 返回异常: {result}"
+    if result.get("ok") is not True:
+        err_name = result.get("name") or ""
+        err_msg = result.get("message") or ""
+        if err_name == "AbortError" or err_name == "TimeoutError":
+            return 0, f"__TIMEOUT__|{timeout}s 内未收到响应"
+        return 0, f"__NETWORK__|{err_name}: {err_msg}".rstrip(": ")
     return result.get("status", 0), result.get("text", "")
+
+
+def is_network_failure(status: int, text: str) -> bool:
+    """是否网络级失败（status==0 且带哨兵前缀）：服务器未返回任何响应，可安全重试。"""
+    return status == 0 and text.startswith(("__TIMEOUT__", "__NETWORK__", "__JSERROR__"))
+
+
+def network_fail_reason(text: str) -> str:
+    """提取网络级失败的简短原因（剥掉哨兵前缀），用于日志与结果消息。"""
+    for prefix in ("__TIMEOUT__", "__NETWORK__", "__JSERROR__"):
+        if text.startswith(prefix):
+            return text[len(prefix):].lstrip("|")
+    return text
+
+
+def fetch_with_retry(page: ChromiumPage, url: str, method: str = "POST",
+                     data: dict = None, timeout: int = 30,
+                     retries: int = NETWORK_RETRY, debug: bool = False) -> tuple:
+    """
+    browser_fetch 的网络级重试包装：仅当拿不到任何 HTTP 响应（超时/断网/JS 异常）
+    时重试，已有服务器响应（含 403/500 等业务状态）不重复请求。
+    返回 (status_code, text)，语义与 browser_fetch 一致。
+    """
+    status, text = browser_fetch(page, url, method=method, data=data, timeout=timeout)
+    attempt = 0
+    while is_network_failure(status, text) and attempt < retries:
+        attempt += 1
+        reason = network_fail_reason(text)
+        print(f"   ⚠️ 请求无响应（{reason}），第 {attempt}/{retries} 次重试，"
+              f"{NETWORK_RETRY_DELAY}s 后重发...")
+        time.sleep(NETWORK_RETRY_DELAY)
+        status, text = browser_fetch(page, url, method=method, data=data, timeout=timeout)
+        if debug:
+            print(f"   [debug] 重试后 {url} -> HTTP {status}")
+    return status, text
 
 
 def reset_cookies_keep_cf(page: ChromiumPage) -> None:
@@ -688,11 +773,16 @@ def login_one_account(page: ChromiumPage, username: str, password: str,
     返回 (success: bool, message: str)。
     登录成功后浏览器自动携带认证 Cookie（HYPERF_SESSION_ID）。
     """
-    status, text = browser_fetch(
+    status, text = fetch_with_retry(
         page, LOGIN_URL,
         data={"username": username, "password": password},
-        timeout=timeout,
+        timeout=timeout, debug=debug,
     )
+
+    if status == 0:
+        # HTTP 0 = 没拿到任何响应，具体原因（超时/断网/JS 异常）无论 debug 与否都要打出来，
+        # 否则线上失败时丢失最关键的定位线索
+        print(f"   ❌ 登录请求网络级失败: {network_fail_reason(text)}")
 
     if debug:
         body = (text or "")[:200].replace("\n", " ")
@@ -702,6 +792,9 @@ def login_one_account(page: ChromiumPage, username: str, password: str,
     try:
         data = json.loads(text)
     except Exception:
+        # 网络级失败给出具体原因；其余保持原格式（如 Cloudflare 拦截返回 HTML 页）
+        if status == 0:
+            return False, f"登录网络异常: {network_fail_reason(text)}"
         return False, f"登录失败: 响应非 JSON (HTTP {status})"
 
     code = data.get("code")
@@ -806,7 +899,11 @@ def is_success_response(resp_text: str, status_code: int) -> tuple:
 
 def try_signin_post(page: ChromiumPage, url: str, timeout: int, debug: bool) -> tuple:
     """对一个候选 URL 发 POST。返回 (success, msg)。"""
-    status, text = browser_fetch(page, url, timeout=timeout)
+    status, text = fetch_with_retry(page, url, timeout=timeout, debug=debug)
+
+    if status == 0:
+        # 网络级失败原因无条件打印（同登录请求：这是定位问题的关键线索）
+        print(f"   ❌ 签到请求网络级失败: {network_fail_reason(text)}")
 
     ok, msg = is_success_response(text, status)
     if debug:
@@ -833,8 +930,14 @@ def _do_signin(page: ChromiumPage, label: str, timeout: int, debug: bool) -> tup
         return False, f"Cookie 失效，请重新登录后复制 Cookie"
 
     # 已知接口失败，走探测兜底
+    # 网络级失败短路：已知接口重试后仍拿不到任何响应，网络/代理大概率已断，
+    # 继续拉任务页+白名单探测只会逐个超时（候选最多 15 个 × 各 30s），快速失败止损
+    m_http0 = re.match(r"^HTTP 0 \| (__(?:TIMEOUT|NETWORK|JSERROR)__\|.*)$", msg)
+    if m_http0:
+        return False, f"网络异常无法完成签到（{network_fail_reason(m_http0.group(1))}），请检查代理 WHOSTV_PROXY 与容器网络"
+
     # 浏览器会话内拉取任务页 HTML（登录态检查 + 扫描候选接口）
-    status, html = browser_fetch(page, TASKS_URL, method="GET", timeout=timeout)
+    status, html = fetch_with_retry(page, TASKS_URL, method="GET", timeout=timeout, debug=debug)
     if status != 200:
         return False, f"任务页 HTTP {status}，已知接口也失败: {msg}"
 
@@ -870,6 +973,10 @@ def _do_signin(page: ChromiumPage, label: str, timeout: int, debug: bool) -> tup
         # Cookie 失效短路：候选接口已确认未授权时，不必白跑剩余候选
         if "Cookie 失效" in msg2 or "HTTP 401" in msg2 or "code=401" in msg2:
             return False, f"Cookie 失效，请重新登录后复制 Cookie（探测 {url} 返回未授权）"
+        # 网络级失败短路：探测途中网络断开，剩余候选同样会逐个超时，止损退出
+        m_fail = re.match(r"^HTTP 0 \| (__(?:TIMEOUT|NETWORK|JSERROR)__\|.*)$", msg2)
+        if m_fail:
+            return False, f"网络异常中断签到探测（{network_fail_reason(m_fail.group(1))}），最后请求: {url}"
         last_msg = f"{url} -> {msg2}"
 
     if state is None:
