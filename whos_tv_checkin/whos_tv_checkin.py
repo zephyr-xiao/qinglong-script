@@ -122,6 +122,12 @@ CF_CHALLENGE_RETRY = 1
 NETWORK_RETRY = 2
 NETWORK_RETRY_DELAY = 3
 
+# 首跳导航（goto）的网络错误重试次数与间隔。浏览器首跳不走页内 fetch 的重试
+# 链路，代理/链路瞬时抖动（ERR_CONNECTION_CLOSED 等）单独重发兜底；
+# goto 自身超时说明链路极慢，重发大概率还是超时，不在此列
+GOTO_RETRY = 2
+GOTO_RETRY_DELAY = 5
+
 # 浏览器调试端口与启动等待上限。
 # Patchright launch 自带启动超时（受限容器里 chromium 冷启动可能远超默认值，
 # 通过 WHOSTV_BROWSER_WAIT 调大），端口同时用于孤儿实例的 CDP 复用检测。
@@ -665,6 +671,33 @@ def fetch_with_retry(page, url: str, method: str = "POST",
     return status, text
 
 
+def is_goto_network_error(e: Exception) -> bool:
+    """goto 抛的是否网络层错误（连接被断/重置/DNS 等，可安全重发）。
+    goto 自身超时不在列：链路极慢时重发大概率还是超时，白耗几分钟。"""
+    msg = str(e)
+    return "net::ERR_" in msg and "ERR_TIMED_OUT" not in msg
+
+
+def goto_with_retry(page, url: str, timeout: int = None,
+                    retries: int = GOTO_RETRY, debug: bool = False) -> None:
+    """goto 的网络错误重试包装：代理/链路瞬时抖动时重发，最多 retries 次。"""
+    kwargs = {"timeout": timeout} if timeout else {}
+    attempt = 0
+    while True:
+        try:
+            page.goto(url, **kwargs)
+            return
+        except Exception as e:
+            if not is_goto_network_error(e) or attempt >= retries:
+                raise
+            attempt += 1
+            print(f"   ⚠️ 导航网络错误（{e}），第 {attempt}/{retries} 次重试，"
+                  f"{GOTO_RETRY_DELAY}s 后重发...")
+            time.sleep(GOTO_RETRY_DELAY)
+            if debug:
+                print(f"   [debug] 重试导航 {url}")
+
+
 def reset_cookies_keep_cf(page) -> None:
     """
     清空浏览器业务 Cookie，仅保留 cf_clearance。
@@ -1003,7 +1036,8 @@ def main():
         page, finalize = create_browser(proxy, debug, browser_port, browser_wait)
         challenge_ok = False
         for attempt in range(CF_CHALLENGE_RETRY + 1):
-            page.goto(HOME, timeout=(CF_CHALLENGE_TIMEOUT + 30) * 1000)
+            goto_with_retry(page, HOME, timeout=(CF_CHALLENGE_TIMEOUT + 30) * 1000,
+                            debug=debug)
             challenge_ok = wait_for_challenge(page)
             if challenge_ok:
                 break

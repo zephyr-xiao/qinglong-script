@@ -216,6 +216,62 @@ class TestResetCookiesKeepCf(unittest.TestCase):
             wtc.reset_cookies_keep_cf(page)  # 不应抛异常
 
 
+class TestGotoWithRetry(unittest.TestCase):
+    """goto_with_retry：仅网络层错误触发重试，超时/业务错误直接抛出。"""
+
+    def test_transient_connection_error_retried(self):
+        """本次实测踩到的场景：代理抖动 ERR_CONNECTION_CLOSED，重发即恢复。"""
+        page = mock.MagicMock()
+        page.goto.side_effect = [
+            Exception("Page.goto: net::ERR_CONNECTION_CLOSED at https://whos.tv/"),
+            None,
+        ]
+        with mock.patch("time.sleep") as sleep_mock:
+            wtc.goto_with_retry(page, "https://whos.tv/", debug=False)
+        self.assertEqual(page.goto.call_count, 2)
+        self.assertEqual(sleep_mock.call_count, 1)
+
+    def test_goto_timeout_not_retried(self):
+        """goto 自身超时说明链路极慢，重发无意义，直接抛。"""
+        page = mock.MagicMock()
+        page.goto.side_effect = Exception(
+            "Page.goto: Timeout 150000ms exceeded")
+        with mock.patch("time.sleep") as sleep_mock:
+            with self.assertRaises(Exception):
+                wtc.goto_with_retry(page, "https://whos.tv/")
+        self.assertEqual(page.goto.call_count, 1)
+        sleep_mock.assert_not_called()
+
+    def test_err_timed_out_not_retried(self):
+        """ERR_TIMED_OUT 同属链路极慢，不重试。"""
+        page = mock.MagicMock()
+        page.goto.side_effect = Exception(
+            "Page.goto: net::ERR_TIMED_OUT at https://whos.tv/")
+        with mock.patch("time.sleep"):
+            with self.assertRaises(Exception):
+                wtc.goto_with_retry(page, "https://whos.tv/")
+        self.assertEqual(page.goto.call_count, 1)
+
+    def test_exhausted_retries_raises_last_error(self):
+        """重试次数耗尽仍失败 → 抛最后一次错误。"""
+        page = mock.MagicMock()
+        page.goto.side_effect = Exception(
+            "Page.goto: net::ERR_CONNECTION_RESET at https://whos.tv/")
+        with mock.patch("time.sleep"):
+            with self.assertRaisesRegex(Exception, "ERR_CONNECTION_RESET"):
+                wtc.goto_with_retry(page, "https://whos.tv/", retries=2)
+        self.assertEqual(page.goto.call_count, 3)  # 首次 + 2 次重试
+
+    def test_non_network_error_not_retried(self):
+        """非网络错误（如协议错误）不重试。"""
+        page = mock.MagicMock()
+        page.goto.side_effect = Exception("some other error")
+        with mock.patch("time.sleep"):
+            with self.assertRaises(Exception):
+                wtc.goto_with_retry(page, "https://whos.tv/")
+        self.assertEqual(page.goto.call_count, 1)
+
+
 class TestLoginMessage(unittest.TestCase):
     """login_one_account 网络失败的文案分支。"""
 
