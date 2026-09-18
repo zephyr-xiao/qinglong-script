@@ -12,10 +12,20 @@ gptqtcool_checkin/artifacts/
 # 凭证与缓存（个人账号信息，严禁提交）
 .token/
 *_cookie.json
+cookie_*.json
 cookies.json
 cookies/
 *.log
 .env
+
+# 运行期登录态与运行数据（个人账号信息，严禁提交）
+*_token.json
+*_state.json
+*_log.txt
+replied_posts.json
+
+# 独立子仓库（有自己的 remote，在各自仓库内维护）
+tg-signer-ql/
 
 # IDE
 .vscode/
