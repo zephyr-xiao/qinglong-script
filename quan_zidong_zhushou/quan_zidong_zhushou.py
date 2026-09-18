@@ -7,15 +7,15 @@ cron: 8 8 * * *
 适配青龙面板 - 仅依赖 requests + 标准库
 
 支持站点：
-  - 荔枝鱼公益站 (huige.bbroot.com)             Bearer Token
-  - 哈基米 API 站 (api.gemai.cc, New API)    New-Api-User Header
-  - MT 论坛       (bbs.binmt.cc, Discuz)     Cookie + formhash
-  - 自定义任意 API 站                          通过 QZD_CUSTOM JSON 配置
+  - Liminality 贝之中转站 (beizhi.sylu.cc, New API 新版)   Bearer Token
+  - 可萌中转站      (api456.me, New API)               New-Api-User Header + Session Cookie
+  - 哈基米 API 站   (api.gemai.cc, New API)            New-Api-User Header
+  - 自定义任意 API 站                                    通过 QZD_CUSTOM JSON 配置
 
 环境变量：
-  QZD_LIZHIYU   邮箱#密码   (多账号 & 分隔)
+  QZD_BEIZHI    用户名#密码 (多账号 & 分隔)
+  QZD_API456    用户名#密码 (多账号 & 分隔)
   QZD_GEMAI     用户名#密码 (多账号 & 分隔)
-  QZD_BINMT     用户名#密码 (多账号 & 分隔)
   QZD_CUSTOM    JSON 数组   高级用户自定义站点（详见 README）
   QZD_NOTIFY    true/false  默认 true，是否调用青龙 notify.py 推送
   QZD_NOTIFY_ONLY_FAIL  true/false  默认 false，true 时仅在有失败时推送
@@ -96,24 +96,51 @@ def send_notify(title: str, content: str) -> bool:
 # ====================== 站点预设（来自源项目 SITE_PRESETS） ======================
 
 SITE_PRESETS = {
-    "lizhiyu": {
-        "name": "荔枝鱼公益站",
+    "beizhi": {
+        "name": "Liminality贝之中转站",
         "type": "custom-api",
         "api_config": {
-            "login_url": "https://huige.bbroot.com/v1/user/login-pwd",
+            "login_url": "https://beizhi.sylu.cc/api/user/login",
             "login_method": "POST",
-            "login_body_template": '{"email": "{{username}}", "password": "{{password}}"}',
+            "login_body_template": '{"username": "{{username}}", "password": "{{password}}"}',
             "login_content_type": "application/json",
-            "token_path": "token",
-            "token_path_fallback": ["data.token"],
-            "signin_url": "https://huige.bbroot.com/v1/user/signin",
+            "token_path": "data.access_token",
+            "token_expires_path": "data.access_expires_at",
+            "signin_url": "https://beizhi.sylu.cc/api/user/checkin",
             "signin_method": "POST",
             "signin_body": "{}",
             "signin_content_type": "application/json",
             "auth_header_template": "Bearer {{token}}",
             "auth_header_name": "Authorization",
-            "success_field": "",
+            "success_field": "success",
             "message_field": "message",
+            "quota_info_url": "https://beizhi.sylu.cc/api/user/self",
+            "quota_field": "data.quota",
+            "quota_per_unit": 500000,
+            "quota_currency": "$",
+        },
+    },
+    "api456": {
+        "name": "可萌中转站",
+        "type": "custom-api",
+        "api_config": {
+            "login_url": "https://api456.me/api/user/login",
+            "login_method": "POST",
+            "login_body_template": '{"username": "{{username}}", "password": "{{password}}"}',
+            "login_content_type": "application/json",
+            "token_path": "data.id",
+            "signin_url": "https://api456.me/api/user/checkin",
+            "signin_method": "POST",
+            "signin_body": "{}",
+            "signin_content_type": "application/json",
+            "auth_header_name": "New-Api-User",
+            "auth_header_template": "{{token}}",
+            "success_field": "success",
+            "message_field": "message",
+            "quota_info_url": "https://api456.me/api/user/self",
+            "quota_field": "data.quota",
+            "quota_per_unit": 500000,
+            "quota_currency": "$",
         },
     },
     "gemai": {
@@ -133,16 +160,11 @@ SITE_PRESETS = {
             "auth_header_template": "{{token}}",
             "success_field": "success",
             "message_field": "message",
-        },
-    },
-    "binmt": {
-        "name": "MT论坛",
-        "type": "discuz",
-        "api_config": {
-            "base_url": "https://bbs.binmt.cc",
-            "cookiepre": "",
-            "login_questionid": "0",
-            "login_answer": "",
+            "quota_info_url": "https://api.gemai.cc/api/user/self",
+            "quota_field": "data.total_quota",
+            "quota_field_fallback": ["data.quota", "data.gift_quota"],
+            "quota_per_unit": 500000,
+            "quota_currency": "¥",
         },
     },
 }
@@ -150,9 +172,9 @@ SITE_PRESETS = {
 
 # 环境变量名 -> 预设 key 的映射（按需扩展）
 ENV_PRESET_MAP = {
-    "QZD_LIZHIYU": "lizhiyu",
+    "QZD_BEIZHI": "beizhi",
+    "QZD_API456": "api456",
     "QZD_GEMAI": "gemai",
-    "QZD_BINMT": "binmt",
 }
 
 
@@ -228,12 +250,107 @@ def drop_token_cache(path: Path) -> None:
         print(f"  ⚠️ 删除凭证缓存失败: {e}")
 
 
+def _snapshot_cookies(session) -> list:
+    """把 requests.Session 的 Cookie 快照成可 JSON 序列化的 [{name,value}]。"""
+    return [{"name": c.name, "value": c.value} for c in session.cookies]
+
+
+def _restore_cookies(session, cookies: list) -> None:
+    """恢复缓存中的 Cookie 到 Session，供 session 型站点（如 New API 传统版）免登录签到。"""
+    for c in cookies or []:
+        if isinstance(c, dict) and c.get("name") and c.get("value"):
+            try:
+                session.cookies.set(c["name"], c["value"])
+            except Exception:
+                pass
+
+
+def _cache_is_valid(cached: dict) -> bool:
+    """缓存有效性判定：有 token 且未过期（expires_at 缺省视为不过期）。"""
+    if not cached.get("token"):
+        return False
+    expires_at = cached.get("expires_at")
+    if isinstance(expires_at, (int, float)) and time.time() >= expires_at:
+        return False
+    return True
+
+
+def _build_cache_payload(session, config: dict, token: str, login_data) -> dict:
+    """
+    构造三合一缓存内容：token + 会话 Cookie 快照 + 可选过期时间。
+
+    session Cookie 对 New API 传统版（api456/gemai）是必需凭证，
+    只存 token 的旧格式会导致缓存命中后仍要重新登录。
+    """
+    payload = {"token": token, "cookies": _snapshot_cookies(session)}
+    expires_path = (config.get("token_expires_path") or "").strip()
+    if expires_path and isinstance(login_data, dict):
+        expires_at = _extract_field(login_data, expires_path)
+        if isinstance(expires_at, (int, float)):
+            payload["expires_at"] = int(expires_at)
+    return payload
+
+
+def _build_auth_headers(config: dict, token: str, username: str) -> dict:
+    """按站点配置构造带鉴权的请求头（签到与余额查询共用）。"""
+    headers = {"User-Agent": DEFAULT_UA}
+    template_vars = {"token": token, "username": username, "cookie": ""}
+    sh_template = config.get("signin_headers", {})
+    if isinstance(sh_template, dict):
+        for k, v in sh_template.items():
+            headers[k] = _apply_template(str(v), template_vars)
+
+    auth_template = config.get("auth_header_template", "")
+    auth_name = config.get("auth_header_name", "Authorization")
+    if auth_template and auth_name not in headers:
+        headers[auth_name] = _apply_template(auth_template, template_vars)
+    return headers
+
+
+def _fetch_quota(session, config: dict, token: str, username: str):
+    """查询账户余额（quota 原始值）。接口未配置、请求失败或字段缺失时返回 None，不影响签到主流程。"""
+    quota_url = (config.get("quota_info_url") or "").strip()
+    if not quota_url:
+        return None
+    headers = _build_auth_headers(config, token, username)
+    try:
+        resp = session.get(quota_url, headers=headers, timeout=DEFAULT_TIMEOUT)
+        if resp.status_code != 200:
+            return None
+        data = resp.json()
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    # 主路径取不到时依次尝试候选路径（部分 New API fork 把总余额放在 total_quota）
+    paths = [config.get("quota_field") or "data.quota"]
+    fallback = config.get("quota_field_fallback") or []
+    if isinstance(fallback, list):
+        paths.extend(p for p in fallback if p and p not in paths)
+    for path in paths:
+        value = _extract_field(data, path)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            continue
+        return int(value)
+    return None
+
+
+def _format_quota(raw: int, config: dict) -> str:
+    """把 quota 原始值按站点单位换算为带货币符的展示文本。"""
+    try:
+        per_unit = float(config.get("quota_per_unit") or 500000)
+    except (TypeError, ValueError):
+        per_unit = 500000.0
+    currency = config.get("quota_currency") or "$"
+    return f"{currency}{raw / per_unit:.2f}"
+
+
 # ====================== 工具函数（萃取自 signin_executor.py） ======================
 
 ALREADY_SIGNED_IN_KEYWORDS = [
     "已签到", "已经签到", "今日已签", "您已签到", "您今日已",
     "签到过", "重复签到", "连续签到",
-    "already", "already signed", "signed in", "signed-in", "signed",
+    "already", "already signed", "already signed in",
 ]
 
 
@@ -326,28 +443,55 @@ def execute_signin(site_key: str, api_config: dict, username: str, password: str
 
     cache_path = token_cache_path(site_key, username)
 
-    # =============== Step 1: 登录（优先复用缓存 token） ===============
+    # =============== Step 1: 登录（优先复用缓存凭证） ===============
     token = ""
     login_url = (config.get("login_url") or "").strip()
     if login_url:
         cached = load_token_cache(cache_path)
-        if cached.get("token"):
+        if _cache_is_valid(cached):
             token = cached["token"]
-            print(f"  🍪 命中缓存 token，跳过登录")
+            _restore_cookies(session, cached.get("cookies"))
+            print(f"  🍪 命中缓存凭证，跳过登录")
         else:
-            ok, login_token, err = _do_login(session, config, username, password)
+            ok, login_token, err, login_data = _do_login(session, config, username, password)
             if not ok:
                 return {"success": False, "error": err}
             token = login_token
-            save_token_cache(cache_path, {"token": token})
+            save_token_cache(cache_path, _build_cache_payload(session, config, token, login_data))
+
+    # =============== Step 1.5: 签到前余额（用于计算今日签到奖励） ===============
+    quota_before = _fetch_quota(session, config, token, username)
 
     # =============== Step 2: 签到 ===============
-    return _do_signin(session, config, username, password, token,
-                      allow_retry=bool(login_url), cache_path=cache_path)
+    result = _do_signin(session, config, username, password, token,
+                        allow_retry=bool(login_url), cache_path=cache_path)
+
+    # =============== Step 3: 组装余额 / 奖励信息 ===============
+    # 401 重试路径会用刷新后的 token 重签，_final_token 保证此处拿到的是最终有效凭证
+    if result.get("success") and config.get("quota_info_url"):
+        quota_after = _fetch_quota(session, config, result.get("_final_token") or token, username)
+        if quota_after is not None:
+            quota_str = _format_quota(quota_after, config)
+            if result.get("already"):
+                result["message"] = f"{result.get('message', '今日已签到')} | 余额 {quota_str}"
+            elif quota_before is not None:
+                reward = quota_after - quota_before
+                if reward > 0:
+                    result["message"] = (
+                        f"{result.get('message', '签到成功')}，"
+                        f"获得 {_format_quota(reward, config)} | 余额 {quota_str}"
+                    )
+                else:
+                    result["message"] = f"{result.get('message', '签到成功')} | 余额 {quota_str}"
+            else:
+                result["message"] = f"{result.get('message', '签到成功')} | 余额 {quota_str}"
+
+    result.pop("_final_token", None)
+    return result
 
 
 def _do_login(session, config, username, password):
-    """登录并提取 token，返回 (ok, token, error)。"""
+    """登录并提取 token，返回 (ok, token, error, login_data)。login_data 供调用方提取过期时间等字段。"""
     login_url = config.get("login_url", "").strip()
     login_method = (config.get("login_method") or "POST").upper()
     login_body_template = config.get("login_body") or config.get("login_body_template", "{}")
@@ -369,27 +513,36 @@ def _do_login(session, config, username, password):
         else:
             resp = session.get(login_url, headers=headers, timeout=DEFAULT_TIMEOUT)
     except requests.Timeout:
-        return False, "", "登录请求超时，请检查网络或登录接口"
+        return False, "", "登录请求超时，请检查网络或登录接口", {}
     except requests.ConnectionError:
-        return False, "", "登录连接失败，请检查网络或站点地址"
+        return False, "", "登录连接失败，请检查网络或站点地址", {}
     except Exception as e:
-        return False, "", f"登录过程异常: {str(e)[:300]}"
+        return False, "", f"登录过程异常: {str(e)[:300]}", {}
 
     if resp.status_code == 401:
-        return False, "", _classify_login_error(401, resp.text, "密码错误或认证失败")
+        return False, "", _classify_login_error(401, resp.text, "密码错误或认证失败"), {}
     if resp.status_code == 403:
-        return False, "", _classify_login_error(403, resp.text, "账号被禁止访问")
+        return False, "", _classify_login_error(403, resp.text, "账号被禁止访问"), {}
     if resp.status_code == 404:
-        return False, "", _classify_login_error(404, resp.text, "登录接口不存在")
+        return False, "", _classify_login_error(404, resp.text, "登录接口不存在"), {}
     if resp.status_code >= 500:
-        return False, "", _classify_login_error(resp.status_code, resp.text, f"服务器错误 (HTTP {resp.status_code})")
+        return False, "", _classify_login_error(resp.status_code, resp.text, f"服务器错误 (HTTP {resp.status_code})"), {}
 
-    # 提取 token
+    # 解析登录响应 JSON
     token = ""
     try:
         login_data = resp.json()
     except Exception:
         login_data = {}
+
+    # New API 系站点惯用 HTTP 200 + success:false 表达业务错误（如密码错误），
+    # 状态码分支捕获不到，需在提取 token 前先识别
+    if isinstance(login_data, dict) and login_data.get("success") is False:
+        biz_msg = str(login_data.get("message") or "")[:200]
+        if biz_msg:
+            if "password" in biz_msg.lower() or "密码" in biz_msg or "incorrect" in biz_msg.lower():
+                return False, "", f"密码错误或账号被禁: {biz_msg}", login_data
+            return False, "", f"登录失败: {biz_msg}", login_data
 
     # 提取 token：优先 token_path，再尝试 token_path_fallback 列表
     token_paths = []
@@ -409,7 +562,14 @@ def _do_login(session, config, username, password):
                 token = str(extracted)
                 break
 
-    return True, token, ""
+    # 配置了提取路径却全部落空：说明响应结构与预期不符，明确报错而非静默放行
+    if token_paths and not token:
+        snippet = (resp.text or "")[:200]
+        return False, "", (
+            f"登录成功但未能从响应提取 token（请检查 token_path 配置）| 响应片段: {snippet}"
+        ), login_data
+
+    return True, token, "", login_data
 
 
 def _do_signin(session, config, username, password, token, allow_retry=True, cache_path=None):
@@ -421,23 +581,12 @@ def _do_signin(session, config, username, password, token, allow_retry=True, cac
     method = (config.get("signin_method") or "POST").upper()
     content_type = config.get("signin_content_type", "application/json")
 
-    # 构造请求头
-    headers = {"User-Agent": DEFAULT_UA}
-    template_vars = {"token": token, "username": username, "cookie": ""}
-    sh_template = config.get("signin_headers", {})
-    if isinstance(sh_template, dict):
-        for k, v in sh_template.items():
-            headers[k] = _apply_template(str(v), template_vars)
-
-    auth_template = config.get("auth_header_template", "")
-    auth_name = config.get("auth_header_name", "Authorization")
-    if auth_template and auth_name not in headers:
-        headers[auth_name] = _apply_template(auth_template, template_vars)
-
+    headers = _build_auth_headers(config, token, username)
     if content_type and "Content-Type" not in headers:
         headers["Content-Type"] = content_type
 
     # 构造请求体
+    template_vars = {"token": token, "username": username, "cookie": ""}
     body_str = _apply_template(str(config.get("signin_body", "{}")), template_vars)
 
     try:
@@ -461,19 +610,24 @@ def _do_signin(session, config, username, password, token, allow_retry=True, cac
     except Exception as e:
         return {"success": False, "error": f"签到请求异常: {str(e)[:300]}"}
 
-    # 401 重试一次（先清缓存，避免反复复用坏 token）
+    # 401 重试一次（先清缓存，避免反复复用坏凭证）
     if resp.status_code == 401 and allow_retry and config.get("login_url"):
         print(f"  ↪ 签到返回 401，清缓存并重新登录后重试...")
         if cache_path:
             drop_token_cache(cache_path)
-        ok, token, err = _do_login(session, config, username, password)
+        ok, new_token, err, login_data = _do_login(session, config, username, password)
         if ok:
             if cache_path:
-                save_token_cache(cache_path, {"token": token})
-            return _do_signin(session, config, username, password, token,
-                              allow_retry=False, cache_path=cache_path)
+                save_token_cache(cache_path, _build_cache_payload(session, config, new_token, login_data))
+            retry_result = _do_signin(session, config, username, password, new_token,
+                                      allow_retry=False, cache_path=cache_path)
+            # 回传刷新后的 token，供调用方查余额使用
+            retry_result["_final_token"] = new_token
+            return retry_result
 
-    return _parse_signin_response(resp, config)
+    result = _parse_signin_response(resp, config)
+    result["_final_token"] = token
+    return result
 
 
 def _parse_signin_response(resp, config):
@@ -494,6 +648,7 @@ def _parse_signin_response(resp, config):
     if _is_already_signed_in(raw_text):
         msg = _extract_field(resp_data, message_field) if message_field else "今日已签到"
         result["success"] = True
+        result["already"] = True
         result["message"] = str(msg) if msg else "今日已签到"
         result["raw_response"] = resp_text[:500]
         return result
@@ -694,7 +849,7 @@ def discuz_sign_in(site_key: str, api_config: dict, username: str, password: str
             saved_cookies = [{"name": c.name, "value": c.value} for c in session.cookies]
             save_token_cache(cache_path, {"cookies": saved_cookies})
 
-            # Step 3: 获取签到页面 formhash（新版用 plugin.php，旧版伪静态已失效）
+            # Step 3: 获取签到页面 formhash（k_misign 的入口是 plugin.php，伪静态路径不返回该字段）
             sign_page_resp = session.get(f"{base_url}/plugin.php?id=k_misign:sign", timeout=DEFAULT_TIMEOUT)
             sign_page_html = sign_page_resp.text or ""
             sign_formhash = _discuz_extract_formhash(sign_page_html)
@@ -883,8 +1038,9 @@ def mask(s: str) -> str:
         if len(head) <= 2:
             return head[0] + "*@" + tail
         return head[:2] + "*" * (len(head) - 2) + "@" + tail
-    if len(s) <= 2:
-        return s[0] + "*"
+    # 过短字符串首尾重叠，仅保留首字符避免完整泄露
+    if len(s) <= 4:
+        return s[0] + "*" * max(1, len(s) - 1)
     return s[:2] + "*" * max(1, len(s) - 4) + s[-2:]
 
 
@@ -899,9 +1055,9 @@ def main():
         msg = (
             "⚠️ 未配置任何站点账号。\n"
             "请在青龙面板「环境变量」中配置以下任意一项：\n"
-            "  QZD_LIZHIYU = 邮箱#密码  （荔枝鱼）\n"
+            "  QZD_BEIZHI  = 用户名#密码（贝之中转站）\n"
+            "  QZD_API456  = 用户名#密码（可萌中转站）\n"
             "  QZD_GEMAI   = 用户名#密码（哈基米API）\n"
-            "  QZD_BINMT   = 用户名#密码（MT论坛）\n"
             "  QZD_CUSTOM  = JSON 数组   （自定义站点）\n"
             "多账号请用 & 或换行分隔。"
         )
@@ -984,6 +1140,10 @@ def main():
             send_notify(notify_title, report)
     else:
         print("ℹ️ QZD_NOTIFY=false 或已跳过推送")
+
+    # 有失败时以非零码退出，让青龙任务状态如实反映签到结果
+    if fail_count > 0:
+        sys.exit(1)
 
 
 if __name__ == "__main__":

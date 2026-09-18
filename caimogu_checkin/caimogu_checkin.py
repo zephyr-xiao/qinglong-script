@@ -10,6 +10,8 @@ AI/模板双模式生成拟人评论，每天在指定板块回复若干帖子�
 环境变量：
   CAIMOGU_COOKIE            登录 Cookie 字符串（优先凭证）
   CAIMOGU_AUTH_FILE         auth_state.json 路径（回退凭证；默认脚本同目录）
+  CAIMOGU_ACCOUNTS          自动登录账号，格式 用户名#密码（手机号/用户名均可）
+                            兼容旧写法：CAIMOGU_USER + CAIMOGU_PASSWORD
   CAIMOGU_CIRCLE_URL        板块地址（默认 https://www.caimogu.cc/circle/308.html）
   CAIMOGU_REPLY_COUNT       每天回帖数（默认 3）
   CAIMOGU_MIN_DELAY         回帖最小间隔秒（默认 8）
@@ -25,6 +27,8 @@ AI/模板双模式生成拟人评论，每天在指定板块回复若干帖子�
   CAIMOGU_CHROMIUM_PATH     chromium 绝对路径（默认自动搜索系统路径）
   CAIMOGU_TIMEOUT_MS        Playwright 页面超时毫秒（默认 90000）
   CAIMOGU_PROXY             可选代理 http://host:port（默认空）
+                                   未配置时自动回退青龙全局代理（HTTPS_PROXY /
+                                   HTTP_PROXY / ALL_PROXY），仍为空则直连
 
 用法：
   python caimogu_qinglong.py            执行自动回帖
@@ -112,6 +116,46 @@ def env_int(name, default):
         return default
 
 
+# 青龙面板「配置文件 / 环境变量」里配置的全局代理变量
+GLOBAL_PROXY_KEYS = (
+    "HTTPS_PROXY", "https_proxy",
+    "HTTP_PROXY", "http_proxy",
+    "ALL_PROXY", "all_proxy",
+)
+
+
+def resolve_proxy(*specific_keys):
+    """
+    解析代理地址，返回 (代理地址, 来源变量名)，两者均可能为空字符串。
+
+    优先级：脚本专属变量 > 青龙全局代理变量 > 空（直连）。
+    Playwright 的 launch(proxy=...) 不读取环境变量，故必须显式取值。
+    """
+    for name in specific_keys:
+        value = (os.getenv(name) or "").strip()
+        if value:
+            return value, name
+    for name in GLOBAL_PROXY_KEYS:
+        value = (os.getenv(name) or "").strip()
+        if value:
+            return value, name
+    return "", ""
+
+
+def parse_account(raw: str) -> tuple:
+    """
+    解析「用户名#密码」格式的账号配置，返回 (用户名, 密码)，解析失败返回空串。
+
+    兼容多组写法（& 或换行分隔），但本脚本的自动登录流程按单账号设计，只取第一组。
+    """
+    first = next((item.strip() for item in raw.replace("\n", "&").split("&") if item.strip()), "")
+    if "#" not in first:
+        return "", ""
+    user, pwd = first.split("#", 1)
+    user, pwd = user.strip(), pwd.strip()
+    return (user, pwd) if user and pwd else ("", "")
+
+
 def parse_cookie_str(s):
     """'a=1; b=2' -> {'a':'1','b':'2'}"""
     jar = {}
@@ -161,6 +205,16 @@ DEFAULT_CONFIG = {
 
 def load_config():
     """从青龙环境变量读取配置，默认值与 Windows 版 DEFAULT_CONFIG 对齐"""
+    proxy, proxy_source = resolve_proxy("CAIMOGU_PROXY")
+
+    # 账号密码：优先合并式 CAIMOGU_ACCOUNTS（用户名#密码），回退旧的分开写法
+    accounts_raw = os.getenv("CAIMOGU_ACCOUNTS", "").strip()
+    if accounts_raw:
+        login_user, login_password = parse_account(accounts_raw)
+    else:
+        login_user = os.getenv("CAIMOGU_USER", "").strip()
+        login_password = os.getenv("CAIMOGU_PASSWORD", "").strip()
+
     cfg = {
         "circle_url": os.getenv("CAIMOGU_CIRCLE_URL", DEFAULT_CONFIG["circle_url"]),
         "reply_count": env_int("CAIMOGU_REPLY_COUNT", DEFAULT_CONFIG["reply_count"]),
@@ -174,11 +228,14 @@ def load_config():
         "ai_timeout": env_int("CAIMOGU_AI_TIMEOUT", DEFAULT_CONFIG["ai_timeout"]),
         "cookie": os.getenv("CAIMOGU_COOKIE", ""),
         "auth_file": os.getenv("CAIMOGU_AUTH_FILE", str(SCRIPT_DIR / "auth_state.json")),
+        "user": login_user,
+        "password": login_password,
         "notify": env_bool("CAIMOGU_NOTIFY", True),
         "notify_only_fail": env_bool("CAIMOGU_NOTIFY_ONLY_FAIL", False),
         "debug": env_bool("CAIMOGU_DEBUG", False),
         "chromium_path": os.getenv("CAIMOGU_CHROMIUM_PATH", ""),
-        "proxy": os.getenv("CAIMOGU_PROXY", ""),
+        "proxy": proxy,
+        "proxy_source": proxy_source,
     }
     return cfg
 
@@ -1219,15 +1276,40 @@ def input_comment(page, editor, comment, logger):
         return False
 
 
+class LoginExpiredError(Exception):
+    """登录态失效（如 cmg_token 过期）时抛出，用于中断整个回帖流程。"""
+
+
 def submit_reply(page, logger):
-    """查找并点击提交按钮，返回是否成功"""
+    """查找并点击提交按钮，返回是否成功。
+    若被 swal2「未登录/登录」弹窗拦截则抛 LoginExpiredError 中断流程。"""
     btn, sel = first_element(page, SELECTORS["submit"])
     if btn:
         try:
-            btn.click()
+            btn.click(timeout=10000)
             logger.info("点击提交按钮: %s", sel)
             return True
         except Exception as e:
+            # 区分「登录失效」与「其他点击问题」：swal2 弹窗拦截时明确提示
+            swal_text = ""
+            try:
+                el = page.query_selector(".swal2-popup")
+                swal_text = el.inner_text() if el else ""
+            except Exception:
+                pass
+            if "登录" in swal_text or "未登录" in swal_text:
+                # 登录失效：关闭弹窗，抛专用异常让上层中断后续回帖
+                try:
+                    page.keyboard.press("Escape")
+                except Exception:
+                    pass
+                swal_clean = swal_text.replace("\n", " ").strip()
+                logger.error(
+                    "提交被「%s」弹窗拦截，登录态可能已失效！"
+                    "请更换有效的 CAIMOGU_COOKIE 后重试",
+                    swal_clean,
+                )
+                raise LoginExpiredError(swal_clean)
             logger.error("点击提交按钮失败: %s", e)
             return False
 
@@ -1302,6 +1384,9 @@ def reply_to_post(page, post_url, config, logger):
         _debug_shot(page, "reply_ok")
         return True
 
+    except LoginExpiredError:
+        # 登录失效：原样向上抛出，由 run_signin 中断整个回帖流程
+        raise
     except Exception as e:
         logger.error("回复帖子时出错: %s", e)
         _debug_shot(page, "exception")
@@ -1309,23 +1394,102 @@ def reply_to_post(page, post_url, config, logger):
 
 
 def check_login_status(page, logger):
-    """检查登录状态是否有效"""
+    """检查登录状态是否有效。
+
+    实测：caimogu 对「token 过期」的页面渲染与正常登录几乎无差别
+    （回复框、回复按钮、头部菜单照常显示），真正校验发生在点击提交时，
+    由 swal2「您还未登录」弹窗提示。因此这里只做「彻底未登录」的拦截，
+    无法靠页面 DOM 判断 token 是否过期；更可靠的失效检测在 submit_reply
+    提交环节（见 LoginExpiredError）。
+    """
     try:
         page.goto("https://www.caimogu.cc/", timeout=60000, wait_until="domcontentloaded")
         page.wait_for_timeout(2000)
 
-        login_links = page.query_selector_all(SELECTORS["login_link"])
-        for link in login_links:
-            try:
-                text = link.inner_text()
-                if "登录" in text or "登陆" in text:
-                    return False
-            except Exception:
-                continue
+        # 彻底未登录：页面存在「登录/注册」字样或 /login 跳转入口
+        has_login_entry = page.query_selector(
+            'a[href*="/login"], a[href*="login.html"], '
+            'a:has-text("登录"), button:has-text("登录"), '
+            'a:has-text("注册"), button:has-text("注册")'
+        )
+        if has_login_entry:
+            logger.warning("检测到未登录（页面存在登录/注册入口）")
+            return False
+
+        # 没有明确未登录标志：放行。token 是否过期由提交环节最终校验，
+        # 若失效会抛 LoginExpiredError 并中断流程，不会误回帖。
+        logger.info("未检测到明确的未登录标志，继续（最终以提交校验为准）")
         return True
     except Exception as e:
         logger.warning("检查登录状态时出错: %s", e)
         return True
+
+
+def auto_login(page, config, logger):
+    """用账号密码自动登录 caimogu，登录成功返回 True。
+
+    实测：caimogu 登录面板默认是微信/Apple 快速登录，账号密码表单藏在
+    .switch-login（div，「手机号 / 账号 登录」）里，需点击它切换；且该面板在
+    headless 下原生 click/fill 时序不稳定，故全程用 JS 注入交互。
+    账号密码登录无图形/滑块验证码（.verify-code 的「获取验证码」属短信登录）。
+    """
+    user, pwd = config.get("user", ""), config.get("password", "")
+    if not (user and pwd):
+        logger.error("未配置 CAIMOGU_ACCOUNTS（格式：用户名#密码），无法自动登录")
+        return False
+    try:
+        page.goto("https://www.caimogu.cc/login.html", timeout=60000,
+                  wait_until="domcontentloaded")
+        page.wait_for_timeout(3000)
+
+        # 点击 .switch-login 切换到账号密码面板
+        page.evaluate("""() => {
+            const el = document.querySelector('.switch-login');
+            if (el) el.dispatchEvent(new MouseEvent('click', {bubbles: true}));
+        }""")
+        page.wait_for_timeout(1200)
+
+        # 填账号密码（仅操作可见输入框，避开注册/找回等隐藏表单的同名元素）
+        filled = page.evaluate("""(a) => {
+            const vis = [...document.querySelectorAll('input')]
+                .filter(i => i.offsetParent !== null);
+            let u = false, p = false;
+            const acc = vis.find(i => i.name === 'account');
+            const pw = vis.find(i => i.name === 'password');
+            if (acc) { acc.value = a.account; acc.dispatchEvent(new Event('input', {bubbles:true})); u = true; }
+            if (pw)  { pw.value  = a.password; pw.dispatchEvent(new Event('input', {bubbles:true})); p = true; }
+            return {u, p};
+        }""", {"account": user, "password": pwd})
+        if not (filled.get("u") and filled.get("p")):
+            logger.error("自动登录：未找到可见的账号/密码输入框")
+            return False
+        page.wait_for_timeout(300)
+
+        # 点登录按钮
+        page.evaluate("""() => {
+            const b = document.querySelector('.btn-login');
+            if (b) b.dispatchEvent(new MouseEvent('click', {bubbles: true}));
+        }""")
+        page.wait_for_timeout(4000)  # 等待登录跳转
+
+        # 验证登录成功：优先看「退出」菜单（登录后必有，最可靠），再看 URL 离开登录页
+        ok = page.evaluate("""() => {
+            if ([...document.querySelectorAll('a,button')]
+                    .some(e => e.innerText && e.innerText.trim() === '退出')) {
+                return true;
+            }
+            return !location.pathname.includes('login')
+                && !location.href.includes('/login');
+        }""")
+        if ok:
+            logger.info("自动登录成功")
+            return True
+        logger.error("自动登录：登录后仍停留在登录页，可能密码错误或账号异常")
+        return False
+    except Exception as e:
+        logger.error("自动登录出错: %s", e)
+        return False
+
 
 # ============================================================
 #  9. 回帖主流程
@@ -1348,8 +1512,10 @@ def run_signin(config, logger):
     logger.info("今天已记录成功回复 %d 条，本次还需要回复 %d 条。", already_count, remaining_count)
 
     cookies, storage_state = _load_auth(config, logger)
-    if not cookies and not storage_state:
-        msg = "未找到登录凭证！请设置 CAIMOGU_COOKIE 环境变量，或把 auth_state.json 放到脚本同目录"
+    has_account = bool(config.get("user") and config.get("password"))
+    if not cookies and not storage_state and not has_account:
+        msg = "未找到登录凭证！请设置 CAIMOGU_COOKIE 环境变量，或把 auth_state.json 放到脚本同目录，"
+        msg += "或配置 CAIMOGU_ACCOUNTS（用户名#密码）以便自动登录"
         logger.error(msg)
         return {"success": False, "done": already_count, "target": reply_count, "message": msg}
 
@@ -1366,9 +1532,24 @@ def run_signin(config, logger):
             page = context.new_page()
 
             if not check_login_status(page, logger):
-                msg = "登录状态已失效！请重新导入 Cookie（CAIMOGU_COOKIE）或 auth_state.json"
-                logger.error(msg)
-                return {"success": False, "done": already_count, "target": reply_count, "message": msg}
+                if has_account:
+                    logger.warning("检测到未登录，尝试用账号密码自动登录...")
+                    if not auto_login(page, config, logger):
+                        msg = "自动登录失败，请检查 CAIMOGU_ACCOUNTS 是否正确，或更新 CAIMOGU_COOKIE"
+                        logger.error(msg)
+                        return {"success": False, "done": already_count,
+                                "target": reply_count, "message": msg}
+                    # 登录成功后持久化（供后续直接复用，减少重复登录）
+                    try:
+                        context.storage_state(path=config.get("auth_file"))
+                        logger.info("已持久化登录态到 %s", config.get("auth_file"))
+                    except Exception as e:
+                        logger.warning("持久化登录态失败: %s", e)
+                else:
+                    msg = "登录状态已失效，且未配置自动登录账号（CAIMOGU_ACCOUNTS）"
+                    logger.error(msg)
+                    return {"success": False, "done": already_count,
+                            "target": reply_count, "message": msg}
 
             logger.info("登录状态有效")
 
@@ -1395,7 +1576,34 @@ def run_signin(config, logger):
                             i + 1, remaining_count, success_count, reply_count)
                 logger.info("标题: %s", post["title"])
 
-                if reply_to_post(page, post["url"], config, logger):
+                # 提交时可能触发登录失效：若配了账号密码则自动登录后重试一次
+                retried = False
+                while True:
+                    try:
+                        replied = reply_to_post(page, post["url"], config, logger)
+                        break
+                    except LoginExpiredError as e:
+                        if not has_account or retried:
+                            # 无账号密码（或已重试过）→ 立即终止整个流程
+                            logger.error("登录态失效且无法自动恢复，终止回帖流程")
+                            return {"success": False, "done": success_count,
+                                    "target": reply_count,
+                                    "message": "登录态已失效（token 过期），请更换有效的 CAIMOGU_COOKIE"
+                                               " 或配置 CAIMOGU_ACCOUNTS（用户名#密码）"}
+                        # 有账号密码：自动登录后重试当前帖子一次
+                        logger.warning("提交时发现登录失效（%s），尝试自动登录后重试该帖...", e)
+                        retried = True
+                        if not auto_login(page, config, logger):
+                            return {"success": False, "done": success_count,
+                                    "target": reply_count,
+                                    "message": "自动登录失败，请检查账号密码或更新 CAIMOGU_COOKIE"}
+                        try:
+                            context.storage_state(path=config.get("auth_file"))
+                            logger.info("已持久化登录态到 %s", config.get("auth_file"))
+                        except Exception as se:
+                            logger.warning("持久化登录态失败: %s", se)
+
+                if replied:
                     success_count += 1
                     logger.info("回复成功 (%d/%d)", success_count, reply_count)
                     mark_today_progress(success_count, reply_count, post_id)
@@ -1499,6 +1707,15 @@ def main():
 
     _CONFIG = load_config()
     _DEBUG = _CONFIG.get("debug", False)
+
+    _proxy = _CONFIG.get("proxy", "")
+    _proxy_src = _CONFIG.get("proxy_source", "")
+    if not _proxy:
+        print("ℹ️ 未配置 CAIMOGU_PROXY 且未检测到青龙全局代理，直连访问")
+    elif _proxy_src == "CAIMOGU_PROXY":
+        print(f"🌐 使用代理: {_proxy}")
+    else:
+        print(f"🌐 使用青龙全局代理（{_proxy_src}）: {_proxy}")
 
     _ensure_browser_deps()
     logger = setup_logging()

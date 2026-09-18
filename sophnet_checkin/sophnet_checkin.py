@@ -144,7 +144,7 @@ def _is_already_signed(msg: str) -> bool:
     """判定 message 是否表示"今日已签到"的幂等提示。"""
     if not msg:
         return False
-    # "signed" 单独匹配会误伤 "unsigned" 等词，改为组合匹配；"already" 语义明确可单独保留
+    # "signed" 单独匹配会误伤 "unsigned" 等词，故用组合短语匹配；"already" 语义明确可单独保留
     keywords = ["今日已签到", "已签到", "已经签到", "重复签到",
                 "already", "signed today"]
     low = msg.lower()

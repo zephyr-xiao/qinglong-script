@@ -9,7 +9,12 @@
  *                              2) JSON 单对象: {"name":"主号","cookie":"..."}
  *                              3) 原始 cookie 字符串（自动当作"默认账号"）
  *   HOST                     【可选】强制锁定签到域名，留空则自动从发布页抓取
- *   IKUUU_PROXY              【可选】HTTP 代理（ikuuu 被墙必备），如 http://172.17.0.1:7890
+ *   IKUUU_PUBLISH_URL        【可选】发布页地址，默认 https://ikuuu.win/
+ *                                      ikuuu 的"最新域名"发布页会整体迁移域名，
+ *                                      迁移时改这里即可
+ *   IKUUU_PROXY              【可选】HTTP 代理（ikuuu 被墙，建议配置），如 http://172.17.0.1:7890
+ *                                      未配置时自动回退青龙全局代理（HTTPS_PROXY /
+ *                                      HTTP_PROXY / ALL_PROXY / GLOBAL_AGENT_*）
  *   IKUUU_NOTIFY_ONLY_FAIL   【可选】1 = 仅失败时推送，0/留空 = 全部推送
  *   IKUUU_DEBUG              【可选】1 = 打印详细调试信息（域名抓取/响应原文/重试等）
  *
@@ -29,9 +34,27 @@ const DEBUG = process.env.IKUUU_DEBUG === '1';
 const NOTIFY_ONLY_FAIL = process.env.IKUUU_NOTIFY_ONLY_FAIL === '1';
 const TIMEOUT_MS = 15000;
 
-// 代理支持（ikuuu 被墙，青龙容器需 IKUUU_PROXY=http://代理地址 才能直连签到域名）
-const IKUUU_PROXY = (process.env.IKUUU_PROXY || '').trim();
-const proxyAgent = IKUUU_PROXY ? new ProxyAgent(IKUUU_PROXY) : null;
+// 代理支持（ikuuu 被墙，直连签到域名需代理）：
+// 优先级 IKUUU_PROXY > 青龙全局代理变量 > 无代理（走公共 CORS 通道兜底）。
+// undici 的 fetch 不读取环境变量，global-agent 也管不到它，故此处显式解析。
+const GLOBAL_PROXY_KEYS = [
+  'HTTPS_PROXY', 'https_proxy',
+  'HTTP_PROXY', 'http_proxy',
+  'ALL_PROXY', 'all_proxy',
+  'GLOBAL_AGENT_HTTPS_PROXY', 'GLOBAL_AGENT_HTTP_PROXY',
+];
+
+// 返回 { url, source }，source 为命中的变量名，未命中则两者均为空串
+function resolveProxy(specificKeys = []) {
+  for (const key of [...specificKeys, ...GLOBAL_PROXY_KEYS]) {
+    const value = (process.env[key] || '').trim();
+    if (value) return { url: value, source: key };
+  }
+  return { url: '', source: '' };
+}
+
+const { url: PROXY, source: PROXY_SOURCE } = resolveProxy(['IKUUU_PROXY']);
+const proxyAgent = PROXY ? new ProxyAgent(PROXY) : null;
 const FETCH_OPTIONS = proxyAgent ? { dispatcher: proxyAgent } : {};
 
 // 统一带代理的 fetch（代理与超时在此注入，调用处保持简洁）
@@ -81,39 +104,107 @@ function normalizeAccounts(rawAccounts) {
 // ==========================================
 // 2. 动态获取最新签到主域名
 // ==========================================
-async function fetchHostFromProxy() {
-  // 通过 allorigins 公共代理绕过网络墙抓发布页
-  const targetUrl = encodeURIComponent('https://ikuuu.eu/');
-  const proxyUrl = `https://api.allorigins.win/raw?url=${targetUrl}`;
-  dbg('正则抓取发布页域名, 代理:', proxyUrl);
 
-  const response = await fetchWithProxy(proxyUrl, {
-    method: 'GET',
-    headers: { 'User-Agent': UA },
-    signal: AbortSignal.timeout(TIMEOUT_MS),
-  });
+// 发布页地址。ikuuu 的"最新域名"发布页会整体迁移域名，迁移时优先用环境变量覆盖，
+// 避免必须改代码。
+const DEFAULT_PUBLISH_URL = 'https://ikuuu.win/';
+const PUBLISH_URL = (process.env.IKUUU_PUBLISH_URL || '').trim() || DEFAULT_PUBLISH_URL;
 
-  const html = await response.text();
-  dbg('发布页 HTML 长度:', html.length, '前80字符:', html.substring(0, 80).replace(/\s+/g, ' '));
+// 发布页自身域名（含已知的备用域名）：只能用来抓取，绝不能当签到面板。
+// 发布页是 nginx 静态站，POST /user/checkin 会返回 405，误当作面板会直接签到失败。
+const PUBLISH_HOSTS = new Set(['ikuuu.win', 'ikuuu.eu']);
+try {
+  PUBLISH_HOSTS.add(new URL(PUBLISH_URL).hostname.toLowerCase());
+} catch (e) {
+  dbg('IKUUU_PUBLISH_URL 不是合法 URL，仅按已知发布页域名过滤:', PUBLISH_URL);
+}
 
-  if (!html) return null;
+// 静态兜底面板域名，数组顺序即尝试顺序（与发布页当前标注的"主要域名 / 备用域名 1"一致）。
+// 发布页已改用 javascript-obfuscator 把域名拆成多段字符串再拼接（如 'ikuuu'+'.top'），
+// 静态正则只能还原出其中一部分，所以必须保留兜底列表，否则抓取失败时无可用目标。
+const FALLBACK_HOSTS = ['ikuuu.top', 'ikuuu.pw'];
 
-  // 收紧匹配：优先带 https 的链接里出现的 ikuuu.xxx 域名，避免抓到脚注释里的兜底域名
-  // 例: https://ikuuu.win  或 href="https://ikuuu.ac" target="_blank"
-  const candidates = [];
-  const linkRe = /https?:\/\/(ikuuu\.[a-z]+)/gi;
+// 折叠 JS 里相邻字符串字面量的拼接：'ikuuu'+'.top' → 'ikuuu.top'
+// 发布页靠这种拼接隐藏域名，不折叠则一条都匹配不到
+function collapseStringConcat(code) {
+  let prev;
+  let out = code;
+  do {
+    prev = out;
+    out = out.replace(/(['"])([^'"]*)\1\s*\+\s*(['"])([^'"]*)\3/g, (m, q1, s1, q2, s2) => `'${s1}${s2}'`);
+  } while (out !== prev);
+  return out;
+}
+
+// 从发布页 HTML 提取候选签到域名（排除发布页自身域名，去重，保持页面上的先后顺序）
+function extractHosts(html) {
+  const normalized = collapseStringConcat(html || '');
+  const hosts = [];
+  const push = (host) => {
+    const h = host.toLowerCase();
+    if (!PUBLISH_HOSTS.has(h) && !hosts.includes(h)) hosts.push(h);
+  };
+
+  // 优先取链接里的域名（带协议），顺序更贴近页面标注的"主要/备用"
+  const urlRe = /https?:\/\/(ikuuu\.[a-z]+)/gi;
   let m;
-  while ((m = linkRe.exec(html)) !== null) {
-    candidates.push(m[1].toLowerCase());
-  }
-  // 兜底：若无带协议的，退回纯域名匹配
-  if (candidates.length === 0) {
-    const fallback = html.match(/ikuuu\.([a-z]+)/i);
-    if (fallback) candidates.push(fallback[0].toLowerCase());
+  while ((m = urlRe.exec(normalized)) !== null) push(m[1]);
+
+  // 补齐只以纯文本/裸字符串出现的域名
+  const bareRe = /ikuuu\.[a-z]+/gi;
+  while ((m = bareRe.exec(normalized)) !== null) push(m[0]);
+
+  return hosts;
+}
+
+// 公共 CORS 代理列表（发布页被墙时靠它们绕过，多备选提高可达率）
+const CORS_PROXIES = [
+  { name: 'allorigins', build: (u) => `https://api.allorigins.win/raw?url=${encodeURIComponent(u)}` },
+  { name: 'cors.lol', build: (u) => `https://api.cors.lol/?url=${encodeURIComponent(u)}` },
+  { name: 'whateverorigin', build: (u) => `https://www.whateverorigin.org/get?url=${encodeURIComponent(u)}` },
+];
+
+// 抓取发布页 HTML，各通道都失败时返回空串（调用方按抓取失败处理）
+async function fetchPublishPage(publishUrl) {
+  // 通道 1：配了代理时优先直连发布页（用户自己的代理最可靠，兑现「打不开用代理」）
+  if (PROXY) {
+    try {
+      dbg(`通道1: 走代理(${PROXY_SOURCE})直连发布页`, publishUrl);
+      const response = await fetchWithProxy(publishUrl, {
+        method: 'GET',
+        headers: { 'User-Agent': UA },
+        signal: AbortSignal.timeout(TIMEOUT_MS),
+      });
+      const html = await response.text();
+      dbg('通道1 发布页 HTML 长度:', html.length);
+      if (extractHosts(html).length > 0) return html;
+      dbg('通道1 未匹配到有效域名');
+    } catch (err) {
+      dbg('通道1 异常:', err.message);
+    }
   }
 
-  // 去掉"发布页自身"域名 ikuuu.eu，返回去重后的候选列表（可能为空）
-  return [...new Set(candidates.filter((c) => c !== 'ikuuu.eu'))];
+  // 通道 2：公共 CORS 代理逐个尝试（发布页被墙时靠它们绕过）
+  for (const p of CORS_PROXIES) {
+    try {
+      dbg(`通道2: 公共代理 ${p.name} 抓发布页`);
+      const response = await fetchWithProxy(p.build(publishUrl), {
+        method: 'GET',
+        headers: { 'User-Agent': UA },
+        signal: AbortSignal.timeout(TIMEOUT_MS),
+      });
+      const html = await response.text();
+      if (extractHosts(html).length > 0) {
+        dbg(`通道2 公共代理 ${p.name} 成功`);
+        return html;
+      }
+      dbg(`通道2 公共代理 ${p.name} 未匹配到有效域名`);
+    } catch (err) {
+      dbg(`通道2 公共代理 ${p.name} 异常:`, err.message);
+    }
+  }
+
+  return '';
 }
 
 async function getLatestHosts() {
@@ -124,26 +215,34 @@ async function getLatestHosts() {
     return [forcedHost];
   }
 
-  console.log('[域名加载] 尝试从发布页 https://ikuuu.eu/ 获取最新主域名...');
-  let candidates = [];
+  console.log(`[域名加载] 尝试从发布页 ${PUBLISH_URL} 获取最新主域名...`);
+  const hosts = [];
   try {
-    candidates = await fetchHostFromProxy();
-    if (candidates.length > 0) {
-      console.log(`[域名加载] 🎉 成功获取当前候选域名: ${candidates.join(', ')}`);
+    const html = await fetchPublishPage(PUBLISH_URL);
+    if (!html) {
+      console.log('[域名加载] ⚠️ 发布页抓取失败（各通道均不可用）');
     } else {
-      console.log('[域名加载] ⚠️ 发布页解析失败，未匹配到有效域名');
+      const found = extractHosts(html);
+      if (found.length > 0) {
+        console.log(`[域名加载] 🎉 成功获取当前候选域名: ${found.join(', ')}`);
+        hosts.push(...found);
+      } else {
+        console.log('[域名加载] ⚠️ 发布页解析成功但未匹配到域名（域名被混淆，仅能靠兜底列表）');
+      }
     }
   } catch (err) {
     console.log(`[域名加载] ❌ 获取动态域名异常: ${err.message}`);
   }
 
-  // 兜底域名始终追加（发布页已改混淆 JS 渲染，静态抓取常失败，兜底保证可用）
-  const fallbackHost = 'ikuuu.win';
-  if (!candidates.includes(fallbackHost)) {
-    candidates.push(fallbackHost);
+  // 兜底域名始终补齐（发布页已改混淆 JS 渲染，静态抓取只能还原部分域名，兜底保证可用）
+  for (const h of FALLBACK_HOSTS) {
+    if (!hosts.includes(h)) hosts.push(h);
   }
-  console.log(`[域名加载] 最终域名列表: ${candidates.join(', ')}`);
-  return candidates;
+
+  // 最后一道保险：发布页自身域名绝不进签到候选（它是静态页，签到只会拿到 405）
+  const finalHosts = hosts.filter((h) => !PUBLISH_HOSTS.has(h));
+  console.log(`[域名加载] 最终域名列表: ${finalHosts.join(', ')}`);
+  return finalHosts;
 }
 
 // ==========================================
@@ -156,10 +255,19 @@ async function getLatestHosts() {
 //     parse_err    响应非 JSON 且非 HTML 登录页，无法判定
 //     network_err  请求异常
 // ==========================================
-function classify(text, httpStatus) {
+function classify(text, httpStatus, location) {
   dbg('签到响应 httpStatus=', httpStatus, '原文前120字:', text.substring(0, 120).replace(/\s+/g, ' '));
 
   // ★ HTTP 状态码是强信号，优先分类（网关错误页/风控页可能不是 HTML 头，正文解析会漏）
+  // 重定向：cookie 失效会跳到登录页；登录页是 base64 混淆 SPA，正文无 login/登录/auth 关键词，
+  // 必须靠 Location 头精确区分「Cookie 失效跳登录」与「域名被墙/重定向」。
+  if ([301, 302, 303, 307, 308].includes(httpStatus)) {
+    const loc = (location || '').toLowerCase();
+    if (loc.includes('login') || loc.includes('auth')) {
+      return { status: 'cookie_dead', msg: 'Cookie 已失效（跳转登录页）' };
+    }
+    return { status: 'domain_block', msg: `HTTP ${httpStatus} 重定向到 ${location || '未知地址'}` };
+  }
   if (httpStatus === 401) {
     return { status: 'cookie_dead', msg: 'HTTP 401 未授权，Cookie 已失效' };
   }
@@ -168,6 +276,10 @@ function classify(text, httpStatus) {
   }
   if (httpStatus === 404) {
     return { status: 'domain_block', msg: 'HTTP 404 接口路径不存在（域名或路径变化）' };
+  }
+  if (httpStatus === 405) {
+    // 发布页是 nginx 静态站，不接受 POST —— 说明当前域名压根不是签到面板
+    return { status: 'domain_block', msg: 'HTTP 405 该域名不是签到面板（疑似发布页）' };
   }
   if (httpStatus === 429) {
     return { status: 'network_err', msg: 'HTTP 429 请求过于频繁（限流）' };
@@ -198,7 +310,8 @@ function classify(text, httpStatus) {
   const raw = (data.msg || data.message || '').toString();
 
   // 已签到的常见文案 → 幂等成功
-  if (/已签到|重复|already|signed|今日已|明天再来/.test(raw)) {
+  // （"已经签到" 与 "已签到" 是两种常见写法，SSPanel 默认文案为前者的变体，两种都要认）
+  if (/已(经)?签到|重复|already|signed|今日已|明天再来/.test(raw)) {
     return { status: 'already', msg: raw || '今日已签到' };
   }
 
@@ -218,6 +331,8 @@ async function checkInOnce(account, host) {
 
   const response = await fetchWithProxy(checkInUrl, {
     method: 'POST',
+    // 不跟随重定向：保留 302 + Location 才能区分「Cookie 失效跳登录」与「域名被墙」
+    redirect: 'manual',
     headers: {
       Cookie: account.cookie,
       'User-Agent': UA,
@@ -227,8 +342,10 @@ async function checkInOnce(account, host) {
     signal: AbortSignal.timeout(TIMEOUT_MS),
   });
 
+  // 302 时 Location 是分类关键（登录页为混淆 SPA，正文无关键词可判）
+  const location = response.headers.get('location');
   const text = await response.text();
-  return classify(text, response.status);
+  return classify(text, response.status, location);
 }
 
 // 带重试的签到
@@ -285,6 +402,14 @@ function resultText(result) {
 // ==========================================
 async function main() {
   console.log('=== iKuuu 青龙自动签到开始 ===\n');
+
+  if (PROXY) {
+    console.log(PROXY_SOURCE === 'IKUUU_PROXY'
+      ? `代理: ${PROXY}`
+      : `代理: ${PROXY}（来源: ${PROXY_SOURCE}）`);
+  } else {
+    console.log('代理: 未配置（发布页走公共 CORS 通道兜底）');
+  }
 
   if (!process.env.ACCOUNTS) {
     console.error('❌ 未配置 ACCOUNTS 环境变量');
@@ -384,7 +509,16 @@ async function main() {
 }
 
 // 导出纯函数供单元测试使用（青龙直接运行不受影响）
-module.exports = { classify, normalizeAccounts, maskName };
+module.exports = {
+  classify,
+  normalizeAccounts,
+  maskName,
+  extractHosts,
+  collapseStringConcat,
+  getLatestHosts,
+  PUBLISH_HOSTS,
+  FALLBACK_HOSTS,
+};
 
 if (require.main === module) {
   main().catch((err) => {

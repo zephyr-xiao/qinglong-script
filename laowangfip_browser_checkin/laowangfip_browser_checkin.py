@@ -13,8 +13,11 @@ cron: 30 8 * * *
 
 环境变量：
   LWFIP_ACCOUNTS              必填 用户名#密码，多账号用 & 或换行分隔
-  LWFIP_PROXY                 必填 HTTP 代理（被墙必备）
+  LWFIP_PROXY                 可选 HTTP 代理（站点被墙，建议配置）
                                    例：http://172.17.0.1:7890
+                                   未配置时自动回退青龙全局代理（HTTPS_PROXY /
+                                   HTTP_PROXY / ALL_PROXY），仍为空则直连尝试
+  LWFIP_PROXY_REQUIRED        可选 默认 false，true 时缺代理直接报错退出
   LWFIP_BASE_URL              可选 默认 https://laowangfip372.vip
   LWFIP_NOTIFY                可选 默认 true
   LWFIP_TIMEOUT               可选 默认 30000（毫秒）
@@ -24,7 +27,7 @@ cron: 30 8 * * *
   LWFIP_MAX_CAPTCHA_RETRY     可选 默认 5，单次拼图失败重试次数
   LWFIP_NOTIFY_ONLY_FAIL      可选 默认 false，true 时仅在有失败时推送
   LWFIP_MAX_RETRY             可选 默认 5，账号级任务重试次数
-  LWFIP_RETRY_INTERVAL        可选 默认 300（秒），账号级重试间隔
+  LWFIP_RETRY_INTERVAL        可选 默认 60（秒），账号级重试间隔
   LWFIP_COOKIE_CACHE          可选 默认 true，登录成功后会话 Cookie 落盘复用，
                                     后续任务/重试直通签到跳过滑块；false 关闭
 
@@ -59,7 +62,7 @@ except Exception:
 
 # Playwright
 try:
-    from playwright.async_api import async_playwright, TimeoutError as PWTimeout, Error as PWError
+    from playwright.async_api import async_playwright, TimeoutError as PWTimeout
 except ImportError:
     print("❌ 缺少 playwright，请安装：")
     print("   pip install playwright")
@@ -106,11 +109,13 @@ SIGN_PAGE_PATH = "/plugin.php?id=k_misign:sign"
 SEL_USERNAME_INPUT = "input[name='username']"
 SEL_PASSWORD_INPUT = "input[name='password']"
 SEL_LOGIN_SUBMIT = "button[name='loginsubmit'], #captcha_submit"
-SEL_LOGIN_LINK = "a:has-text('登录'), a:has-text('登 录'), #lsubmit"
 
 # tncode 验证码
 SEL_TNCODE_TRIGGER = "#tncode"
-SEL_TNCODE_DIV = "#tncode_div"
+# 弹窗容器真实 DOM：<div class="tncode_div is-ready" id="tncode_box">（探针实测），
+# id 是 tncode_box 而 class 才是 tncode_div；此处必须用单一简单选择器，
+# 因为 _wait_loading_gone 等处会拼 `{SEL_TNCODE_DIV} .loading` 后代选择器
+SEL_TNCODE_DIV = "#tncode_box"
 SEL_TNCODE_CANVAS_BG = ".tncode_canvas_bg"
 SEL_TNCODE_CANVAS_MARK = ".tncode_canvas_mark"
 SEL_SLIDE_BLOCK = ".slide_block"
@@ -118,9 +123,6 @@ SEL_SLIDE_TRACK = ".slide"
 SEL_TNCODE_REFRESH = ".tncode_refresh"
 SEL_TNCODE_MSG_OK = ".tncode_msg_ok"
 SEL_TNCODE_MSG_ERROR = ".tncode_msg_error"
-
-# 签到
-SEL_SIGN_BUTTON = "a.J_chkitot, a[href*='qiandao'], #JD_sign, a:has-text('签到'), button:has-text('签到')"
 
 # 滑块识别参数
 TEMPLATE_THRESHOLD = 0.30
@@ -131,7 +133,7 @@ OVERSHOOT_PX = (5, 15)
 
 # 账号级重试参数默认值（可由环境变量 LWFIP_MAX_RETRY / LWFIP_RETRY_INTERVAL 覆盖）
 MAX_RETRY = 5
-RETRY_INTERVAL_SEC = 300  # 5 分钟
+RETRY_INTERVAL_SEC = 60  # 1 分钟
 
 DEFAULT_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -154,6 +156,35 @@ def env_int(name: str, default: int) -> int:
         return int(os.getenv(name) or default)
     except Exception:
         return default
+
+
+# 青龙面板「配置文件 / 环境变量」里配置的全局代理变量
+GLOBAL_PROXY_KEYS = (
+    "HTTPS_PROXY", "https_proxy",
+    "HTTP_PROXY", "http_proxy",
+    "ALL_PROXY", "all_proxy",
+)
+
+
+def resolve_proxy(*specific_keys: str) -> tuple:
+    """
+    解析代理地址，返回 (代理地址, 来源变量名)，两者均可能为空字符串。
+
+    优先级：脚本专属变量 > 青龙全局代理变量 > 空（直连）。
+
+    这样脚本在未配置专属变量时也能复用青龙面板的全局代理；代理是否必须
+    交由调用方判断，缺失代理本身不视为错误。
+    Playwright 的 launch(proxy=...) 不会读取环境变量，因此必须在这里显式取值。
+    """
+    for name in specific_keys:
+        value = (os.getenv(name) or "").strip()
+        if value:
+            return value, name
+    for name in GLOBAL_PROXY_KEYS:
+        value = (os.getenv(name) or "").strip()
+        if value:
+            return value, name
+    return "", ""
 
 
 def is_retryable_error(err_text: str) -> bool:
@@ -184,6 +215,18 @@ def is_retryable_error(err_text: str) -> bool:
     ]
     lower = err_text.lower()
     return any(kw in lower for kw in retry_keywords)
+
+
+def compact_error(err: BaseException, limit: int = 120) -> str:
+    """
+    压缩异常文本为单行摘要。
+
+    Playwright 错误的 call log 是多行缩进格式，直接 str(e)[:80] 往往
+    截在 'waiting for loca' 这种半句上，把最关键的 locator 名切掉；
+    先折叠全部空白再截断，locator 信息就能保留到摘要里。
+    """
+    text = re.sub(r"\s+", " ", str(err)).strip()
+    return text[:limit]
 
 
 def parse_credentials(env_value: str):
@@ -335,13 +378,12 @@ async def send_notify_with_retry(title: str, content: str) -> bool:
     return False
 
 
-def _format_countqian_value(label: str, value: str, unit: str = "") -> str:
-    """格式化 countqian 统计值，按白名单字段保留单位。"""
+def _format_countqian_value(label: str, value: str) -> str:
+    """格式化 countqian 统计值，按白名单字段附加固定单位。"""
     value = str(value or "").strip()
-    unit = re.sub(r"\s+", "", unit or "")
     if not value:
         return ""
-    # 白名单字段 → 固定单位映射；天数单位直接用识别出的"天"
+    # 白名单字段 → 固定单位映射
     label_units = {
         "连续签到": "天",
         "总天数": "天",
@@ -350,7 +392,6 @@ def _format_countqian_value(label: str, value: str, unit: str = "") -> str:
     }
     expected_unit = label_units.get(label)
     if expected_unit:
-        # 文本里已带单位就直接保留数字 + 固定单位
         return f"{value} {expected_unit}"
     return value
 
@@ -370,8 +411,7 @@ def parse_countqian_stats(items: list[str]) -> dict:
                 value = text.replace(label, "", 1).strip(" ：:　")
                 match = re.search(r"\d+", value)
                 if match:
-                    unit = "天" if label in ("连续签到", "总天数") and "天" in value else ""
-                    stats[label] = _format_countqian_value(label, match.group(0), unit)
+                    stats[label] = _format_countqian_value(label, match.group(0))
                 break
 
     return stats
@@ -387,7 +427,7 @@ def _captcha_log(debug: bool, msg: str):
 def solve_slider_from_screenshot(png_bytes: bytes, debug: bool,
                                  image_bottom_px: int | None = None):
     """
-    从浏览器截屏（按下滑块后）的 #tncode_div 中找出"还需要移动的像素数"。
+    从浏览器截屏（按下滑块后）的 #tncode_box 中找出"还需要移动的像素数"。
 
     实测 laowangfip372.vip 的真实布局（单张图，非三联）：
       - 上部：单张完整背景图，按下滑块后左上角出现绿色边框的拼图碎片
@@ -648,7 +688,7 @@ async def pass_tncode_in_browser(page, debug: bool, max_retry: int = 3) -> tuple
        缺口位置在背景图某处用黑边阴影绘制。
 
     流程：
-      1) 等 #tncode_div 出现并加载完（.loading 消失）
+      1) 等 #tncode_box 弹出（点击无效时自动重新点击触发，自愈）并加载完（.loading 消失）
       2) 按下滑块（mouse.down）
       3) 微动 3px → 截屏前测出 .slide 上沿，作为切图基准
       4) 截屏 → OpenCV 识别 (piece_x, target_x, confidence)
@@ -670,8 +710,15 @@ async def pass_tncode_in_browser(page, debug: bool, max_retry: int = 3) -> tuple
         if await _check_tncode_already_passed(page, debug):
             return True, ""
         try:
-            # 等弹窗加载完
-            await page.wait_for_selector(SEL_TNCODE_DIV, timeout=10000)
+            # 等弹窗真正弹出来（点击无效/资源失败时自动重新点击触发）
+            if not await _ensure_tncode_popup(page, debug):
+                reason = "验证码弹窗未出现（点击触发无效，已自动重试点击）"
+                _captcha_log(debug, reason)
+                failure_reasons.append(reason)
+                await _shot(page, f"tncode_popup_missing_a{attempt}", debug)
+                await _click_refresh(page, debug)
+                await asyncio.sleep(2)
+                continue
 
             # 动态等图片真正加载（替代固定 sleep(5)）
             await _wait_loading_gone(page, debug)
@@ -812,15 +859,18 @@ async def pass_tncode_in_browser(page, debug: bool, max_retry: int = 3) -> tuple
             await asyncio.sleep(1.5)
 
         except PWTimeout as e:
-            failure_reasons.append(f"超时: {str(e)[:80]}")
-            _captcha_log(debug, f"超时: {e}")
+            failure_reasons.append(f"超时: {compact_error(e)}")
+            _captcha_log(debug, f"超时: {compact_error(e)}")
             try:
                 await page.mouse.up()
             except Exception:
                 pass
+            # 超时多为弹窗/资源未就绪，不重新触发的话后续轮次会白等同一个死弹窗
+            await _click_refresh(page, debug)
+            await asyncio.sleep(2)
         except Exception as e:
-            failure_reasons.append(f"异常: {str(e)[:80]}")
-            _captcha_log(debug, f"异常: {e}")
+            failure_reasons.append(f"异常: {compact_error(e)}")
+            _captcha_log(debug, f"异常: {compact_error(e)}")
             try:
                 await page.mouse.up()
             except Exception:
@@ -875,7 +925,7 @@ async def _check_tncode_already_passed(page, debug: bool) -> bool:
 
 async def _wait_loading_gone(page, debug: bool, max_wait: float = 15.0) -> bool:
     """
-    等 #tncode_div 内的 .loading 元素真正消失（图片加载完成）。
+    等 #tncode_box 内的 .loading 元素真正消失（图片加载完成）。
     替代原固定的 5 秒等待——代理慢时最多等 15 秒，
     代理快时 .loading 一消失立即返回，节省多账号累计耗时。
     返回 True 表示加载完成；False 表示超时。
@@ -903,6 +953,54 @@ async def _wait_loading_gone(page, debug: bool, max_wait: float = 15.0) -> bool:
             _captcha_log(debug, f"等图片加载中... ({elapsed:.1f}s)")
             last_log = time.time()
         await asyncio.sleep(0.4)
+    return False
+
+
+async def _wait_tncode_div_visible(page, debug: bool, timeout_ms: int = 3000) -> bool:
+    """等 #tncode_box 真正显示（可见），未显示时按 attached 状态分类记日志。"""
+    try:
+        await page.wait_for_selector(SEL_TNCODE_DIV, timeout=timeout_ms, state="visible")
+        return True
+    except PWTimeout:
+        div = page.locator(SEL_TNCODE_DIV).first
+        try:
+            if await div.count() > 0:
+                _captcha_log(debug, "弹窗 DOM 已存在但未显示（疑似验证码图片/资源加载失败）")
+            else:
+                _captcha_log(debug, "弹窗 DOM 完全不存在（疑似 tncode JS 未加载或点击无效）")
+        except Exception:
+            pass
+        return False
+
+
+async def _ensure_tncode_popup(page, debug: bool, max_triggers: int = 3) -> bool:
+    """
+    确保 tncode 弹窗真正弹出来，返回弹窗是否就绪。
+
+    只点一次 #tncode 就傻等是最大隐患：点击时机过早（JS 未绑完事件）、
+    验证码图片资源在代理下加载失败，都会让弹窗永不出现，后续重试轮
+    全部白等同一个不存在的弹窗。这里主动等 + 未出现就重新点，自愈。
+    """
+    if await _check_tncode_already_passed(page, debug):
+        return True
+
+    for trigger_round in range(1, max_triggers + 1):
+        # 弹窗可能已被前一轮点击拉起，先探再点
+        if await _wait_tncode_div_visible(page, debug, timeout_ms=3000):
+            return True
+        if trigger_round < max_triggers:
+            _captcha_log(debug, f"弹窗未出现（第 {trigger_round} 次点击无效），重新点击 #tncode")
+            try:
+                trigger = page.locator(SEL_TNCODE_TRIGGER).first
+                # 短超时：弹窗盖住触发按钮时 click 会干等，久等不如交回外层刷新/重试
+                if await trigger.count() > 0 and await trigger.is_visible(timeout=1000):
+                    await trigger.click(timeout=5000)
+                else:
+                    # 触发按钮不可见时退化为刷新路径（内部含重新触发逻辑）
+                    await _click_refresh(page, debug)
+            except Exception as e:
+                _captcha_log(debug, f"重新点击 #tncode 失败: {compact_error(e)}")
+
     return False
 
 
@@ -939,7 +1037,7 @@ async def _wait_captcha_result(page, debug: bool, timeout_ms: int = 4000) -> boo
                 if "验证成功" in text or "已通过" in text:
                     return True
 
-            # 强信号 2：#tncode_div 已隐藏（通过即关闭）
+            # 强信号 2：#tncode_box 已隐藏（通过即关闭）
             div = page.locator(SEL_TNCODE_DIV).first
             if await div.count() > 0:
                 style = await div.get_attribute("style") or ""
@@ -996,13 +1094,7 @@ async def fetch_sign_stats(page, base_url: str, debug: bool) -> tuple[dict, str]
                     continue
 
                 value = await li.locator("input.hidnum").first.get_attribute("value", timeout=1000)
-                unit = ""
-                try:
-                    unit = await li.locator("p b:last-child").inner_text(timeout=1000)
-                except Exception:
-                    unit = ""
-
-                formatted = _format_countqian_value(label, value or "", unit)
+                formatted = _format_countqian_value(label, value or "")
                 if formatted:
                     stats[label] = formatted
             except Exception as e:
@@ -1027,7 +1119,7 @@ async def fetch_sign_stats(page, base_url: str, debug: bool) -> tuple[dict, str]
     except Exception as e:
         if debug:
             traceback.print_exc()
-        return {}, f"读取签到统计异常: {str(e)[:200]}"
+        return {}, f"读取签到统计异常: {compact_error(e, 200)}"
 
 
 async def dismiss_intro_popups(page, debug: bool):
@@ -1066,7 +1158,7 @@ async def dismiss_intro_popups(page, debug: bool):
         except Exception:
             continue
 
-    # 兜底：年龄确认弹窗（旧版可能还在）
+    # 兜底：年龄确认弹窗（部分页面模板仍会弹出）
     try:
         agree = page.locator(
             "button:has-text('我已满'), button:has-text('同意'), .agree-btn"
@@ -1108,7 +1200,7 @@ async def login_with_browser(page, base_url: str, username: str, password: str,
             await page.wait_for_selector(SEL_USERNAME_INPUT, timeout=15000, state="visible")
         except PWTimeout:
             await _shot(page, "no_username_input", debug)
-            return False, f"找不到用户名输入框（页面可能未加载完，或弹窗未关掉）"
+            return False, "找不到用户名输入框（页面可能未加载完，或弹窗未关掉）"
 
         # 填账号密码（用 type 模拟人类输入，比 fill 更不容易被检测）
         username_input = page.locator(SEL_USERNAME_INPUT).first
@@ -1221,11 +1313,11 @@ async def login_with_browser(page, base_url: str, username: str, password: str,
         # 4) 已离开登录页且无失败提示 → 视为成功
         return True, f"登录成功（跳转到 {cur_url[:60]}）"
     except PWTimeout as e:
-        return False, f"登录超时: {str(e)[:200]}"
+        return False, f"登录超时: {compact_error(e, 200)}"
     except Exception as e:
         if debug:
             traceback.print_exc()
-        return False, f"登录异常: {str(e)[:200]}"
+        return False, f"登录异常: {compact_error(e, 200)}"
 
 
 async def sign_with_browser(page, base_url: str, debug: bool,
@@ -1392,11 +1484,11 @@ async def sign_with_browser(page, base_url: str, debug: bool,
 
         return {"success": False, "error": f"签到结果未知（最终 URL: {result_url[:80]}）"}
     except PWTimeout as e:
-        return {"success": False, "error": f"签到超时: {str(e)[:200]}"}
+        return {"success": False, "error": f"签到超时: {compact_error(e, 200)}"}
     except Exception as e:
         if debug:
             traceback.print_exc()
-        return {"success": False, "error": f"签到异常: {str(e)[:200]}"}
+        return {"success": False, "error": f"签到异常: {compact_error(e, 200)}"}
 
 
 # ====================== 8. 单账号编排 ======================
@@ -1481,7 +1573,7 @@ async def run_one_account(username: str, password: str, base_url: str, proxy: st
                     except Exception as e:
                         if debug:
                             traceback.print_exc()
-                        print(f"⚠️ Cookie 复用失败（{str(e)[:100]}），走完整登录")
+                        print(f"⚠️ Cookie 复用失败（{compact_error(e, 100)}），走完整登录")
                         try:
                             await context.clear_cookies()
                         except Exception:
@@ -1532,7 +1624,7 @@ async def amain():
     print("=" * 60)
 
     accounts_raw = os.getenv("LWFIP_ACCOUNTS", "").strip()
-    proxy = (os.getenv("LWFIP_PROXY") or "").strip()
+    proxy, proxy_source = resolve_proxy("LWFIP_PROXY")
     base_url = (os.getenv("LWFIP_BASE_URL") or DEFAULT_BASE_URL).strip().rstrip("/")
     notify_enabled = env_bool("LWFIP_NOTIFY", True)
     timeout_ms = env_int("LWFIP_TIMEOUT", 30000)
@@ -1568,16 +1660,20 @@ async def amain():
                 print(f"🔍 自动检测到系统 Chromium: {chromium_path}")
                 break
 
-    # 校验代理（被墙站必备）
+    # 代理校验：缺失代理默认降级为警告直连，仅在显式开启严格模式时退出
     if not proxy:
         msg = (
-            "❌ 未配置环境变量 LWFIP_PROXY\n"
-            "老王FIP 站点被墙，必须挂代理（如 http://172.17.0.1:7890）。"
+            "⚠️ 未配置 LWFIP_PROXY，也未检测到青龙全局代理，将直连尝试。\n"
+            "   老王FIP 站点被墙，直连大概率失败，请至少二选一：\n"
+            "     · 设置 LWFIP_PROXY=http://172.17.0.1:7890\n"
+            "     · 在青龙「配置文件 / 环境变量」配置全局代理（HTTPS_PROXY 等）\n"
+            "   如需缺代理即报错退出，设置 LWFIP_PROXY_REQUIRED=1。"
         )
         print(msg)
-        if notify_enabled:
-            await send_notify_with_retry(title, msg)
-        sys.exit(1)
+        if env_bool("LWFIP_PROXY_REQUIRED", False):
+            if notify_enabled:
+                await send_notify_with_retry(title, msg)
+            sys.exit(1)
 
     accounts = parse_credentials(accounts_raw)
     if not accounts:
@@ -1590,7 +1686,13 @@ async def amain():
             await send_notify_with_retry(title, msg)
         sys.exit(1)
 
-    print(f"📋 共 {len(accounts)} 个账号 | 代理: {proxy} | 站点: {base_url}")
+    if not proxy:
+        proxy_desc = "未配置（直连）"
+    elif proxy_source == "LWFIP_PROXY":
+        proxy_desc = proxy
+    else:
+        proxy_desc = f"{proxy}（来源: {proxy_source}）"
+    print(f"📋 共 {len(accounts)} 个账号 | 代理: {proxy_desc} | 站点: {base_url}")
     print(f"   debug={debug}, headful={headful}, timeout={timeout_ms}ms, "
           f"captcha_retry={max_captcha_retry}, task_retry={max_retry}次/间隔{retry_interval}s")
     print(f"   cookie_cache={use_cookie_cache}")
@@ -1645,7 +1747,7 @@ async def amain():
 
             # 判断是否需要重试
             if attempt < max_retry and is_retryable_error(err):
-                print(f"           🔄 检测到可重试错误，准备重试...")
+                print("           🔄 检测到可重试错误，准备重试...")
                 continue
             else:
                 # 不可重试的错误，或已到最后一次

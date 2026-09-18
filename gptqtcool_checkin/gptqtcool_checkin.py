@@ -147,7 +147,7 @@ def send_serverj(title: str, content: str) -> bool:
 def send_notify(title: str, content: str) -> bool:
     """推送通知。优先自实现 Server酱(GET+UA+超时+重试),否则走青龙 notify.py。返回是否成功。"""
     if _SERVERJ_KEY:
-        # 自实现 Server酱:绕过青龙旧版 serverJ 渠道(无 timeout/UA/重试且异步丢通知)
+        # 自实现 Server酱:绕过青龙内置 serverJ 渠道(无 timeout/UA/重试且异步丢通知)
         return send_serverj(title, content)
     if not _qinglong_send:
         logger.info("ℹ️ 未找到 notify.py(仅在青龙环境内可用),跳过推送")
@@ -282,7 +282,7 @@ async def detect_slider_captcha(page) -> bool:
             logger.info(f'✅ 通过页面文本检测到验证码: "{text}"')
             return True
 
-    # 修复:已删除过宽的 div[style*="position: absolute"][style*="left"] 选择器(误判率高)
+    # 滑块选择器只取语义明确的：div[style*="position: absolute"][style*="left"] 这类过宽选择器误判率高，不用
     slider_selectors = [
         'div[class*="slider"]',
         ".captcha-slider",
@@ -395,7 +395,7 @@ async def is_logged_in(page) -> bool:
         logger.info('✅ 检测到"已绑定"或"退出登录",确认已登录')
         return True
 
-    # 2. 可见的密码输入框 → 未登录(修复:emoji 改 ℹ️ 避免语义混淆)
+    # 2. 可见的密码输入框 → 未登录（emoji 用 ℹ️，避免与密码框的 🔑 混淆）
     password_input = page.locator('input#renewKey[type="password"]')
     if await password_input.count() > 0:
         try:
@@ -715,10 +715,9 @@ def detect_gap_by_template(
 ) -> tuple[int, float, str] | None:
     """OpenCV 模板匹配(原生,无子进程)
 
-    同时尝试 TM_CCOEFF_NORMED 和 TM_CCORR_NORMED,取置信度更高者。
+    用 TM_CCOEFF_NORMED 定位拼图块图案在背景图中的位置。
     若提供了渲染尺寸,会先将 tile 缩放到与 master 同一比例,避免原始图与截图尺寸不一致导致误匹配。
-    返回 (gap_x, confidence, method_name)；method_name 用于上层按方法区分采信阈值
-    （CCORR 对平坦/纯色区域置信度虚高,不能与 CCOEFF 用同一阈值）。
+    返回 (gap_x, confidence, method_name)。
     """
     master_img = cv2.imdecode(np.frombuffer(master, dtype=np.uint8), cv2.IMREAD_COLOR)
     tile_img = cv2.imdecode(np.frombuffer(tile, dtype=np.uint8), cv2.IMREAD_UNCHANGED)
@@ -752,20 +751,111 @@ def detect_gap_by_template(
         return None
 
     best_x, best_conf, best_method = 0, -1.0, ""
-    for name, method in [
-        ("TM_CCOEFF_NORMED", cv2.TM_CCOEFF_NORMED),
-        ("TM_CCORR_NORMED", cv2.TM_CCORR_NORMED),
-    ]:
-        result = cv2.matchTemplate(master_img, tile_img, method)
-        _, max_val, _, max_loc = cv2.minMaxLoc(result)
-        if max_val > best_conf:
-            best_conf = round(float(max_val), 4)
-            # 左边缘语义：匹配窗口左上角 = 图案左边缘（与边缘检测分支的 gap_x 语义一致）
-            best_x = int(max_loc[0])
-            best_method = name
+    # 只用 TM_CCOEFF_NORMED:该站点背景是海水纹理,CCORR 在亮水面处普遍 0.91+,
+    # 置信度失去区分度(实测三轮假阳性全落在同一片亮水面);CCOEFF 扣除均值,
+    # 无真匹配时分数会诚实回落到 0.3 附近
+    result = cv2.matchTemplate(master_img, tile_img, cv2.TM_CCOEFF_NORMED)
+    _, max_val, _, max_loc = cv2.minMaxLoc(result)
+    best_conf = round(float(max_val), 4)
+    # 左边缘语义：匹配窗口左上角 = 图案左边缘（与边缘检测分支的 gap_x 语义一致）
+    best_x = int(max_loc[0])
+    best_method = "TM_CCOEFF_NORMED"
 
     logger.info(f"🔍 模板匹配: gapX={best_x}, confidence={best_conf}, method={best_method}")
     return best_x, best_conf, best_method
+
+
+# 高亮方块采信阈值:窗口与周边亮度差超过该值才认为存在白色半透明方块
+# (实测该站点方块得分 38~45,海水纹理/阳光亮斑本底 < 20,取中间偏下值)
+HIGHLIGHT_MIN_CONF = 25.0
+
+
+def detect_gap_by_highlight(
+    master: bytes,
+    tile_size: int,
+    prior_y: float | None = None,
+    bg_render_h: float | None = None,
+    tile_rect: dict | None = None,
+    bg_rect: dict | None = None,
+) -> tuple[int, int, float]:
+    """高亮方块型缺口检测(该站点验证码形态)
+
+    站点的缺口不是"拼图内容挖洞"而是白色半透明方块直接标注在背景图上,
+    拼图块图案与背景图内容无对应关系(线性回归 R²≈0.1),模板匹配必然失效。
+    检测原理:方块区域亮度显著高于周边海面,用拼图块尺寸滑窗计算
+    "窗口均值 - 环形周边均值",峰值位置即方块左上角(背景图自然坐标系)。
+
+    参数:
+        prior_y: 拼图块 DOM 中心 y(渲染坐标系)。实测方块与拼图块同行,
+                 提供时按 bg_render_h/natural_h 比例换算后把扫描带限定在
+                 该 y 附近,抑制远处阳光亮斑干扰。
+        bg_render_h: 背景图渲染高度,用于 prior_y 的坐标换算。
+        tile_rect / bg_rect: 拼图块与背景图的 DOM 渲染位置。拼图块预览
+                 叠加在背景图左侧(非背景内容),映射到自然坐标系后排除,
+                 否则拼图块预览自身/其涂黑副本会被误判为高亮区。
+
+    返回 (gap_x, gap_y, score);score < HIGHLIGHT_MIN_CONF 时上层应回退其他方法。
+    """
+    img = cv2.imdecode(np.frombuffer(master, dtype=np.uint8), cv2.IMREAD_COLOR)
+    if img is None:
+        logger.info("❌ 高亮检测:无法解码背景图")
+        return 0, 0, 0.0
+
+    h, w = img.shape[:2]
+    size = min(tile_size, w - 1, h - 1)
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY).astype(np.float32)
+
+    # 拼图块预览区映射到自然坐标系(渲染坐标 - 背景图原点)×缩放
+    exclude_x1 = 0.0
+    if tile_rect and bg_rect:
+        scale = w / max(1.0, bg_rect["width"])
+        exclude_x1 = (tile_rect["x"] - bg_rect["x"] + tile_rect["width"]) * scale
+
+    # 积分图加速:任意矩形区域均值 O(1),滑窗+环形周边全图扫描无需逐像素循环
+    integral = cv2.integral(gray)  # (h+1, w+1)
+
+    def rect_mean(x0: int, y0: int, x1: int, y1: int) -> float:
+        """积分图求 [y0,y1) x [x0,x1) 区域均值,坐标越界自动裁剪"""
+        x0, y0 = max(0, x0), max(0, y0)
+        x1, y1 = min(w, x1), min(h, y1)
+        if x1 <= x0 or y1 <= y0:
+            return 0.0
+        s = integral[y1, x1] - integral[y0, x1] - integral[y1, x0] + integral[y0, x0]
+        return float(s) / ((y1 - y0) * (x1 - x0))
+
+    # y 扫描带:有先验时限定换算后的拼图块中心 y ±size,无先验时全图扫描
+    if prior_y is not None and bg_render_h:
+        py = prior_y * h / bg_render_h
+        y_min = max(0, int(py - size))
+        y_max = min(h - size, int(py + size))
+    else:
+        y_min, y_max = 0, h - size
+    if y_max < y_min:
+        y_min, y_max = 0, max(0, h - size)
+
+    ring = max(6, size // 4)  # 环形周边厚度
+    # x 从 size 起扫:方块不会贴到背景图左缘,且左侧边缘的环形数据不完整;
+    # 有拼图块预览时再右移一个"窗口+环"宽度——紧贴预览区的窗口其环形左带
+    # 会覆盖预览区(亮度异常源),把 ring_mean 拉低产生虚高分
+    x_min = max(size, int(exclude_x1) + size + ring)
+    best_score, best_x, best_y = -1e9, 0, 0
+    for y in range(y_min, y_max + 1):
+        for x in range(x_min, w - size + 1):
+            win = rect_mean(x, y, x + size, y + size)
+            # 环形均值 = 大矩形均值按面积扣掉窗口,而非四条带直接平均——
+            # 边角处部分条带越界为空,直接平均会被 0 稀释造成边角假高分
+            bx0, by0 = x - ring, y - ring
+            bx1, by1 = x + size + ring, y + size + ring
+            big = rect_mean(bx0, by0, bx1, by1)
+            big_area = (min(h, by1) - max(0, by0)) * (min(w, bx1) - max(0, bx0))
+            ring_area = big_area - size * size
+            ring_mean = (big * big_area - win * size * size) / max(1, ring_area)
+            score = win - ring_mean
+            if score > best_score:
+                best_score, best_x, best_y = score, x, y
+
+    logger.info(f"🔍 高亮方块检测: x={best_x}, y={best_y}, score={best_score:.1f}")
+    return best_x, best_y, best_score
 
 
 async def detect_gap(
@@ -778,14 +868,43 @@ async def detect_gap(
     tile_rect: dict | None = None,
     bg_rect: dict | None = None,
 ) -> tuple[int, float, str]:
-    """三层递进缺口检测: 模板匹配 → 边缘检测 → 降级
+    """四层递进缺口检测: 高亮方块 → 模板匹配 → 边缘检测 → 降级
 
-    优先使用模板匹配(若能拿到拼图块),因为它直接定位拼图块在背景图中的位置,
-    准确率高于基于边缘推断的算法。边缘检测作为模板匹配失败后的备选。
+    优先使用高亮方块检测:该站点验证码形态是白色半透明方块标注缺口,
+    拼图块图案与背景图无内容对应,模板匹配在此形态下必然漂移。
+    拼图内容型验证码(高亮检测低分)回退到模板匹配,边缘检测作为最后备选。
     """
+    # 策略 0: 高亮方块检测(需要背景图与拼图块渲染位置)
+    if tile_rect and bg_rect:
+        hl_x, hl_y, hl_score = detect_gap_by_highlight(
+            screenshot,
+            int(tile_rect["width"]) or 52,
+            prior_y=(tile_rect["y"] + tile_rect["height"] / 2) if tile_rect else None,
+            bg_render_h=bg_rect["height"],
+            tile_rect=tile_rect,
+            bg_rect=bg_rect,
+        )
+        if hl_score >= HIGHLIGHT_MIN_CONF:
+            logger.info(f"✅ 高亮方块命中: gap_x={hl_x}, y={hl_y}, score={hl_score:.1f}")
+            if save_debug_path:
+                try:
+                    img = cv2.imdecode(np.frombuffer(screenshot, dtype=np.uint8), cv2.IMREAD_COLOR)
+                    if img is not None:
+                        h = img.shape[0]
+                        cv2.line(img, (hl_x, 0), (hl_x, h), (0, 0, 255), 2)
+                        cv2.imwrite(str(save_debug_path), img)
+                        logger.info(f"📸 已保存缺口检测调试图: {save_debug_path}")
+                except Exception as e:
+                    logger.info(f"ℹ️ 保存调试图失败: {e}")
+            return hl_x, hl_score, "highlight"
+        logger.info(
+            f"⚠️ 高亮方块检测低分 ({hl_score:.1f} < {HIGHLIGHT_MIN_CONF}),"
+            f"判定为拼图内容型验证码,回退模板匹配"
+        )
+
     # 策略 1: 模板匹配(有拼图块截图时)
     if tile_screenshot:
-        logger.info("🔍 优先尝试模板匹配...")
+        logger.info("🔍 尝试模板匹配...")
         # ★ 防自匹配：拼图块图案与缺口图案相同，若不涂黑拼图块自身区域，
         # 匹配分数最高点必然是拼图块自身位置（gap_x 返回拼图块位置导致拖动错位）。
         # 按 tile_rect/bg_rect 把拼图块在背景图中的区域涂黑后再匹配。
@@ -820,11 +939,9 @@ async def detect_gap(
         )
         if tm:
             tm_x, tm_conf, tm_method = tm
-            # 按方法区分采信阈值：CCORR 对纯色/平坦区域置信度虚高，需更高阈值
-            # （今天 3 轮 CCORR conf 0.88~0.90 全部漂移到拼图块附近即此问题）
-            min_conf = 0.93 if tm_method == "TM_CCORR_NORMED" else 0.85
+            min_conf = 0.85
             # 漂移拒绝：匹配窗口若与拼图块区域（涂黑区）重叠，说明命中的是拼图块
-            # 自身附近而非真缺口（CCORR 在涂黑区边缘产生虚假高响应），拒绝采信回退边缘检测
+            # 自身附近而非真缺口（涂黑区边缘的亮度突变会产生虚假高响应），拒绝采信回退边缘检测
             drifted = False
             if masked_region:
                 mx0, mx1, mtw = masked_region
@@ -1281,7 +1398,7 @@ async def slide_with_retry(page, handle_box: dict, container_box) -> bool:
 async def handle_slider_captcha(page) -> bool:
     """处理滑动验证码 - 以屏幕截图坐标系为基准,高密度微调试
 
-    核心修复:
+    关键处理:
     1. 始终优先使用 page.screenshot(clip=container_box) 作为缺口检测输入,
        保证检测坐标与页面渲染 1:1。
     2. 若只能拿到 DOM 原始背景图,则按 natural/rendered 比例换算 gap_x。
@@ -1293,7 +1410,7 @@ async def handle_slider_captcha(page) -> bool:
 
         # 连续滑块重定位失败计数: 该站点首次滑动失败后会隐藏滑块(切到"人机验证"),
         # 此时多枪连发无意义。连续 2 次失败即判定滑块已消失,提前放弃让外层刷新
-        # 验证码重试——实测"刷新重来"远比空转跑完所有偏移更快更稳(2026-08-14 优化)
+        # 验证码重试——实测"刷新重来"远比空转跑完所有偏移更快更稳
         miss_streak = 0
 
         logger.info("🔍 查找滑块验证码...")
@@ -1423,9 +1540,11 @@ async def handle_slider_captcha(page) -> bool:
             f"method={method}, confidence={conf:.2f}"
         )
 
-        # 5. 多枪连发: 固定偏移（覆盖 ±24px 误差）
+        # 5. 多枪连发: 固定偏移（覆盖检测残余误差）
+        # highlight 实测误差 ±1px,小偏移足矣;template 保留中等扫描;
+        # edge 系误差大,维持宽扫描
         offsets = [0, 4, -4, 8, -8, 12, -12, 16, -16, 20, -20, 24, -24]
-        max_offset = 12 if method == "template" else (20 if method == "edge" else 24)
+        max_offset = 8 if method == "highlight" else (12 if method == "template" else (20 if method == "edge" else 24))
         valid_offsets = [o for o in offsets if abs(o) <= max_offset]
         logger.info(
             f"🎯 第一阶段: 最大偏移={max_offset}px, 尝试 {len(valid_offsets)} 次"
@@ -1646,7 +1765,7 @@ async def auto_checkin() -> bool:
                 storage_state=storage_state,
             )
 
-            # 修复:add_init_script 在 goto 之前注入(context 级,所有页面加载时生效)
+            # add_init_script 在 context 级注入，对所有页面加载生效
             await context.add_init_script("""
                 Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
                 window.navigator.chrome = { runtime: {} };
@@ -1654,7 +1773,7 @@ async def auto_checkin() -> bool:
 
             page = await context.new_page()
 
-            # 修复:只打印 warn/error,过滤站点自身的 info/log 噪音（按级别输出）
+            # 只打印 warn/error，过滤站点自身的 info/log 噪音（按级别输出）
             def _on_page_console(msg):
                 if msg.type == "error":
                     logger.error(f"📄 页面日志[error]: {msg.text}")

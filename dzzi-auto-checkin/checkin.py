@@ -325,11 +325,11 @@ class DzziClient:
         self.user_id = user.get("id") or payload.get("id")
         self.display_name = user.get("display_name") or payload.get("display_name") or self.username
         access_token = payload.get("access_token") or ""
-        # dzzi 实测签到/状态接口走 Bearer token 认证（旧版 New-Api-User 头返回 401）
+        # dzzi 实测签到/状态接口走 Bearer token 认证（New-Api-User 头返回 401）
         if access_token:
             self.session.headers["Authorization"] = f"Bearer {access_token}"
         if self.user_id:
-            # 顺带兼容老版本 new-api 的 New-Api-User 头认证
+            # 顺带带上 New-Api-User 头，兼容仍认该头的 New API 实例
             self.session.headers["New-Api-User"] = str(self.user_id)
         log("INFO", f"[{self.label}] 登录成功 (id={self.user_id})")
         return True

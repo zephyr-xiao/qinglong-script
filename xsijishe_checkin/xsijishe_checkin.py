@@ -232,7 +232,7 @@ def parse_accounts(raw: str) -> list[dict]:
 # 已知活跃域名列表（从发布页 47447.net 通过 Playwright 获取，作为无 Playwright 时的兜底）
 # 顺序即优先级；镜像域名 DNS 记录不稳定（间歇污染），连接失败时自动跳过
 KNOWN_HOSTS = [
-    "sjs96.com",       # 发布页当前主推（Cloudflare 直连，2026-08-15 验证可用）
+    "sjs96.com",       # 发布页当前主推（Cloudflare 直连）
     "sjs66.net",       # 备用（DNS 间歇污染，失败自动跳过）
     "xsijishe.net",    # 备用（同上）
     "xsijishe.com",    # 历史域名（DNS 间歇污染）

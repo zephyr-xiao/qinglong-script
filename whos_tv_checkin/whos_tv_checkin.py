@@ -25,8 +25,9 @@ cron: 15 8 * * *
   WHOSTV_COOKIE   完整 Cookie 字符串；多账号用 & 分隔
   WHOSTV_ACCOUNT  账号密码，格式 用户名#密码；多账号用 & 分隔
                   例：user1@mail.com#pass1&user2#pass2
-  WHOSTV_PROXY    HTTP/SOCKS 代理；whos.tv 在大陆网络被屏蔽，必须走代理
+  WHOSTV_PROXY    HTTP/SOCKS 代理；whos.tv 在大陆网络被屏蔽，建议走代理
                    例：http://172.17.0.1:7890   或   socks5://172.17.0.1:7891
+                   未配置时自动回退青龙全局代理（HTTPS_PROXY / HTTP_PROXY / ALL_PROXY）
   WHOSTV_NOTIFY   true/false，默认 true，是否调用青龙 notify.py 推送
   WHOSTV_NOTIFY_ONLY_FAIL  true/false，默认 false，仅当存在失败时才推送
                    （需 WHOSTV_NOTIFY=true 时生效，全部成功则静默）
@@ -112,10 +113,13 @@ HOME = "https://whos.tv"
 TASKS_URL = f"{HOME}/points-center/tasks"
 LOGIN_URL = f"{HOME}/api/login"
 
-# Cloudflare 挑战最长等待秒数（实测通过时间约 5~90 秒，波动较大）
-CF_CHALLENGE_TIMEOUT = 120
-# 挑战未通过时的额外重试次数（挑战偶尔首次失败，重试可提高成功率）
-CF_CHALLENGE_RETRY = 1
+# Cloudflare 挑战单轮最长等待秒数（实测通过时间约 5~150 秒，波动较大）
+CF_CHALLENGE_TIMEOUT = 180
+# 挑战未通过时的额外轮数。出口 IP 信誉波动时 CF 放行是概率性的（同环境
+# 实测通过率约 1/3 且随机），多轮 + 轮间隔抽签比单轮死等通过率高得多
+CF_CHALLENGE_RETRY = 3
+# 轮间隔秒数：刷新页面重新触发挑战，给 CF 风控窗口滑动的时间
+CF_CHALLENGE_ROUND_DELAY = 20
 
 # 网络级失败（超时/断网，拿不到任何 HTTP 响应）的自动重试次数与间隔。
 # 仅网络层失败才重试；服务器已有响应（含 4xx/5xx）属业务结果，重试无意义
@@ -179,6 +183,29 @@ def env_int(name: str, default: int) -> int:
         return default
 
 
+# 青龙面板「配置文件 / 环境变量」里配置的全局代理变量
+GLOBAL_PROXY_KEYS = (
+    "HTTPS_PROXY", "https_proxy",
+    "HTTP_PROXY", "http_proxy",
+    "ALL_PROXY", "all_proxy",
+)
+
+
+def resolve_proxy(*specific_keys: str) -> tuple:
+    """
+    解析代理地址，返回 (代理地址, 来源变量名)，两者均可能为空字符串。
+
+    优先级：脚本专属变量 > 青龙全局代理变量 > 空（直连）。
+    Patchright 的 launch 参数不会读取环境变量，浏览器链路必须在这里显式取值；
+    HTTP 链路走 urllib，其 ProxyHandler 本身就会读环境变量，无需干预。
+    """
+    for name in (*specific_keys, *GLOBAL_PROXY_KEYS):
+        value = (os.getenv(name) or "").strip()
+        if value:
+            return value, name
+    return "", ""
+
+
 def parse_cookie_str(s: str) -> dict:
     """把 'a=1; b=2' 这种 Cookie 头字符串解析成 dict。"""
     jar = {}
@@ -225,11 +252,11 @@ def mask(s: str) -> str:
 def find_checkin_state(html: str):
     """
     从 HTML 中检测签到按钮状态。
-    v2 版本：data-signed-in 由 JS 动态生成，服务端 HTML 中不存在。
-    改为检测 insufficient-points-checkin-btn 等元素判断页面是否正常。
+    data-signed-in 可能由 JS 动态生成而不在服务端 HTML 里，因此同时检测
+    insufficient-points-checkin-btn 等元素判断页面是否正常。
     返回 'true' / 'false' / None（找不到签到相关元素）。
     """
-    # 旧版兼容：仍尝试找 data-signed-in
+    # 页面形态一：HTML 里直接带 data-signed-in
     m = re.search(
         r'id=["\']checkin-btn["\'][^>]*?data-signed-in=["\'](true|false)["\']',
         html, re.IGNORECASE,
@@ -867,7 +894,7 @@ def _do_signin(page, label: str, timeout: int, debug: bool) -> tuple:
     对已认证的浏览器会话执行签到流程（Cookie 模式和账号模式共享）。
     返回 (success: bool, message: str)。
     """
-    # ★ 先直接调 v2 签到 API（不再依赖 HTML 按钮状态）
+    # ★ 先直接调 v2 签到 API（不依赖 HTML 按钮状态）
     signin_url = f"{HOME}/api/user/tasks/signin"
     ok, msg = try_signin_post(page, signin_url, timeout, debug)
 
@@ -1004,7 +1031,7 @@ def main():
     notify_only_fail = env_bool("WHOSTV_NOTIFY_ONLY_FAIL", False)
     timeout = env_int("WHOSTV_TIMEOUT", 30)
     debug = env_bool("WHOSTV_DEBUG", False)
-    proxy = (os.getenv("WHOSTV_PROXY") or "").strip()
+    proxy, proxy_source = resolve_proxy("WHOSTV_PROXY")
     browser_wait = env_int("WHOSTV_BROWSER_WAIT", BROWSER_WAIT_DEFAULT)
     browser_port = env_int("WHOSTV_BROWSER_PORT", BROWSER_PORT_DEFAULT)
 
@@ -1023,13 +1050,20 @@ def main():
         print(f"🍪 Cookie 账号: {len(cookie_accounts)} 个")
     if login_accounts:
         print(f"🔑 账号密码: {len(login_accounts)} 个")
-    if proxy:
+    if not proxy:
+        print("🌐 代理: 未配置（直连；whos.tv 在大陆网络大概率无法访问）")
+    elif proxy_source == "WHOSTV_PROXY":
         print(f"🌐 代理: {proxy}")
+    else:
+        print(f"🌐 代理: {proxy}（来源: {proxy_source}）")
     print("=" * 60)
 
-    # 启动浏览器并等待 Cloudflare 挑战通过（带重试）
-    print("\n🚀 启动浏览器，等待 Cloudflare 挑战通过（最长"
-          f" {CF_CHALLENGE_TIMEOUT} 秒 × {CF_CHALLENGE_RETRY + 1} 次）...")
+    # 启动浏览器并等待 Cloudflare 挑战通过（带多轮抽签重试）
+    # 出口 IP 信誉波动时 CF 放行是概率性的（实测同环境通过率约 1/3 且随机），
+    # 单轮长等无意义，多轮 + 轮间隔（让 CF 风控窗口滑动）才能抽中放行
+    print("\n🚀 启动浏览器，等待 Cloudflare 挑战通过（每轮最长"
+          f" {CF_CHALLENGE_TIMEOUT} 秒 × {CF_CHALLENGE_RETRY + 1} 轮，轮间隔"
+          f" {CF_CHALLENGE_ROUND_DELAY}s）...")
     page = None
     finalize = None
     try:
@@ -1041,12 +1075,14 @@ def main():
             challenge_ok = wait_for_challenge(page)
             if challenge_ok:
                 break
-            print(f"⚠️ 挑战第 {attempt + 1} 次未通过，重试...")
-            time.sleep(3)
+            if attempt < CF_CHALLENGE_RETRY:
+                print(f"⚠️ 挑战第 {attempt + 1}/{CF_CHALLENGE_RETRY + 1} 轮未通过，"
+                      f"{CF_CHALLENGE_ROUND_DELAY}s 后刷新重试...")
+                time.sleep(CF_CHALLENGE_ROUND_DELAY)
         if not challenge_ok:
             raise RuntimeError(
-                f"Cloudflare 挑战在 {CF_CHALLENGE_TIMEOUT} 秒内未通过"
-                "（站点人机验证拦截，可能是出口 IP 信誉或网络问题）"
+                f"Cloudflare 挑战在 {CF_CHALLENGE_RETRY + 1} 轮内均未通过"
+                "（出口 IP 被 CF 高风险判定且放行窗口未抽中，建议换代理节点）"
             )
         if debug:
             print(f"   [debug] 挑战通过 | 标题: {page.title()}")

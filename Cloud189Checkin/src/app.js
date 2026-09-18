@@ -5,7 +5,7 @@
  *
  * 环境变量：
  *   TY_ACCOUNTS                【必填】账号列表，支持 JSON 数组 / 单对象（详见 accounts.js）
- *   TY_USERNAME_n/TY_PASSWORD_n  旧版账号格式，仍兼容
+ *   TY_USERNAME_n/TY_PASSWORD_n  逐对账号格式，兼容保留
  *   CLOUD189_VERBOSE           可选，1 = 开启 cloud189-sdk 调试日志
  *
  * 推送：复用同目录 sendNotify.js（青龙官方 Notify），在青龙变量里配 DD_BOT_TOKEN 等即可。
@@ -83,7 +83,7 @@ async function main() {
   let successCount = 0;
   const total = accounts.length;
   if (total === 0) {
-    console.warn("未配置账号环境变量 TY_ACCOUNTS（或旧版 TY_USERNAME_n/TY_PASSWORD_n）");
+    console.warn("未配置账号环境变量 TY_ACCOUNTS（或 TY_USERNAME_n/TY_PASSWORD_n）");
   }
 
   for (let index = 0; index < total; index++) {
