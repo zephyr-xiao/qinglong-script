@@ -6,8 +6,7 @@
 
 | 脚本 | 说明 | 文档 | 青龙任务命令 |
 |---|---|---|---|
-| E-Hentai 自动签到 | E-Hentai 每日签到领 Exp/Credits，Cookie 认证，TLS 1.2 回退 + Cookie 过期预警 | [ehentai_autosignin/README.md](ehentai_autosignin/README.md) | `task ehentai_autosignin/autosignin.py` |
-| 7x.hk / 8s.hk 签到 | NewAPI 双站签到（7x.hk + 8s.hk），session 认证，单脚本双站 | [7x8s_checkin/README.md](7x8s_checkin/README.md) | `task 7x8s_checkin/7x8s_checkin.py` |
+| E-Hentai 自动签到 | E-Hentai 每日签到领 Exp/Credits，Cookie 认证，TLS 1.2 回退 + Cookie 过期预警 | [AkiyaKiko_EhentaiAutoSignIn/autosignin.py](AkiyaKiko_EhentaiAutoSignIn/autosignin.py) | `task AkiyaKiko_EhentaiAutoSignIn/autosignin.py` |
 | 老王FIP签到（浏览器版） | Discuz + tncode 滑块 + 前端 JS 签名，使用 Playwright + OpenCV 自动登录签到 | [laowangfip_browser_checkin/README.md](laowangfip_browser_checkin/README.md) | `task laowangfip_browser_checkin/laowangfip_browser_checkin.py` |
 | 全自动签到助手 | 多站点 API/Discuz 签到，支持内置站点与 `QZD_CUSTOM` 自定义站点，凭证 token/Cookie 缓存复用 | [quan_zidong_zhushou/README.md](quan_zidong_zhushou/README.md) | `task quan_zidong_zhushou/quan_zidong_zhushou.py` |
 | whos.tv 签到 | Cookie 签到，带接口探测和代理支持 | [whos_tv_checkin/README.md](whos_tv_checkin/README.md) | `task whos_tv_checkin/whos_tv_checkin.py` |
@@ -19,7 +18,6 @@
 | DZZI.AI 自动签到 | New API 站签到，多账号批量、已签到自动跳过（幂等） | [dzzi-auto-checkin/README.md](dzzi-auto-checkin/README.md) | `task dzzi-auto-checkin/checkin.py` |
 | 雨云自动签到 | 雨云服务器签到 + 自动续费，多账号 + 验证码识别，专为青龙面板优化 | [Rainyun/README.md](Rainyun/README.md) | `task Rainyun/main.py` |
 | 天翼云盘签到 | cloud189-sdk 登录签到，多账号 + 个人/家庭容量统计，复用 sendNotify.js 全通道推送 | [Cloud189Checkin/README.md](Cloud189Checkin/README.md) | `task Cloud189Checkin/src/app.js` |
-| RouterTeam 签到（Node.js） | ai.router.team 邀请奖励页每日签到，账号密码登录 + Bearer token 缓存复用，多账号 + 充值门槛识别 | [ai-router-team-checkin/README.md](ai-router-team-checkin/README.md) | `task ai-router-team-checkin/ai_router_team_checkin.js` |
 | PT 签到（Node.js） | NovaHD / HDArea / BTSchool 三站签到，Cookie 失效自动登录兜底（视觉模型识别验证码），登录限次保护防封 IP | [pt-checkin/README.md](pt-checkin/README.md) | `task pt-checkin/pt_checkin.js` |
 | TG签到（tg-signer） | Telegram 群/机器人自动签到，基于 tg-signer 封装，扫码登录多账号，支持发消息+点按钮+定时撤回 | [tg-signer-ql/README.md](tg-signer-ql/README.md) | `task tg-signer-ql/tg_signer_ql.py` |
 | ZodGame 签到 | zodgame.xyz 每日签到 + BUX 广告任务（每个 +2 点币），Cookie 认证，幂等跳过，Cookie 失效推送告警 | [zodgame_checkin/README.md](zodgame_checkin/README.md) | `task zodgame_checkin/zodgame_checkin.py` |
