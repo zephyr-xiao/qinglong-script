@@ -69,7 +69,7 @@ xvfb-run -a task whos_tv_checkin/whos_tv_checkin.py
 |---|---:|---|---|
 | `WHOSTV_COOKIE` | 二选一 | - | 完整 Cookie 字符串，多账号用 `&` 分隔 |
 | `WHOSTV_ACCOUNT` | 二选一 | - | 账号密码，格式 `用户名#密码`，多账号用 `&` 分隔 |
-| `WHOSTV_PROXY` | 建议 | - | HTTP/SOCKS 代理，国内网络通常必填 |
+| `WHOSTV_PROXY` | 建议 | - | HTTP/SOCKS 代理，国内网络建议配置；留空时自动回退青龙全局代理（`HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY`） |
 | `WHOSTV_BROWSER_PATH` | 否 | 自动探测 | 指定 chromium 可执行文件路径（默认自动查找） |
 | `WHOSTV_NOTIFY` | 否 | `true` | 是否调用青龙 `notify.py` 推送 |
 | `WHOSTV_NOTIFY_ONLY_FAIL` | 否 | `false` | 仅当存在失败时才推送（需 `WHOSTV_NOTIFY=true`，全部成功则静默） |
@@ -243,7 +243,9 @@ HTTP 0 表示请求根本没拿到服务器响应（不是站点拒绝），脚�
 
 ### 请求超时或连接失败？
 
-whos.tv 在大陆网络通常需要代理。请确认 `WHOSTV_PROXY` 在青龙容器内可访问。
+whos.tv 在大陆网络通常需要代理。脚本按 `WHOSTV_PROXY` → 青龙全局代理（`HTTPS_PROXY` /
+`HTTP_PROXY` / `ALL_PROXY`）的顺序取代理，两者都没有则直连。请确认脚本取到的代理
+在青龙容器内可访问。
 
 Docker 青龙常见代理值：
 
@@ -262,7 +264,7 @@ http://172.17.0.1:7890
 
 - **密码错误**：日志会明确提示"登录失败: 密码错误"
 - **账号不存在**：检查用户名是否拼写正确
-- **网络不通**：确保 `WHOSTV_PROXY` 配置正确
+- **网络不通**：确保代理（`WHOSTV_PROXY` 或青龙全局代理）配置正确且容器内可达
 - **账号被封禁**：日志会提示"账号已被封禁"
 
 ### 不知道脚本试了哪些接口？

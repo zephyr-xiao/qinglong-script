@@ -32,7 +32,8 @@ task laowangfip_browser_checkin/laowangfip_browser_checkin.py
 | 变量名 | 必填 | 默认值 | 说明 |
 |---|---:|---|---|
 | `LWFIP_ACCOUNTS` | ✅ | - | `用户名#密码`，多账号用 `&` 或换行分隔 |
-| `LWFIP_PROXY` | ✅ | - | HTTP 代理，站点被墙必备，如 `http://172.17.0.1:7890` |
+| `LWFIP_PROXY` | 否 | - | HTTP 代理，站点被墙建议配置，如 `http://172.17.0.1:7890`；留空时自动回退青龙全局代理 |
+| `LWFIP_PROXY_REQUIRED` | 否 | `false` | 设为 `true` 时缺代理直接报错退出（默认缺代理仅告警并直连尝试） |
 | `LWFIP_BASE_URL` | 否 | `https://laowangfip372.vip` | 站点换域名时覆盖 |
 | `LWFIP_NOTIFY` | 否 | `true` | 是否调用青龙 `notify.py` 推送 |
 | `LWFIP_TIMEOUT` | 否 | `30000` | Playwright 超时时间，单位毫秒 |
@@ -42,7 +43,7 @@ task laowangfip_browser_checkin/laowangfip_browser_checkin.py
 | `LWFIP_MAX_CAPTCHA_RETRY` | 否 | `5` | 单次滑块识别失败重试次数 |
 | `LWFIP_NOTIFY_ONLY_FAIL` | 否 | `false` | `true` 时仅在有账号失败时才推送 |
 | `LWFIP_MAX_RETRY` | 否 | `5` | 账号级任务重试次数（仅可重试错误触发，见下文重试策略） |
-| `LWFIP_RETRY_INTERVAL` | 否 | `300` | 两次任务重试间隔，单位秒 |
+| `LWFIP_RETRY_INTERVAL` | 否 | `60` | 两次任务重试间隔，单位秒 |
 | `LWFIP_COOKIE_CACHE` | 否 | `true` | 登录成功后会话 Cookie 落盘复用，直通签到跳过滑块 |
 
 多账号示例：
@@ -52,6 +53,10 @@ LWFIP_ACCOUNTS=user1#pass1&user2#pass2
 ```
 
 ## 依赖安装
+
+### Python 版本
+
+要求 **Python 3.10+**（代码使用了 `int | None` 联合类型语法）。青龙容器自带 Python 3.11，无需处理。
 
 ### Python 依赖
 
@@ -116,11 +121,11 @@ python laowangfip_browser_checkin.py
 | 错误类型 | 是否重试 | 示例 |
 |---|---|---|
 | 网络 / 超时 / 代理 | ✅ | 登录超时、proxy error、连接被拒、浏览器启动失败、导航被中断 / Chromium 错误页（`chrome-error://`） |
-| 滑块验证码失败 | ✅ | 验证码识别失败、服务端判定未通过 |
+| 滑块验证码失败 | ✅ | 验证码识别失败、服务端判定未通过、验证码弹窗未出现 |
 | 签到流程异常 | ✅ | 未到达验证页、提交后仍在验证页、签到结果未知、找不到签到按钮 |
 | 业务错误 | ❌ | 密码错误、用户名不存在、账号禁用（重试无意义） |
 
-间隔保持固定（不做指数退避）：多账号最坏时长可控（如默认 5 次 × 300 秒 = 20 分钟），避免任务跨 cron 周期。
+间隔保持固定（不做指数退避）：多账号最坏时长可控（如默认 5 次重试、4 个间隔 × 60 秒 = 4 分钟），避免任务跨 cron 周期。
 
 ## 会话 Cookie 复用
 
@@ -174,21 +179,27 @@ LWFIP_CHROMIUM_PATH=/usr/bin/chromium
 
 ### 页面打不开或超时？
 
-老王FIP 站点需要代理。确认 `LWFIP_PROXY` 在青龙容器内可访问，例如：
+老王FIP 站点需要代理。脚本按 `LWFIP_PROXY` → 青龙全局代理（`HTTPS_PROXY` /
+`HTTP_PROXY` / `ALL_PROXY`）的顺序取代理，两者都没有则直连（大概率打不开）。
+确认脚本取到的代理在青龙容器内可访问，Docker 青龙常用宿主机地址：
 
 ```text
 http://172.17.0.1:7890
 ```
 
+代理软件建议开启**规则模式**：国内域名直连、境外域名走代理。这样青龙里配一个全局代理
+就能同时兼顾各脚本，不必逐个脚本单独配置 `LWFIP_PROXY`。
+
 ### 报错「Navigation ... is interrupted by another navigation」或「ERR_CONNECTION_CLOSED」？
 
 Chromium 访问站点时连接被关闭，页面跳到内置错误页（`chrome-error://chromewebdata/`）。
 这属于可重试的网络/代理抖动，脚本会自动重试，无需人工干预；若频繁出现，请检查
-`LWFIP_PROXY` 代理连通性是否稳定。
+代理（`LWFIP_PROXY` 或青龙全局代理）连通性是否稳定。
 
 ### 验证码失败？
 
-先开启：
+脚本内置弹窗自愈：点击 `#tncode` 后 3 秒内弹窗未出现会自动重新点击（最多 3 轮），
+避免单次点击无效导致整轮全败。若仍持续失败，先开启：
 
 ```text
 LWFIP_DEBUG=true
@@ -196,6 +207,8 @@ LWFIP_HEADFUL=true
 ```
 
 本地观察浏览器窗口和 `_browser_debug_*.png` 截图，确认代理、页面和验证码弹窗是否正常。
+日志中若出现「弹窗 DOM 已存在但未显示」多为验证码图片在代理下加载失败；
+「弹窗 DOM 完全不存在」多为 tncode JS 未加载成功，请检查代理连通性。
 
 ### 统计数据为空或只有“天”？
 

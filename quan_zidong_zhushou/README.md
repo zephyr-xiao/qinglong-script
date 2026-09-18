@@ -6,10 +6,11 @@
 
 - 单文件 Python 脚本，只依赖 `requests` + 标准库；
 - 支持多站点、多账号；
-- 内置站点预设：荔枝鱼公益站、哈基米 API 站、MT 论坛；
-- 支持 `QZD_CUSTOM` 扩展任意自定义 API 站；
-- 自动登录、提取 Token / Cookie / formhash、签到、识别“今日已签到”；
-- **凭证缓存复用**：登录成功后把 Token / Discuz Cookie 落盘到脚本同目录 `.token/`，下次命中则跳过登录直接签到；401 / 登录态失效自动清缓存重登；
+- 内置站点：Liminality 贝之中转站、可萌中转站、哈基米 API 站；
+- 支持 `QZD_CUSTOM` 扩展任意自定义 API 站（含 Discuz 论坛）；
+- 自动登录、提取 Token / Cookie、签到、识别“今日已签到”；
+- **余额展示**：签到后显示账户总余额；当日首签成功还会显示本次签到获得的额度（按签到前后余额差计算）。内置站已预配 `quota_info_url` 等字段，自定义站可在 `api_config` 中按需添加（`quota_info_url` / `quota_field` / `quota_per_unit` / `quota_currency`）；
+- **凭证缓存复用**：登录成功后把 Token、会话 Cookie、过期时间落盘到脚本同目录 `.token/`，下次命中则跳过登录直接签到；token 过期 / 401 / 登录态失效自动清缓存重登；
 - 401 自动重新登录重试一次；
 - 中文错误分类：密码错误、账号不存在、接口 404、限流 429 等；
 - 账号脱敏展示，避免日志泄露；
@@ -33,9 +34,9 @@ task quan_zidong_zhushou/quan_zidong_zhushou.py
 
 | 变量名 | 必填 | 格式 | 示例 |
 |---|---:|---|---|
-| `QZD_LIZHIYU` | 否 | `邮箱#密码`，多账号用 `&` 或换行分隔 | `a@x.com#mypass&b@y.com#otherpass` |
+| `QZD_BEIZHI` | 否 | `用户名#密码`，多账号用 `&` 或换行分隔 | `123#pwd123` |
+| `QZD_API456` | 否 | `用户名#密码`，多账号用 `&` 或换行分隔 | `123#pwd123` |
 | `QZD_GEMAI` | 否 | `用户名#密码`，多账号用 `&` 或换行分隔 | `zhangsan#pwd123` |
-| `QZD_BINMT` | 否 | `用户名#密码`，多账号用 `&` 或换行分隔 | `lisi#pwd456` |
 | `QZD_CUSTOM` | 否 | JSON 数组，见下方 | 见下方 |
 | `QZD_NOTIFY` | 否 | `true` / `false`，默认 `true` | `false` |
 | `QZD_NOTIFY_ONLY_FAIL` | 否 | `true` / `false`，默认 `false`，`true` 时仅在有失败时推送 | `true` |
@@ -46,9 +47,9 @@ task quan_zidong_zhushou/quan_zidong_zhushou.py
 
 | key | 名称 | 站点地址 | 认证方式 |
 |---|---|---|---|
-| `lizhiyu` | 荔枝鱼公益站 | https://huige.bbroot.com | Bearer Token |
+| `beizhi` | Liminality 贝之中转站 | https://beizhi.sylu.cc | Bearer Token（短期 token + 过期时间缓存） |
+| `api456` | 可萌中转站 | https://api456.me | New-Api-User Header + Session Cookie |
 | `gemai` | 哈基米 API 站 | https://api.gemai.cc | New-Api-User Header |
-| `binmt` | MT 论坛 | https://bbs.binmt.cc | Discuz Cookie + formhash |
 
 ## `QZD_CUSTOM` 自定义站点
 
@@ -101,13 +102,17 @@ task quan_zidong_zhushou/quan_zidong_zhushou.py
 | `api_config.auth_header_template` | 鉴权头值模板，例如 `Bearer {{token}}` |
 | `api_config.success_field` | 判定成功的字段路径 |
 | `api_config.message_field` | 提取消息文本的字段路径 |
+| `api_config.quota_info_url` | 余额查询接口（可选，配置后签到结果显示余额） |
+| `api_config.quota_field` | 余额字段点号路径，默认 `data.quota` |
+| `api_config.quota_per_unit` | 额度换算单位，默认 `500000`（New API 标准） |
+| `api_config.quota_currency` | 货币符号，默认 `$` |
 
 `type` 为 `discuz` 时，`api_config` 通常只需配置 `base_url`，其余流程由脚本自动处理。
 
 ## 凭证缓存
 
-- 登录成功后将 token（API 站）或 Discuz 会话 Cookie 落盘到脚本同目录 `.token/{site}_{hash}.json`
-- 下次运行命中缓存则**跳过登录直接签到**；token 失效（401）/ Cookie 失效（"请先登录"）自动清除缓存并重新登录
+- 登录成功后将 token、会话 Cookie 快照、token 过期时间（如有）落盘到脚本同目录 `.token/{site}_{hash}.json`
+- 下次运行命中缓存则**跳过登录直接签到**（Session Cookie 型站点同样生效）；token 过期 / 签到 401 / Cookie 失效自动清除缓存并重新登录
 - 无开关，自动生效；如需强制重新登录，删除脚本同目录 `.token/` 即可（含敏感数据，勿提交/外传）
 
 ## 依赖安装
@@ -129,7 +134,7 @@ pip install requests
 Linux / macOS：
 
 ```bash
-export QZD_LIZHIYU="your@email.com#yourpass"
+export QZD_BEIZHI="your_username#yourpass"
 export QZD_NOTIFY=false
 python quan_zidong_zhushou.py
 ```
@@ -137,7 +142,7 @@ python quan_zidong_zhushou.py
 Windows PowerShell：
 
 ```powershell
-$env:QZD_LIZHIYU="your@email.com#yourpass"
+$env:QZD_BEIZHI="your_username#yourpass"
 $env:QZD_NOTIFY="false"
 python .\quan_zidong_zhushou.py
 ```
@@ -156,13 +161,16 @@ python .\quan_zidong_zhushou.py
 
 在青龙「依赖管理」-「Python」中安装 `requests`。
 
-### Discuz 站点无法获取 formhash？
-
-通常是登录失败、账号密码错误、Cookie 不完整，或论坛启用了额外安全问题。可通过 `QZD_CUSTOM` 的 Discuz 配置扩展安全提问参数。
-
 ### 怎么临时禁用某个站点？
 
 在青龙「环境变量」里禁用对应变量即可，不需要删除。
+
+### 本地跑单元测试
+
+```bash
+pip install pytest
+python -m pytest tests -q
+```
 
 ### 怎么扩展新的内置站点？
 
