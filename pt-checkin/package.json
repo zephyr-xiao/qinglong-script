@@ -1,0 +1,16 @@
+{
+  "name": "pt-checkin",
+  "version": "1.0.0",
+  "description": "PT 站点每日签到脚本（NovaHD / HDArea / BTSchool，青龙面板）",
+  "main": "pt_checkin.js",
+  "scripts": {
+    "start": "node pt_checkin.js",
+    "test": "node tests/pt_checkin_test.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "undici": "^6.21.0"
+  }
+}
