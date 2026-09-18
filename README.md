@@ -6,6 +6,7 @@
 
 | 脚本 | 说明 | 文档 | 青龙任务命令 |
 |---|---|---|---|
+| E-Hentai 自动签到 | E-Hentai 每日签到领 Exp/Credits，Cookie 认证，TLS 1.2 回退 + Cookie 过期预警 | [ehentai_autosignin/README.md](ehentai_autosignin/README.md) | `task ehentai_autosignin/autosignin.py` |
 | 7x.hk / 8s.hk 签到 | NewAPI 双站签到（7x.hk + 8s.hk），session 认证，单脚本双站 | [7x8s_checkin/README.md](7x8s_checkin/README.md) | `task 7x8s_checkin/7x8s_checkin.py` |
 | 老王FIP签到（浏览器版） | Discuz + tncode 滑块 + 前端 JS 签名，使用 Playwright + OpenCV 自动登录签到 | [laowangfip_browser_checkin/README.md](laowangfip_browser_checkin/README.md) | `task laowangfip_browser_checkin/laowangfip_browser_checkin.py` |
 | 全自动签到助手 | 多站点 API/Discuz 签到，支持内置站点与 `QZD_CUSTOM` 自定义站点，凭证 token/Cookie 缓存复用 | [quan_zidong_zhushou/README.md](quan_zidong_zhushou/README.md) | `task quan_zidong_zhushou/quan_zidong_zhushou.py` |
@@ -18,6 +19,12 @@
 | DZZI.AI 自动签到 | New API 站签到，多账号批量、已签到自动跳过（幂等） | [dzzi-auto-checkin/README.md](dzzi-auto-checkin/README.md) | `task dzzi-auto-checkin/checkin.py` |
 | 雨云自动签到 | 雨云服务器签到 + 自动续费，多账号 + 验证码识别，专为青龙面板优化 | [Rainyun/README.md](Rainyun/README.md) | `task Rainyun/main.py` |
 | 天翼云盘签到 | cloud189-sdk 登录签到，多账号 + 个人/家庭容量统计，复用 sendNotify.js 全通道推送 | [Cloud189Checkin/README.md](Cloud189Checkin/README.md) | `task Cloud189Checkin/src/app.js` |
+| RouterTeam 签到（Node.js） | ai.router.team 邀请奖励页每日签到，账号密码登录 + Bearer token 缓存复用，多账号 + 充值门槛识别 | [ai-router-team-checkin/README.md](ai-router-team-checkin/README.md) | `task ai-router-team-checkin/ai_router_team_checkin.js` |
+| PT 签到（Node.js） | NovaHD / HDArea / BTSchool 三站签到，Cookie 失效自动登录兜底（视觉模型识别验证码），登录限次保护防封 IP | [pt-checkin/README.md](pt-checkin/README.md) | `task pt-checkin/pt_checkin.js` |
+| TG签到（tg-signer） | Telegram 群/机器人自动签到，基于 tg-signer 封装，扫码登录多账号，支持发消息+点按钮+定时撤回 | [tg-signer-ql/README.md](tg-signer-ql/README.md) | `task tg-signer-ql/tg_signer_ql.py` |
+| ZodGame 签到 | zodgame.xyz 每日签到 + BUX 广告任务（每个 +2 点币），Cookie 认证，幂等跳过，Cookie 失效推送告警 | [zodgame_checkin/README.md](zodgame_checkin/README.md) | `task zodgame_checkin/zodgame_checkin.py` |
+| 嘉立创签到 | m.jlc.com 每日签到领金豆，第七天自动领 8 金豆券，AccessToken 认证，幂等跳过，Token 失效告警 | [jlc_checkin/README.md](jlc_checkin/README.md) | `task jlc_checkin/jlc_checkin.py` |
+| 纸鸢下载签到 | mybt.kiteyuan.info 每日签到 + 访问任务，Casdoor 账号密码自动登录换 JWT，JWT 缓存复用（401 才重登），多账号 + 网络重试，幂等跳过 | [mybt-checkin-ql/README.md](mybt-checkin-ql/README.md) | `task mybt-checkin-ql/mybt_checkin.py` |
 
 ## 迁移提醒
 
@@ -68,3 +75,57 @@ Windows PowerShell 中设置环境变量示例：
 $env:XXX_NOTIFY="false"
 python path\to\script.py
 ```
+
+## 代理配置（重要）
+
+脚本的代理取值优先级固定为三段：
+
+1. 脚本专属变量（如 `LWFIP_PROXY`、`IKUUU_PROXY`、`TG_PROXY`）
+2. 青龙全局代理：`HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY`（大小写均可）
+3. 都为空则直连（不报错退出）
+
+### 注意：`config.sh` 里的 `ProxyUrl` 对脚本无效
+
+`ProxyUrl` 是**青龙面板自身**的配置项，只用于面板拉库、安装依赖，**不会注入任务脚本的运行环境**。
+脚本读不到它，因此「配了 ProxyUrl 却仍提示未配置代理」是正常现象，不是脚本的问题。
+
+要让所有脚本共用一份代理配置，任选其一。
+
+**方式一：青龙「环境变量」页（推荐）**
+
+新增两条，值改成你自己的代理地址：
+
+| 名称 | 值 |
+|---|---|
+| `HTTP_PROXY` | `http://192.168.5.5:7890` |
+| `HTTPS_PROXY` | `http://192.168.5.5:7890` |
+
+> 代理跑在宿主机上时容器内常用 `http://172.17.0.1:7890`；跑在局域网其它机器上则填其实际 IP。
+> 保存后新运行的任务即生效。
+
+**方式二：容器级环境变量（docker 部署）**
+
+在 `docker-compose.yml` 的青龙服务下追加：
+
+```yaml
+environment:
+  - HTTP_PROXY=http://192.168.5.5:7890
+  - HTTPS_PROXY=http://192.168.5.5:7890
+  - NO_PROXY=localhost,127.0.0.1,192.168.0.0/16,10.0.0.0/8,172.16.0.0/12
+```
+
+`NO_PROXY` 用于排除内网，避免青龙访问数据库、NAS 时也被绕进代理。
+
+> 建议代理软件开启**规则模式**：国内域名直连、境外域名走代理。否则国内站脚本（嘉立创、雨云、司机社等）会因绕行而变慢甚至失败。
+
+### 代理没生效怎么排查
+
+运行同目录的诊断脚本 `proxy_env_probe.py`，它会列出任务环境里所有含 proxy 的变量、
+脚本的代理解析结果，并实测直连与代理各自的出口 IP：
+
+```text
+task proxy_env_probe.py
+```
+
+判断标准：输出第 1 节若没有 `HTTP_PROXY` / `HTTPS_PROXY`，说明「环境变量」页里没配；
+第 4 节「代理」一行能显示出 IP 且与「直连」不同，说明代理链路可用。
