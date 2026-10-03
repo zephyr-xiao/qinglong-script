@@ -17,7 +17,7 @@ k_misign 签到需通过算术验证（"签到验证：A - B = ?"），脚本解
   SXSY_DEBUG             true/false 调试模式，默认 false
   SXSY_PROXY             HTTP 代理（可选，如 http://172.17.0.1:7890）
 依赖：requests 必装；ddddocr 仅账密登录时需要（Cookie 模式无需安装）
-作者: 箫遥风
+作者: zephyr_xiao
 """
 import json
 import os

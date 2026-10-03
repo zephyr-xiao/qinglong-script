@@ -19,7 +19,7 @@ cron: 40 8 * * *
 
 依赖:requests
 
-作者: 箫遥风
+作者: zephyr_xiao
 """
 
 import os

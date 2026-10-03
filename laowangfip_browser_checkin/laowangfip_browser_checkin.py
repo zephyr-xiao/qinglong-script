@@ -36,7 +36,7 @@ cron: 30 8 * * *
   opencv-python-headless  （滑块识别）
   numpy
 
-作者: 箫遥风
+作者: zephyr_xiao
 """
 
 import asyncio

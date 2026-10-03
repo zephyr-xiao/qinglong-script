@@ -19,7 +19,7 @@ cron: 5 8 * * *
   MYBT_DEBUG             true/false 输出调试细节，默认 false
   MYBT_PROXY             HTTP/SOCKS 代理，如 http://172.17.0.1:7890
   MYBT_BASE_URL / MYBT_AUTH_URL / MYBT_SECRET   站点/认证地址/签名密钥（一般不用改）
-作者: 箫遥风
+作者: zephyr_xiao
 """
 import base64
 import hashlib
