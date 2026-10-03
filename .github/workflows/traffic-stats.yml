@@ -27,11 +27,20 @@ jobs:
         with:
           python-version: "3.12"
 
+      # 流量接口不接受 Actions 自带的 GITHUB_TOKEN（403 Resource not accessible by
+      # integration），必须用一个带 Administration:read 的令牌，见 stats/README.md。
+      - name: 检查令牌
+        env:
+          TRAFFIC_TOKEN: ${{ secrets.TRAFFIC_TOKEN }}
+        run: |
+          if [ -z "$TRAFFIC_TOKEN" ]; then
+            echo "::error::未配置 TRAFFIC_TOKEN 密钥。GitHub 的流量接口不接受自带的 GITHUB_TOKEN，必须单独配置令牌，步骤见 stats/README.md 的「云端运行」。"
+            exit 1
+          fi
+
       - name: 抓取并提交流量快照
         env:
-          # 优先用自定义 PAT（需 Administration:read 或经典 token 的 repo 权限）；
-          # 未配置时退回默认 GITHUB_TOKEN
-          GH_TOKEN: ${{ secrets.TRAFFIC_TOKEN || secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.TRAFFIC_TOKEN }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
