@@ -25,6 +25,23 @@
 | 福利吧预注册签到 | wnflb2023.com「游客预注册签到」插件，连续签到 30 天转正，Cookie 直签或账号密码登录（验证码 ddddocr 自动识别 + Cookie 缓存），幂等跳过 + 进度统计 | [wnflb_checkin/README.md](wnflb_checkin/README.md) | `task wnflb_checkin/wnflb_checkin.py` |
 | 尚香书苑签到 | sxsy45.com Discuz k_misign 签到，登录图片验证码 ddddocr 自动识别 + 算术验证自动计算，Cookie 直签或账密登录（Cookie 缓存复用），幂等跳过 + 签到统计 | [sxsy45_checkin/README.md](sxsy45_checkin/README.md) | `task sxsy45_checkin/sxsy45_checkin.py` |
 
+## 来源与致谢
+
+以下脚本改写/移植自开源项目，按青龙面板规范适配后在本仓库维护，原项目地址一并列出：
+
+| 脚本 | 原项目 |
+|---|---|
+| 雨云自动签到 | [SerendipityR-2022/Rainyun-Qiandao](https://github.com/SerendipityR-2022/Rainyun-Qiandao) → [fatekey/Rainyun-Qiandao](https://github.com/fatekey/Rainyun-Qiandao) → [Jielumoon/Rainyun-Qiandao](https://github.com/Jielumoon/Rainyun-Qiandao) |
+| 天翼云盘签到 | [wes-lin/Cloud189Checkin](https://github.com/wes-lin/Cloud189Checkin)（登录依赖 [wes-lin/cloud189-sdk](https://github.com/wes-lin/cloud189-sdk)） |
+| iKuuu 签到 | [wuang-wu/Ikuuu](https://github.com/wuang-wu/Ikuuu) |
+| E-Hentai 自动签到 | [AkiyaKiko/EhentaiAutoSignIn](https://github.com/AkiyaKiko/EhentaiAutoSignIn) |
+| 嘉立创签到 | [Foticing/LC-AutoSign](https://github.com/Foticing/LC-AutoSign) |
+| 纸鸢下载签到 | [elongou-checkin/mybt-signin](https://github.com/elongou-checkin/mybt-signin) |
+| New API 站点签到 | [zhangguoguo1314/quan-zidong-zhushou](https://github.com/zhangguoguo1314/quan-zidong-zhushou) |
+| TG 签到（tg-signer） | [amchii/tg-signer](https://github.com/amchii/tg-signer) |
+
+其余脚本为本仓库原创。感谢上述项目作者的开源工作。
+
 ## 迁移提醒
 
 脚本已从根目录移动到子目录。若青龙中已有旧任务，需要同步修改命令：

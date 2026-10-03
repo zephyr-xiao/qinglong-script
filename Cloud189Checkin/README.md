@@ -2,6 +2,8 @@
 
 青龙面板自动签到脚本，针对天翼云盘（189 网盘）。Node.js 实现，基于 `cloud189-sdk` 登录，复用目录内 `sendNotify.js` 推送全通道。
 
+> 改写自 [wes-lin/Cloud189Checkin](https://github.com/wes-lin/Cloud189Checkin)，登录依赖 [wes-lin/cloud189-sdk](https://github.com/wes-lin/cloud189-sdk)，按青龙面板规范适配。
+
 ## 脚本文件
 
 | 文件 | 说明 |

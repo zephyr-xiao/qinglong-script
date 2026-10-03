@@ -4,6 +4,7 @@ new Env('纸鸢下载签到');
 cron: 5 8 * * *
 
 纸鸢下载（mybt.kiteyuan.info）自动签到，移植自 elongou-checkin/mybt-signin。
+原项目地址: https://github.com/elongou-checkin/mybt-signin
 流程：Casdoor 账号密码自动登录换取站点 token → 每日签到 + 访问任务 → 青龙 notify.py 推送。
 登录态按账号本地缓存复用，失效时先用 refresh_token 续期、失败才重新登录（缓存不存密码）。
 

@@ -4,6 +4,7 @@ new Env('嘉立创签到');
 cron: 40 8 * * *
 
 嘉立创(立创商城 m.jlc.com)每日签到脚本,移植自 GitHub Foticing/LC-AutoSign。
+原项目地址: https://github.com/Foticing/LC-AutoSign
 签到领金豆,第七天自动领取 8 金豆券,查询金豆余额。
 
 认证方式:AccessToken(嘉立创 App 抓包获取),多账号换行分隔。
