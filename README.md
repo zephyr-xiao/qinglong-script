@@ -145,3 +145,9 @@ task proxy_env_probe.py
 
 判断标准：输出第 1 节若没有 `HTTP_PROXY` / `HTTPS_PROXY`，说明「环境变量」页里没配；
 第 4 节「代理」一行能显示出 IP 且与「直连」不同，说明代理链路可用。
+
+## 仓库流量
+
+GitHub 只保留最近 14 天的流量数据，这里每周自动抓取并存档到 [`stats/`](stats/README.md)，趋势如下：
+
+[![仓库流量趋势](stats/traffic.svg)](stats/README.md)

@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import math
 import subprocess
 import sys
 from datetime import datetime
@@ -97,6 +98,142 @@ def write_csv(rows: dict[str, dict]) -> None:
             writer.writerow({k: rows[day].get(k, 0) for k in CSV_FIELDS})
 
 
+# ---------------------------- SVG 图表 ----------------------------
+
+CHART_DAYS = 30  # 图表最多展示最近多少天
+BLUE = "#0A84FF"
+ORANGE = "#FF9500"
+GRID = "#E5E5EA"
+INK = "#1C1C1E"
+MUTED = "#8E8E93"
+
+
+def nice_max(value: int) -> int:
+    """把 Y 轴上限向上取到 1/2/5×10^n，让刻度好看。"""
+    if value <= 0:
+        return 1
+    exp = math.floor(math.log10(value))
+    base = 10 ** exp
+    for mult in (1, 2, 5, 10):
+        if value <= mult * base:
+            return mult * base
+    return 10 * base
+
+
+def smooth_path(points: list[tuple[float, float]]) -> str:
+    """把折线点转成平滑曲线（Catmull-Rom 转三次贝塞尔）。
+
+    流量是逐日小数值，平滑曲线比折线折角更耐看，也更容易看出趋势。
+    """
+    if len(points) < 2:
+        return ""
+    path = f"M {points[0][0]:.1f},{points[0][1]:.1f}"
+    for i in range(len(points) - 1):
+        p0 = points[i - 1] if i > 0 else points[i]
+        p1, p2 = points[i], points[i + 1]
+        p3 = points[i + 2] if i + 2 < len(points) else p2
+        c1 = (p1[0] + (p2[0] - p0[0]) / 6, p1[1] + (p2[1] - p0[1]) / 6)
+        c2 = (p2[0] - (p3[0] - p1[0]) / 6, p2[1] - (p3[1] - p1[1]) / 6)
+        path += (f" C {c1[0]:.1f},{c1[1]:.1f} {c2[0]:.1f},{c2[1]:.1f} "
+                 f"{p2[0]:.1f},{p2[1]:.1f}")
+    return path
+
+
+def render_svg(rows: dict[str, dict], days: int = CHART_DAYS) -> str:
+    """把每日数据画成一张自包含的 SVG（浏览=实线，独立访客=虚线）。
+
+    只依赖标准库，不引入绘图包；配色为白底卡片 + 系统蓝，深浅色模式都能看。
+    """
+    series = [rows[day] for day in sorted(rows)][-days:]
+    if not series:
+        return "<svg xmlns='http://www.w3.org/2000/svg' width='1' height='1'></svg>"
+
+    width, height = 780, 250
+    pad_l, pad_r, pad_t, pad_b = 48, 18, 60, 34
+    plot_w = width - pad_l - pad_r
+    plot_h = height - pad_t - pad_b
+    base_y = pad_t + plot_h
+
+    views = [int(r["views"]) for r in series]
+    visitors = [int(r["unique_visitors"]) for r in series]
+    top = nice_max(max(max(views), max(visitors)))
+
+    slot = plot_w / len(series)
+
+    parts: list[str] = [
+        f"<svg xmlns='http://www.w3.org/2000/svg' width='{width}' height='{height}' "
+        f"viewBox='0 0 {width} {height}' role='img' aria-label='仓库流量趋势'>",
+        # 颜色以「显式属性」为准（GitHub 清洗 SVG 时可能剥掉 <style>），
+        # <style> 只做深色模式覆盖：被剥掉只是退回浅色，不会画错。
+        "<style>@media (prefers-color-scheme:dark){"
+        ".card{fill:#161618;stroke:#303034}.ink{fill:#F2F2F7}"
+        ".muted{fill:#98989F}.grid{stroke:#303034}}</style>",
+        f"<rect class='card' x='0.5' y='0.5' width='{width - 1}' height='{height - 1}' rx='12' "
+        f"fill='#FFFFFF' stroke='{GRID}'/>",
+        f"<text class='ink' x='{pad_l}' y='28' font-size='15' font-weight='600' "
+        f"font-family='-apple-system,Segoe UI,PingFang SC,Microsoft YaHei,sans-serif' "
+        f"fill='{INK}'>仓库流量</text>",
+    ]
+
+    total_views = sum(views)
+    # 每日「独立访客」是按天去重的，直接相加会跨天重复计数，因此称「人次」
+    total_visits = sum(int(r["unique_visitors"]) for r in series)
+    total_clones = sum(int(r["clones"]) for r in series)
+    span = f"{series[0]['date'][5:]} ~ {series[-1]['date'][5:]}"
+    parts.append(
+        f"<text class='muted' x='{pad_l}' y='47' font-size='11' "
+        f"font-family='-apple-system,Segoe UI,PingFang SC,Microsoft YaHei,sans-serif' "
+        f"fill='{MUTED}'>{span} · 浏览 {total_views} 次 / 访客 {total_visits} 人次 / "
+        f"克隆 {total_clones} 次</text>"
+    )
+
+    # 图例（右上）：圆点 + 文字
+    legend_y = 25
+    lx = width - pad_r - 168
+    parts.append(f"<circle cx='{lx + 5}' cy='{legend_y}' r='4' fill='{BLUE}'/>")
+    parts.append(f"<text class='muted' x='{lx + 14}' y='{legend_y + 4}' font-size='11' "
+                 f"font-family='-apple-system,Segoe UI,PingFang SC,Microsoft YaHei,sans-serif' "
+                 f"fill='{MUTED}'>浏览</text>")
+    parts.append(f"<circle cx='{lx + 62}' cy='{legend_y}' r='4' fill='{ORANGE}'/>")
+    parts.append(f"<text class='muted' x='{lx + 71}' y='{legend_y + 4}' font-size='11' "
+                 f"font-family='-apple-system,Segoe UI,PingFang SC,Microsoft YaHei,sans-serif' "
+                 f"fill='{MUTED}'>独立访客</text>")
+
+    # 横向网格线 + Y 轴刻度
+    for i in range(5):
+        ratio = i / 4
+        y = base_y - plot_h * ratio
+        parts.append(f"<line class='grid' x1='{pad_l}' y1='{y:.1f}' x2='{pad_l + plot_w}' y2='{y:.1f}' "
+                     f"stroke='{GRID}' stroke-width='1'/>")
+        parts.append(f"<text class='muted' x='{pad_l - 8}' y='{y + 3.5:.1f}' font-size='10' "
+                     f"text-anchor='end' font-family='-apple-system,Segoe UI,PingFang SC,"
+                     f"Microsoft YaHei,sans-serif' fill='{MUTED}'>{round(top * ratio)}</text>")
+
+    # 浏览：实线平滑曲线（主指标）
+    view_pts = [(pad_l + slot * (i + 0.5), base_y - plot_h * v / top) for i, v in enumerate(views)]
+    parts.append(f"<path d='{smooth_path(view_pts)}' fill='none' stroke='{BLUE}' "
+                 f"stroke-width='2.2' stroke-linecap='round'/>")
+
+    # 独立访客：虚线 + 圆点（次要指标，弱化处理）
+    visit_pts = [(pad_l + slot * (i + 0.5), base_y - plot_h * v / top)
+                 for i, v in enumerate(visitors)]
+    parts.append(f"<path d='{smooth_path(visit_pts)}' fill='none' stroke='{ORANGE}' "
+                 f"stroke-width='1.8' stroke-linecap='round' stroke-dasharray='5 3'/>")
+    for x, y in visit_pts:
+        parts.append(f"<circle cx='{x:.1f}' cy='{y:.1f}' r='2.6' fill='{ORANGE}'/>")
+
+    # X 轴只标首尾日期：中间日期挤在一起反而难读，趋势看形状就够了
+    marks = [(0, "start")] if len(series) == 1 else [(0, "start"), (len(series) - 1, "end")]
+    for idx, anchor in marks:
+        x = pad_l + slot * (idx + 0.5)
+        parts.append(f"<text class='muted' x='{x:.1f}' y='{height - 12}' font-size='10' "
+                     f"text-anchor='{anchor}' font-family='-apple-system,Segoe UI,PingFang SC,"
+                     f"Microsoft YaHei,sans-serif' fill='{MUTED}'>{series[idx]['date']}</text>")
+
+    parts.append("</svg>")
+    return "".join(parts)
+
+
 def commit_and_push(summary: str) -> bool:
     """只提交 stats/ 目录；暂存区里若有其它改动则跳过，避免误提交。"""
     run(["git", "-C", str(REPO_ROOT), "add", "stats"])
@@ -156,6 +293,7 @@ def main() -> int:
 
     write_csv(rows)
     LATEST_PATH.write_text(json.dumps(latest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    (STATS_DIR / "traffic.svg").write_text(render_svg(rows), encoding="utf-8")
 
     if args.no_push:
         print("已写入 stats/（--no-push，未提交）")
