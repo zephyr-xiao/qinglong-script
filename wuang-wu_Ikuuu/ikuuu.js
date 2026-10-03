@@ -1,6 +1,6 @@
 /**
  * @name iKuuu 自动签到
- * @description 青龙面板自动签到脚本（ikuuu 机场），动态域名 + 多账号 + 状态分档 + 失败才推送
+ * @description 青龙面板自动签到脚本（ikuuu 机场），改写自 https://github.com/wuang-wu/Ikuuu，动态域名 + 多账号 + 状态分档 + 失败才推送
  * @cron 8 8 * * *
  *
  * 环境变量：

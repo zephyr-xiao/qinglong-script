@@ -2,6 +2,8 @@
 
 青龙面板自动签到脚本，针对 ikuuu 机场（面板域名随发布页轮换，当前为 `ikuuu.top` / `ikuuu.pw`）。Node.js 实现，复用目录内 `sendNotify.js` 推送全通道。
 
+> 改写自 [wuang-wu/Ikuuu](https://github.com/wuang-wu/Ikuuu)，按青龙面板规范适配。
+
 ## 脚本文件
 
 | 文件 | 说明 |

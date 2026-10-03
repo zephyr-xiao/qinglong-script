@@ -2,6 +2,9 @@
 '''
 new Env('E-Hentai 自动签到')
 cron: 1 */6 * * *
+
+脚本来源: https://github.com/AkiyaKiko/EhentaiAutoSignIn
+作者: zephyr_xiao（基于原项目改写）
 '''
 
 import os
