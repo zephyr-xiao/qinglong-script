@@ -1,0 +1,79 @@
+{
+  "fetched_at": "2026-10-04T04:22:45+08:00",
+  "repo": "zephyr-xiao/qinglong-script",
+  "views_14d": {
+    "count": 61,
+    "uniques": 20
+  },
+  "clones_14d": {
+    "count": 17,
+    "uniques": 14
+  },
+  "stars": 2,
+  "forks": 1,
+  "watchers": 0,
+  "referrers": [
+    {
+      "referrer": "github.com",
+      "views": 26,
+      "uniques": 16
+    },
+    {
+      "referrer": "Bing",
+      "views": 5,
+      "uniques": 2
+    }
+  ],
+  "popular_paths": [
+    {
+      "path": "/zephyr-xiao/qinglong-script",
+      "views": 29,
+      "uniques": 18
+    },
+    {
+      "path": "/zephyr-xiao/qinglong-script/blob/main/jlc_checkin/README.md",
+      "views": 4,
+      "uniques": 2
+    },
+    {
+      "path": "/zephyr-xiao/qinglong-script/blob/main/quan_zidong_zhushou/README.md",
+      "views": 3,
+      "uniques": 3
+    },
+    {
+      "path": "/zephyr-xiao/qinglong-script/tree/main/laowangfip_browser_checkin",
+      "views": 3,
+      "uniques": 1
+    },
+    {
+      "path": "/zephyr-xiao/qinglong-script/blob/main/jlc_checkin/jlc_checkin.py",
+      "views": 2,
+      "uniques": 2
+    },
+    {
+      "path": "/zephyr-xiao/qinglong-script/blob/main/tg-signer-ql/README.md",
+      "views": 2,
+      "uniques": 2
+    },
+    {
+      "path": "/zephyr-xiao/qinglong-script/tree/main/jlc_checkin",
+      "views": 2,
+      "uniques": 2
+    },
+    {
+      "path": "/zephyr-xiao/qinglong-script/blob/main/AkiyaKiko_EhentaiAutoSignIn/autosignin.py",
+      "views": 1,
+      "uniques": 1
+    },
+    {
+      "path": "/zephyr-xiao/qinglong-script/blob/main/pt-checkin/README.md",
+      "views": 1,
+      "uniques": 1
+    },
+    {
+      "path": "/zephyr-xiao/qinglong-script/blob/main/wuang-wu_Ikuuu/README.md",
+      "views": 1,
+      "uniques": 1
+    }
+  ]
+}
