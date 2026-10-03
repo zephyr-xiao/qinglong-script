@@ -28,9 +28,6 @@ replied_posts.json
 *_accounts.txt
 .test_tmp/
 
-# 独立子仓库（有自己的 remote，在各自仓库内维护）
-tg-signer-ql/
-
 # IDE
 .vscode/
 .idea/
