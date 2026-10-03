@@ -38,7 +38,7 @@
  *   - 验证码识别两级链路：视觉模型（PT_OCR_API_URL）→ 本地 ddddocr 降级（同目录 ddddocr_ocr.py，
  *     颜色过滤 + 连通域去噪 + 双模型投票，实测 30 样本 80.0%）。
  *   - 推送：复用同目录 sendNotify.js（青龙官方 Notify）。
- * 作者: 箫遥风
+ * 作者: zephyr_xiao
  */
 
 const fs = require('fs');

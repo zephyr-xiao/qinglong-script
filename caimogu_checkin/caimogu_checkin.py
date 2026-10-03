@@ -34,7 +34,7 @@ AI/模板双模式生成拟人评论，每天在指定板块回复若干帖子�
   python caimogu_qinglong.py            执行自动回帖
   python caimogu_qinglong.py --test     测试评论生成效果（不启动浏览器）
   python caimogu_qinglong.py --help     显示帮助
-作者: 箫遥风
+作者: zephyr_xiao
 """
 
 import json

@@ -24,7 +24,7 @@ cron: 8 8 * * *
   QZD_TIMEOUT   秒          默认 30，HTTP 请求超时
   QZD_PROXY     代理地址    默认空，如 http://172.17.0.1:7890
 
-作者: 箫遥风（基于源项目改写）
+作者: zephyr_xiao（基于源项目改写）
 """
 
 import hashlib

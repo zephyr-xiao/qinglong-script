@@ -18,7 +18,7 @@ SophNet(www.sophnet.com) 福利中心每日签到，签到领 Token 奖励。
   localStorage.getItem('sophnet-auth-tab-sync-v1')
 取返回 JSON 中的 p.refreshToken 字段值即可。
 
-作者: 箫遥风
+作者: zephyr_xiao
 """
 
 import json

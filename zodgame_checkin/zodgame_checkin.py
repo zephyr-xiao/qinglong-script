@@ -21,7 +21,7 @@ Cookie 失效时推送告警,提醒重新抓取。
 
 依赖:requests
 
-作者: 箫遥风
+作者: zephyr_xiao
 """
 
 import os
