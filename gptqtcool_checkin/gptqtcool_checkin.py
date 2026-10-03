@@ -1697,6 +1697,104 @@ async def wait_for_checkin_result(page, timeout: float = 18.0) -> bool:
     return False
 
 
+async def click_checkin_button(page) -> bool:
+    """点击签到按钮(三级选择器回退),返回是否成功点击"""
+    logger.info("🖱️ 寻找并点击签到按钮...")
+    if await page.locator("button#checkinBtn.ci-btn.renew").count() > 0:
+        logger.info("✅ 找到精确的签到按钮")
+        await page.evaluate("""() => {
+            const button = document.querySelector('button#checkinBtn.ci-btn.renew');
+            if (button) button.click();
+        }""")
+        logger.info("🖱️ 点击签到按钮(JavaScript 执行)")
+        return True
+    if await page.locator('button:has-text("签到续期")').count() > 0:
+        logger.info("✅ 找到签到续期按钮")
+        await page.evaluate("""() => {
+            const buttons = document.querySelectorAll('button');
+            for (const btn of buttons) {
+                if (btn.textContent && btn.textContent.includes('签到续期')) {
+                    btn.click();
+                    break;
+                }
+            }
+        }""")
+        logger.info("🖱️ 点击签到续期按钮(JavaScript 执行)")
+        return True
+    if await page.locator('button:has-text("签到")').count() > 0:
+        logger.info("✅ 找到签到按钮")
+        await page.evaluate("""() => {
+            const buttons = document.querySelectorAll('button');
+            for (const btn of buttons) {
+                const t = (btn.textContent || '').trim();
+                // has-text("签到") 会同时命中"今日已签到"按钮（FORCE_RUN 放行时），
+                // 点击前排除它，避免点了无效按钮后走完整验证码流程
+                if (t.includes('签到') && !t.includes('今日已签到')) {
+                    btn.click();
+                    break;
+                }
+            }
+        }""")
+        logger.info("🖱️ 点击签到按钮(JavaScript 执行)")
+        return True
+    return False
+
+
+async def reload_and_verify(page) -> bool:
+    """刷新页面后的兜底成功检测(按钮文本 / 今日已签到按钮 / 日历标记)"""
+    logger.info("🔄 刷新页面以更新签到状态...")
+    await page.reload(wait_until="domcontentloaded")
+    await asyncio.sleep(3.0)
+
+    logger.info("📅 等待日历加载...")
+    try:
+        await page.wait_for_selector(".ci-cal-day", state="visible", timeout=5000)
+        logger.info("✅ 日历已加载")
+    except Exception:
+        logger.info("⚠️ 日历加载超时,继续检查")
+
+    logger.info("🔍 刷新后兜底检查签到状态...")
+
+    # 1. 按钮文本变为"今日已签到"/"已签到"
+    checkin_button = page.locator("button#checkinBtn.ci-btn.renew")
+    if await checkin_button.count() > 0:
+        button_text = await checkin_button.text_content()
+        logger.info(f"📝 签到按钮文本: {button_text}")
+        # 注意：不含 "Check-in"（未签到状态的动作动词），避免签到失败时误判成功
+        success_texts = ["今日已签到", "已签到", "Signed", "Renewed", "Checked in today"]
+        if button_text and any(s in button_text for s in success_texts):
+            logger.info(f"🎉 检测到按钮状态变为: {button_text}")
+            return True
+
+    # 2. 今日已签到按钮
+    if await page.locator('button:has-text("今日已签到")').count() > 0:
+        logger.info('🎉 检测到"今日已签到"按钮,签到成功!')
+        return True
+
+    # 3. 日历今日是否有签到标记(精确匹配日期数字)
+    today = datetime.now().day
+    logger.info(f"📅 检查今天({today}号)是否有签到标记...")
+    cal_days = await page.locator(".ci-cal-day").all()
+    found_today = False
+    for cd in cal_days:
+        cd_text = await cd.text_content()
+        if cd_text and cd_text.strip() == str(today):
+            found_today = True
+            has_sign_mark = await cd.locator(
+                '.dot, .checked, [class*="sign"]'
+            ).count() > 0
+            if has_sign_mark:
+                logger.info(f"🎉 签到成功!{today}号已有签到标记")
+                return True
+            logger.info(f"ℹ️ {today}号未发现签到标记")
+            break
+    if not found_today:
+        logger.info(f"ℹ️ 日历中未找到日期{today}")
+
+    logger.warning("⚠️ 未检测到明确的签到成功标志")
+    return False
+
+
 # ========== 主流程 ==========
 
 def _load_storage_state() -> str | None:
@@ -1732,8 +1830,54 @@ def _drop_storage_state() -> None:
         logger.warning(f"⚠️ 删除登录态失败: {e}")
 
 
+async def relogin_after_auth_failure(page, context, auth: dict) -> bool:
+    """登录态被服务端拒绝(401)后的自愈:清凭证 → 完整登录 → 落盘
+
+    背景:该站前端会用 localStorage 里残留的用户信息渲染"已登录"UI,
+    即使服务端 token 已过期(API 全部 401),纯 DOM 检测仍会误判已登录。
+    因此自愈时必须把客户端凭证清干净,让页面回到真实未登录视图。
+    """
+    logger.info("🛠️ 开始登录态自愈:清除本地凭证并重新登录")
+    _drop_storage_state()
+    try:
+        await context.clear_cookies()
+    except Exception as e:
+        logger.warning(f"⚠️ 清除 cookie 失败(忽略): {e}")
+    try:
+        await page.evaluate(
+            "() => { try { localStorage.clear(); sessionStorage.clear(); } catch (e) {} }"
+        )
+    except Exception as e:
+        logger.warning(f"⚠️ 清除 web storage 失败(忽略): {e}")
+
+    await page.goto(CHECKIN_URL, wait_until="domcontentloaded", timeout=GPTQTCOOL_TIMEOUT)
+    await asyncio.sleep(2.0 + random.random())
+    await switch_to_chinese_if_needed(page)
+
+    if not await try_login_with_retry(page):
+        logger.error("❌ 自愈重新登录失败")
+        return False
+    logger.info("✅ 自愈重新登录成功")
+    await _save_storage_state(context)
+    # 重置计数,避免历史 401 干扰后续签到周期的失效判定
+    auth["count"] = 0
+    return True
+
+
 async def auto_checkin() -> bool:
     """主签到函数"""
+    # 401 感知:页面渲染出的"已登录"UI 可能只是 localStorage 残影,
+    # 服务端 token 过期时 API 会返回 401,以此判定登录态的真实有效性
+    auth = {"count": 0}
+
+    def _on_auth_response(response):
+        try:
+            if response.status == 401:
+                auth["count"] += 1
+                logger.warning(f"🚨 API 响应 401(累计 {auth['count']} 次): {response.url}")
+        except Exception:
+            pass
+
     async with async_playwright() as p:
         browser = await p.chromium.launch(
             headless=HEADLESS,
@@ -1782,6 +1926,7 @@ async def auto_checkin() -> bool:
 
             page.on("console", _on_page_console)
             page.on("pageerror", lambda err: logger.error(f"❌ 页面错误: {err}"))
+            page.on("response", _on_auth_response)
 
             logger.info(f"🌐 正在访问签到页面: {CHECKIN_URL}")
             await page.goto(CHECKIN_URL, wait_until="domcontentloaded", timeout=GPTQTCOOL_TIMEOUT)
@@ -1790,17 +1935,23 @@ async def auto_checkin() -> bool:
             await asyncio.sleep(2.0 + random.random())
             await switch_to_chinese_if_needed(page)
 
-            # 登录：命中持久化登录态则直通签到；否则完整登录后落盘
+            # 登录：缓存命中且加载期无 401 → 直通签到；否则完整登录后落盘
             if await is_logged_in(page):
-                logger.info("✅ 检测到已登录状态(缓存命中),跳过登录与滑块")
-                await _save_storage_state(context)
+                # 等待页面发出首批带鉴权的 API 请求,用 401 计数验证登录态真伪
+                await asyncio.sleep(3.0)
+                if auth["count"] > 0:
+                    logger.warning(
+                        f"🚨 页面 UI 显示已登录,但 API 已返回 {auth['count']} 次 401,登录态已失效"
+                    )
+                    if not await relogin_after_auth_failure(page, context, auth):
+                        raise Exception("登录态已失效且重新登录失败")
+                else:
+                    logger.info("✅ 检测到已登录状态(缓存命中且无 401),跳过登录与滑块")
+                    await _save_storage_state(context)
             else:
-                logger.info("🔐 未登录,需要先登录(清理旧登录态)")
-                _drop_storage_state()
-                if not await try_login_with_retry(page):
+                logger.info("🔐 未登录,走完整登录流程")
+                if not await relogin_after_auth_failure(page, context, auth):
                     raise Exception("多次重试后仍未登录成功(可能未登录或会话已过期)")
-                logger.info("✅ 登录流程完成")
-                await _save_storage_state(context)
 
             # GPTQTCOOL_FORCE_RUN: 检查今日是否已签到
             if not GPTQTCOOL_FORCE_RUN:
@@ -1814,111 +1965,43 @@ async def auto_checkin() -> bool:
             else:
                 logger.info("⚠️ GPTQTCOOL_FORCE_RUN=true,忽略今日已签到状态,强制执行")
 
-            # 点击签到按钮(三级选择器回退)
-            logger.info("🖱️ 寻找并点击签到按钮...")
-            if await page.locator("button#checkinBtn.ci-btn.renew").count() > 0:
-                logger.info("✅ 找到精确的签到按钮")
-                await page.evaluate("""() => {
-                    const button = document.querySelector('button#checkinBtn.ci-btn.renew');
-                    if (button) button.click();
-                }""")
-                logger.info("🖱️ 点击签到按钮(JavaScript 执行)")
-            elif await page.locator('button:has-text("签到续期")').count() > 0:
-                logger.info("✅ 找到签到续期按钮")
-                await page.evaluate("""() => {
-                    const buttons = document.querySelectorAll('button');
-                    for (const btn of buttons) {
-                        if (btn.textContent && btn.textContent.includes('签到续期')) {
-                            btn.click();
-                            break;
-                        }
-                    }
-                }""")
-                logger.info("🖱️ 点击签到续期按钮(JavaScript 执行)")
-            elif await page.locator('button:has-text("签到")').count() > 0:
-                logger.info("✅ 找到签到按钮")
-                await page.evaluate("""() => {
-                    const buttons = document.querySelectorAll('button');
-                    for (const btn of buttons) {
-                        const t = (btn.textContent || '').trim();
-                        // has-text("签到") 会同时命中"今日已签到"按钮（FORCE_RUN 放行时），
-                        // 点击前排除它，避免点了无效按钮后走完整验证码流程
-                        if (t.includes('签到') && !t.includes('今日已签到')) {
-                            btn.click();
-                            break;
-                        }
-                    }
-                }""")
-                logger.info("🖱️ 点击签到按钮(JavaScript 执行)")
-            else:
-                raise Exception("未找到签到按钮")
+            # 签到主流程:失败且伴随新 401 时判定登录态失效,自愈重登后重试一次
+            for attempt in (1, 2):
+                if attempt == 2:
+                    logger.info("🔁 自愈完成,重试签到(第 2 次尝试)...")
+                count_before = auth["count"]
 
-            # 处理验证码
-            captcha_ok = await wait_and_handle_captcha_with_retry(page)
-            if not captcha_ok:
-                logger.warning("⚠️ 未检测到/未通过验证码,尝试直接检查签到结果...")
+                if not await click_checkin_button(page):
+                    raise Exception("未找到签到按钮")
 
-            # 轮询检查签到结果
-            if await wait_for_checkin_result(page, timeout=18.0):
-                return True
+                # 处理验证码
+                captcha_ok = await wait_and_handle_captcha_with_retry(page)
+                if not captcha_ok:
+                    logger.warning("⚠️ 未检测到/未通过验证码,尝试直接检查签到结果...")
 
-            # 若验证码未通过且结果也未确认,再抛异常
-            if not captcha_ok:
-                raise Exception("验证码验证失败,无法继续签到")
-
-            # 刷新页面确保状态更新（兜底检测）
-            logger.info("🔄 刷新页面以更新签到状态...")
-            await page.reload(wait_until="domcontentloaded")
-            await asyncio.sleep(3.0)
-
-            # 等待日历加载
-            logger.info("📅 等待日历加载...")
-            try:
-                await page.wait_for_selector(".ci-cal-day", state="visible", timeout=5000)
-                logger.info("✅ 日历已加载")
-            except Exception:
-                logger.info("⚠️ 日历加载超时,继续检查")
-
-            # 刷新后兜底检查签到成功状态
-            logger.info("🔍 刷新后兜底检查签到状态...")
-
-            # 1. 按钮文本变为"今日已签到"/"已签到"
-            checkin_button = page.locator("button#checkinBtn.ci-btn.renew")
-            if await checkin_button.count() > 0:
-                button_text = await checkin_button.text_content()
-                logger.info(f"📝 签到按钮文本: {button_text}")
-                # 注意：不含 "Check-in"（未签到状态的动作动词），避免签到失败时误判成功
-                success_texts = ["今日已签到", "已签到", "Signed", "Renewed", "Checked in today"]
-                if button_text and any(s in button_text for s in success_texts):
-                    logger.info(f"🎉 检测到按钮状态变为: {button_text}")
+                # 轮询检查签到结果
+                if await wait_for_checkin_result(page, timeout=18.0):
                     return True
 
-            # 2. 今日已签到按钮
-            if await page.locator('button:has-text("今日已签到")').count() > 0:
-                logger.info('🎉 检测到"今日已签到"按钮,签到成功!')
-                return True
+                # 若验证码未通过且结果也未确认,再抛异常
+                if not captcha_ok:
+                    raise Exception("验证码验证失败,无法继续签到")
 
-            # 3. 日历今日是否有签到标记(精确匹配日期数字)
-            today = datetime.now().day
-            logger.info(f"📅 检查今天({today}号)是否有签到标记...")
-            cal_days = await page.locator(".ci-cal-day").all()
-            found_today = False
-            for cd in cal_days:
-                cd_text = await cd.text_content()
-                if cd_text and cd_text.strip() == str(today):
-                    found_today = True
-                    has_sign_mark = await cd.locator(
-                        '.dot, .checked, [class*="sign"]'
-                    ).count() > 0
-                    if has_sign_mark:
-                        logger.info(f"🎉 签到成功!{today}号已有签到标记")
-                        return True
-                    logger.info(f"ℹ️ {today}号未发现签到标记")
-                    break
-            if not found_today:
-                logger.info(f"ℹ️ 日历中未找到日期{today}")
+                # 刷新页面确保状态更新（兜底检测）
+                if await reload_and_verify(page):
+                    return True
 
-            logger.warning("⚠️ 未检测到明确的签到成功标志")
+                # 本轮出现新 401 → 登录态失效,清凭证重登后重试;无 401 则维持原判定
+                if attempt == 1 and auth["count"] > count_before:
+                    logger.warning(
+                        f"🚨 本次签到周期出现 {auth['count'] - count_before} 次 401,"
+                        "判定登录态失效,自愈后重试"
+                    )
+                    if not await relogin_after_auth_failure(page, context, auth):
+                        break
+                    continue
+                break
+
             return False
 
         except Exception as e:

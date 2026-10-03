@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-new Env('全自动签到助手');
+new Env('New API 站点自动签到');
 cron: 8 8 * * *
 
 脚本来源: 重写自 https://github.com/zhangguoguo1314/quan-zidong-zhushou
@@ -10,12 +10,14 @@ cron: 8 8 * * *
   - Liminality 贝之中转站 (beizhi.sylu.cc, New API 新版)   Bearer Token
   - 可萌中转站      (api456.me, New API)               New-Api-User Header + Session Cookie
   - 哈基米 API 站   (api.gemai.cc, New API)            New-Api-User Header
+  - DZZI.AI 大肘子API (api.dzzi.ai, New API)            Bearer Token
   - 自定义任意 API 站                                    通过 QZD_CUSTOM JSON 配置
 
 环境变量：
   QZD_BEIZHI    用户名#密码 (多账号 & 分隔)
   QZD_API456    用户名#密码 (多账号 & 分隔)
   QZD_GEMAI     用户名#密码 (多账号 & 分隔)
+  QZD_DZZI      用户名#密码 (多账号 & 分隔)
   QZD_CUSTOM    JSON 数组   高级用户自定义站点（详见 README）
   QZD_NOTIFY    true/false  默认 true，是否调用青龙 notify.py 推送
   QZD_NOTIFY_ONLY_FAIL  true/false  默认 false，true 时仅在有失败时推送
@@ -167,6 +169,29 @@ SITE_PRESETS = {
             "quota_currency": "¥",
         },
     },
+    "dzzi": {
+        "name": "DZZI.AI（大肘子API）",
+        "type": "custom-api",
+        "api_config": {
+            "login_url": "https://api.dzzi.ai/api/user/login",
+            "login_method": "POST",
+            "login_body_template": '{"username": "{{username}}", "password": "{{password}}"}',
+            "login_content_type": "application/json",
+            "token_path": "data.access_token",
+            "signin_url": "https://api.dzzi.ai/api/user/checkin",
+            "signin_method": "POST",
+            "signin_body": "{}",
+            "signin_content_type": "application/json",
+            "auth_header_template": "Bearer {{token}}",
+            "auth_header_name": "Authorization",
+            "success_field": "success",
+            "message_field": "message",
+            "quota_info_url": "https://api.dzzi.ai/api/user/self",
+            "quota_field": "data.quota",
+            "quota_per_unit": 500000,
+            "quota_currency": "$",
+        },
+    },
 }
 
 
@@ -175,6 +200,7 @@ ENV_PRESET_MAP = {
     "QZD_BEIZHI": "beizhi",
     "QZD_API456": "api456",
     "QZD_GEMAI": "gemai",
+    "QZD_DZZI": "dzzi",
 }
 
 
@@ -1045,7 +1071,7 @@ def mask(s: str) -> str:
 
 
 def main():
-    title = "全自动签到助手"
+    title = "New API 站点自动签到"
     print("=" * 60)
     print(f"🚀 {title}  开始执行  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print("=" * 60)
@@ -1058,6 +1084,7 @@ def main():
             "  QZD_BEIZHI  = 用户名#密码（贝之中转站）\n"
             "  QZD_API456  = 用户名#密码（可萌中转站）\n"
             "  QZD_GEMAI   = 用户名#密码（哈基米API）\n"
+            "  QZD_DZZI    = 用户名#密码（DZZI.AI）\n"
             "  QZD_CUSTOM  = JSON 数组   （自定义站点）\n"
             "多账号请用 & 或换行分隔。"
         )
