@@ -1,0 +1,38 @@
+name: 流量统计快照
+
+# 为什么放在云端：GitHub 只保留最近 14 天的流量数据，需要定期抓取才能留档；
+# 放在 Actions 里跑，不依赖本地电脑是否开机。公开仓库的 Actions 免费。
+on:
+  schedule:
+    # 每周一 01:00 UTC = 北京时间 09:00（GitHub 的 cron 一律按 UTC 解释）
+    - cron: "0 1 * * 1"
+  workflow_dispatch: # 也支持在 Actions 页面手动点运行
+
+# 需要写权限才能把快照提交回仓库
+permissions:
+  contents: write
+
+# 避免两次运行同时提交造成冲突
+concurrency:
+  group: traffic-stats
+  cancel-in-progress: false
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 抓取并提交流量快照
+        env:
+          # 优先用自定义 PAT（需 Administration:read 或经典 token 的 repo 权限）；
+          # 未配置时退回默认 GITHUB_TOKEN
+          GH_TOKEN: ${{ secrets.TRAFFIC_TOKEN || secrets.GITHUB_TOKEN }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          python stats/fetch_traffic.py
