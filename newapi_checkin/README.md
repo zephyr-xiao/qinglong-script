@@ -1,4 +1,4 @@
-# 全自动签到助手（青龙面板版）
+# New API 站点自动签到（青龙面板版）
 
 重写自 [zhangguoguo1314/quan-zidong-zhushou](https://github.com/zhangguoguo1314/quan-zidong-zhushou)，去除原项目的 FastAPI / Vue / SQLite / 用户系统，仅保留核心签到能力，适配青龙面板。
 
@@ -6,7 +6,7 @@
 
 - 单文件 Python 脚本，只依赖 `requests` + 标准库；
 - 支持多站点、多账号；
-- 内置站点：Liminality 贝之中转站、可萌中转站、哈基米 API 站；
+- 内置站点：Liminality 贝之中转站、可萌中转站、哈基米 API 站、DZZI.AI；
 - 支持 `QZD_CUSTOM` 扩展任意自定义 API 站（含 Discuz 论坛）；
 - 自动登录、提取 Token / Cookie、签到、识别“今日已签到”；
 - **余额展示**：签到后显示账户总余额；当日首签成功还会显示本次签到获得的额度（按签到前后余额差计算）。内置站已预配 `quota_info_url` 等字段，自定义站可在 `api_config` 中按需添加（`quota_info_url` / `quota_field` / `quota_per_unit` / `quota_currency`）；
@@ -19,7 +19,7 @@
 ## 青龙任务命令
 
 ```text
-task quan_zidong_zhushou/quan_zidong_zhushou.py
+task newapi_checkin/newapi_checkin.py
 ```
 
 建议定时：
@@ -37,11 +37,14 @@ task quan_zidong_zhushou/quan_zidong_zhushou.py
 | `QZD_BEIZHI` | 否 | `用户名#密码`，多账号用 `&` 或换行分隔 | `123#pwd123` |
 | `QZD_API456` | 否 | `用户名#密码`，多账号用 `&` 或换行分隔 | `123#pwd123` |
 | `QZD_GEMAI` | 否 | `用户名#密码`，多账号用 `&` 或换行分隔 | `zhangsan#pwd123` |
+| `QZD_DZZI` | 否 | `用户名#密码`，多账号用 `&` 或换行分隔 | `zhangsan#pwd123` |
 | `QZD_CUSTOM` | 否 | JSON 数组，见下方 | 见下方 |
 | `QZD_NOTIFY` | 否 | `true` / `false`，默认 `true` | `false` |
 | `QZD_NOTIFY_ONLY_FAIL` | 否 | `true` / `false`，默认 `false`，`true` 时仅在有失败时推送 | `true` |
 | `QZD_TIMEOUT` | 否 | 秒，默认 `30` | `60` |
 | `QZD_PROXY` | 否 | HTTP/SOCKS 代理 | `http://172.17.0.1:7890` |
+
+> DZZI.AI 原为独立脚本 `dzzi-auto-checkin`，现已整合为本脚本的内置站点。原变量 `DZZI_ACCOUNTS`（格式 `用户名|密码`）请改为 `QZD_DZZI`（格式 `用户名#密码`），青龙任务命令也一并改为 `task newapi_checkin/newapi_checkin.py`。
 
 ## 内置站点
 
@@ -50,6 +53,7 @@ task quan_zidong_zhushou/quan_zidong_zhushou.py
 | `beizhi` | Liminality 贝之中转站 | https://beizhi.sylu.cc | Bearer Token（短期 token + 过期时间缓存） |
 | `api456` | 可萌中转站 | https://api456.me | New-Api-User Header + Session Cookie |
 | `gemai` | 哈基米 API 站 | https://api.gemai.cc | New-Api-User Header |
+| `dzzi` | DZZI.AI（大肘子API） | https://api.dzzi.ai | Bearer Token |
 
 ## `QZD_CUSTOM` 自定义站点
 
@@ -136,7 +140,7 @@ Linux / macOS：
 ```bash
 export QZD_BEIZHI="your_username#yourpass"
 export QZD_NOTIFY=false
-python quan_zidong_zhushou.py
+python newapi_checkin.py
 ```
 
 Windows PowerShell：
@@ -144,7 +148,7 @@ Windows PowerShell：
 ```powershell
 $env:QZD_BEIZHI="your_username#yourpass"
 $env:QZD_NOTIFY="false"
-python .\quan_zidong_zhushou.py
+python .\newapi_checkin.py
 ```
 
 未设置任何站点变量时，脚本会打印提示后退出。

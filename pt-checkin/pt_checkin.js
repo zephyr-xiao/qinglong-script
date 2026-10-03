@@ -1,17 +1,20 @@
 /**
  * @name PT 站点自动签到
- * @description NovaHD / HDArea / BTSchool 三站签到，Cookie 失效自动登录兜底（视觉模型识别验证码），限次保护防封 IP
+ * @description NovaHD / HDArea / BTSchool / CrabPT 四站签到，Cookie 失效自动登录兜底（视觉模型识别验证码），限次保护防封 IP
  * @cron 30 8 * * *
  *
  * 环境变量：
  *   PT_SITE_NOVAHD_CK         【可选】NovaHD（pt.novahd.top）Cookie 种子；自动登录成功后会缓存到 novahd_cookie.json 并优先使用
  *   PT_SITE_HDAREA_CK         【可选】HDArea（hdarea.club）Cookie；该站无自动登录，失效需重新导出
  *   PT_SITE_BTSCHOOL_CK       【可选】BTSchool（pt.btschool.club）Cookie 种子；自动登录成功后会缓存到 btschool_cookie.json 并优先使用
+ *   PT_SITE_CRABPT_CK         【可选】CrabPT（crabpt.vip）Cookie 种子；自动登录成功后会缓存到 crabpt_cookie.json 并优先使用
  *   PT_NOVAHD_ACCOUNTS        【可选】NovaHD 账密，格式 用户名#密码，Cookie 失效时自动登录兜底用
  *                                      兼容旧写法：PT_NOVAHD_USERNAME + PT_NOVAHD_PASSWORD
  *   PT_BTSCHOOL_ACCOUNTS      【可选】BTSchool 账密，格式 用户名#密码，Cookie 失效时自动登录兜底用
  *                                      兼容旧写法：PT_BTSCHOOL_USERNAME + PT_BTSCHOOL_PASSWORD
- *   PT_OCR_API_URL            【可选】OpenAI 兼容视觉接口地址（如 https://xx/v1/chat/completions），两站共用
+ *   PT_CRABPT_ACCOUNTS        【可选】CrabPT 账密，格式 用户名#密码，Cookie 失效时自动登录兜底用
+ *                                      兼容旧写法：PT_CRABPT_USERNAME + PT_CRABPT_PASSWORD
+ *   PT_OCR_API_URL            【可选】OpenAI 兼容视觉接口地址（如 https://xx/v1/chat/completions），多站共用
  *   PT_OCR_API_KEY            【可选】对应 API Key；未配置或调用失败时自动降级到本地 ddddocr（需 Python + ddddocr + opencv-python）
  *   PT_OCR_MODEL              【可选】视觉模型名，默认 gpt-4o-mini
  *   PT_PYTHON                 【可选】ddddocr 降级用的 Python 解释器路径，默认 python
@@ -24,12 +27,13 @@
  *
  * 登录限次保护（防止连续失败封 IP）：
  *   - BTSchool 允许连续失败 20 次，NovaHD 仅 10 次；脚本每次运行前解析登录页「你还有 [N] 次尝试机会」
- *   - 剩余次数低于阈值（BTSchool 10 / NovaHD 5）立即放弃登录并推送警告
- *   - 单次运行登录尝试轮数上限 = 阈值一半（BTSchool 5 / NovaHD 2），成功登录后站点计数自动清零
+ *   - 剩余次数低于阈值（BTSchool 10 / NovaHD 5 / CrabPT 5）立即放弃登录并推送警告
+ *   - 单次运行登录尝试轮数上限 = 阈值一半（BTSchool 5 / NovaHD 2 / CrabPT 3），成功登录后站点计数自动清零
  *
  * 说明：
  *   - 未配置 Cookie 且无账密的站点自动跳过，不影响其他站点。
  *   - BTSchool 签到端点为 GET index.php?action=addbonus（非标准 NexusPHP attendance.php）。
+ *   - CrabPT 签到端点为 GET attendance.php 直接触发签到（无表单无验证码），奖励名为蟹币值。
  *   - NovaHD 登录为 challenge-response 挑战认证：response = HMAC-SHA256(challenge, SHA256(secret + SHA256(password)))。
  *   - 验证码识别两级链路：视觉模型（PT_OCR_API_URL）→ 本地 ddddocr 降级（同目录 ddddocr_ocr.py，
  *     颜色过滤 + 连通域去噪 + 双模型投票，实测 30 样本 80.0%）。
@@ -52,6 +56,7 @@ const TIMEOUT_MS = (Number(process.env.PT_TIMEOUT) || 20) * 1000;
 const LOGIN_LIMITS = {
   novahd: { safeFloor: 5, maxRounds: 2 },
   btschool: { safeFloor: 10, maxRounds: 5 },
+  crabpt: { safeFloor: 5, maxRounds: 3 },
 };
 
 // UA 池：每次运行随机取一个，保持整次运行内一致（同一会话换 UA 反而是异常特征）
@@ -937,7 +942,146 @@ async function processBtschool() {
 }
 
 // ==========================================
-// 10. 状态 → 标记 / 通知文案
+// 10. CrabPT 登录与签到（attendance.php GET 即签到）
+// ==========================================
+// 蟹黄堡（crabpt.vip）：标准 NexusPHP 表单登录（takelogin.php + regimage 验证码），
+// 成功后 302 → index.php 并下发新版 c_secure_pass 单枚登录 Cookie（旧版为 uid/pass 两枚）。
+// 签到无需表单：GET attendance.php 即触发，响应正文「签到成功…本次签到获得 N 个蟹币值」；
+// 已签日重复 GET 幂等（返回与签到成功页相同的当日结果，不重复计数），脚本仍先查首页避免多余请求。
+function parseCrabptAttendance(html) {
+  // 数字可能被 <b>/<font> 等标签包裹（实测「第 <b>1</b> 次签到」），pattern 允许可选标签
+  const num = '(?:<[^>]+>\\s*)?(\\d+)(?:\\s*</[^>]+>)?';
+  // 登录页特征：验证码表单 + 账号输入框（用于 Cookie 失效判定）
+  const isLoginPage = /name="imagehash"/i.test(html) && /name="username"/i.test(html);
+  const reward = (html.match(new RegExp(`本次签到获得\\s*${num}\\s*个?\\s*蟹币值`, 'i'))
+    || html.match(new RegExp(`首次签到获得\\s*${num}\\s*个?\\s*蟹币值`, 'i')) || [])[1] || null;
+  const continuousDays = (html.match(new RegExp(`已连续签到\\s*${num}\\s*天`, 'i')) || [])[1] || null;
+  const totalSignCount = (html.match(new RegExp(`这是您的第\\s*${num}\\s*次签到`, 'i')) || [])[1] || null;
+  const rank = (html.match(new RegExp(`今日签到排名[：:]\\s*${num}`, 'i')) || [])[1] || null;
+  const hasSignSuccess = /签到成功|本次签到获得/i.test(html);
+  // 已签提示覆盖常见 NexusPHP 文案；「签到已得」实测来自首页导航栏
+  const isAlreadySigned = /今天已经签到|已经签到过|今日已签到|您今天已经|明天再来|明日再来|签到已得/.test(html);
+  return { isLoginPage, reward, continuousDays, totalSignCount, rank, hasSignSuccess, isAlreadySigned };
+}
+
+async function loginCrabpt(username, password) {
+  const base = 'https://crabpt.vip';
+  const limit = LOGIN_LIMITS.crabpt;
+
+  for (let round = 1; round <= limit.maxRounds; round++) {
+    console.log(`  ↪ CrabPT 自动登录第 ${round}/${limit.maxRounds} 轮...`);
+    const loginPage = await withRetry(() => getPage(`${base}/login.php`));
+    if (loginPage.error) {
+      console.log(`  ⚠️ 登录页获取失败: ${loginPage.error}`);
+      return null;
+    }
+    const page = parseLoginPage(loginPage.text);
+    if (!page.imagehash) {
+      console.log('  ⚠️ 登录页未解析到 imagehash，页面结构可能已变化');
+      return null;
+    }
+    if (page.remainAttempts != null && page.remainAttempts < limit.safeFloor) {
+      console.log(`  ❌ 剩余尝试机会仅 ${page.remainAttempts} 次（低于安全阈值 ${limit.safeFloor}），放弃登录防止封 IP`);
+      return null;
+    }
+
+    const captcha = await fetchAndRecognizeCaptcha(base, page.imagehash, loginPage.setCookie.length ? mergeCookies('', loginPage.setCookie) : undefined);
+    if (captcha.error) {
+      console.log(`  ⚠️ ${captcha.error}`);
+      return null;
+    }
+
+    // 表单含 secret/two_step_code 空字段（与浏览器提交一致；secret 登录页为空串）
+    const form = new URLSearchParams({
+      secret: page.secret || '',
+      username,
+      password,
+      two_step_code: '',
+      imagestring: captcha.code,
+      imagehash: page.imagehash,
+    });
+    const loginCookie = mergeCookies('', loginPage.setCookie);
+    const post = await postForm(`${base}/takelogin.php`, loginCookie || undefined, form.toString());
+
+    const newCookie = mergeCookies(loginCookie, post.setCookie);
+    const hasLoginCookie = /c_secure_pass=|(?:^|;\s*)uid=\d+/.test(newCookie);
+    const redirectedOut = post.location && !/login\.php|takelogin\.php/i.test(post.location);
+    if (post.httpStatus === 302 || post.httpStatus === 303 || redirectedOut || hasLoginCookie) {
+      if (newCookie) {
+        console.log('  ✅ CrabPT 自动登录成功');
+        return newCookie;
+      }
+    }
+    dbg(`登录失败详情: httpStatus=${post.httpStatus} location=${post.location} cookie=${newCookie.substring(0, 80)} body=${(post.text || '').substring(0, 300).replace(/\s+/g, ' ')}`);
+    console.log(`  ⚠️ 第 ${round} 轮登录未成功（验证码错误或判定未命中），换新验证码重试`);
+    await sleep(rand(3000, 6000));
+  }
+  console.log(`  ❌ CrabPT 自动登录 ${limit.maxRounds} 轮均失败，放弃（保护站点尝试次数）`);
+  return null;
+}
+
+async function processCrabpt() {
+  const siteKey = 'crabpt';
+  let cookie = resolveCookie(siteKey, 'PT_SITE_CRABPT_CK');
+  const { username, password } = resolveAccount('PT_CRABPT_ACCOUNTS', 'PT_CRABPT_USERNAME', 'PT_CRABPT_PASSWORD');
+
+  if (!cookie && !(username && password)) {
+    return { status: 'skipped', msg: '未配置 Cookie 与账密，跳过' };
+  }
+
+  const base = 'https://crabpt.vip';
+  // 该站 attendance.php GET 即触发签到，故先回首页判登录态与已签态，已签日不再请求签到端点
+  let indexPage = await withRetry(() => getPage(`${base}/index.php`, cookie || undefined));
+  if (indexPage.error) return { status: 'network_err', msg: `访问首页失败: ${indexPage.error}` };
+
+  let indexInfo = parseCrabptAttendance(indexPage.text);
+  const cookieDead = indexInfo.isLoginPage || /login\.php/i.test(indexPage.finalUrl || '');
+  if (cookieDead) {
+    if (!(username && password)) {
+      return { status: 'cookie_dead', msg: 'Cookie 已失效且未配置账密，请重新导出 Cookie' };
+    }
+    console.log('  ↪ Cookie 已失效，尝试自动登录兜底...');
+    cookie = await loginCrabpt(username, password);
+    if (!cookie) return { status: 'cookie_dead', msg: 'Cookie 失效且自动登录未成功，请检查账密/OCR 配置' };
+    saveCookie(siteKey, cookie);
+    indexPage = await withRetry(() => getPage(`${base}/index.php`, cookie));
+    if (indexPage.error) return { status: 'network_err', msg: `重新访问首页失败: ${indexPage.error}` };
+    indexInfo = parseCrabptAttendance(indexPage.text);
+    if (indexInfo.isLoginPage || /login\.php/i.test(indexPage.finalUrl || '')) {
+      return { status: 'cookie_dead', msg: '自动登录后仍判定未登录，账号可能有异常' };
+    }
+  }
+
+  // 首页导航「签到已得N」为已签标记（实测确认）
+  if (indexInfo.isAlreadySigned) {
+    return { status: 'already', msg: '今日已签到（首页显示签到已得）' };
+  }
+
+  // 未签 → GET attendance.php 触发签到（无表单无验证码）
+  const sign = await withRetry(() => getPage(`${base}/attendance.php`, cookie, { Referer: `${base}/index.php` }));
+  if (sign.error) return { status: 'network_err', msg: `签到请求失败: ${sign.error}` };
+  const signInfo = parseCrabptAttendance(sign.text);
+  if (signInfo.hasSignSuccess && (signInfo.reward || signInfo.totalSignCount)) {
+    let detail = '';
+    if (signInfo.totalSignCount) detail += `\n  📊 第 ${signInfo.totalSignCount} 次签到`;
+    if (signInfo.continuousDays) detail += `\n  🎯 连续签到 ${signInfo.continuousDays} 天`;
+    if (signInfo.reward) detail += `\n  🎁 获得 ${signInfo.reward} 蟹币值`;
+    if (signInfo.rank) detail += `\n  🏁 今日签到排名 ${signInfo.rank}`;
+    return { status: 'success', msg: `签到成功${detail.replace(/\n/g, '')}`, detail };
+  }
+
+  // 签到响应未确认 → 回读首页兜底（签前首页无已签标记，签后出现即成功）
+  await sleep(1000);
+  const refresh = await withRetry(() => getPage(`${base}/index.php`, cookie));
+  const refreshInfo = parseCrabptAttendance(refresh.text || '');
+  if (!refresh.error && refreshInfo.isAlreadySigned) {
+    return { status: 'success', msg: '签到成功（首页已显示签到已得）' };
+  }
+  return { status: 'parse_err', msg: '签到请求已发出但未能确认结果，请开 PT_DEBUG 查看页面' };
+}
+
+// ==========================================
+// 11. 状态 → 标记 / 通知文案
 // ==========================================
 const STATUS_FLAG = {
   success: '✅',
@@ -964,7 +1108,7 @@ function resultText(result) {
 }
 
 // ==========================================
-// 11. 主入口
+// 12. 主入口
 // ==========================================
 async function main() {
   console.log('=== PT 站点自动签到开始 ===');
@@ -981,6 +1125,7 @@ async function main() {
     { name: 'NovaHD', fn: processNovahd },
     { name: 'HDArea', fn: processHdarea },
     { name: 'BTSchool', fn: processBtschool },
+    { name: 'CrabPT', fn: processCrabpt },
   ];
 
   const results = [];
@@ -1055,6 +1200,7 @@ module.exports = {
   novahdSignOnce,
   parseNovahdAttendance,
   parseHdareaAttendance,
+  parseCrabptAttendance,
   isCookieDead,
   mergeCookies,
   setCookiesToCookieString,

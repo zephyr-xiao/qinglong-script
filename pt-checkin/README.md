@@ -1,6 +1,6 @@
 # PT 站点自动签到（Node.js）
 
-NovaHD（`pt.novahd.top`）/ HDArea（`hdarea.club`）/ BTSchool（`pt.btschool.club`）三站每日签到。Node.js 实现，复用目录内 `sendNotify.js` 推送全通道。未配置的站点自动跳过，互不影响。
+NovaHD（`pt.novahd.top`）/ HDArea（`hdarea.club`）/ BTSchool（`pt.btschool.club`）/ CrabPT（`crabpt.vip`）四站每日签到。Node.js 实现，复用目录内 `sendNotify.js` 推送全通道。未配置的站点自动跳过，互不影响。
 
 ## 脚本文件
 
@@ -9,8 +9,8 @@ NovaHD（`pt.novahd.top`）/ HDArea（`hdarea.club`）/ BTSchool（`pt.btschool.
 | `pt_checkin.js` | 签到主脚本 |
 | `sendNotify.js` | 青龙官方 Notify（推送通道），勿删 |
 | `ddddocr_ocr.py` | ddddocr 降级识别辅助（颜色过滤 + 连通域去噪 + 双模型投票，实测 80%） |
-| `novahd_cookie.json` / `btschool_cookie.json` | 自动登录成功后的 Cookie 缓存（运行时生成，已 gitignore） |
-| `tests/pt_checkin_test.js` | 单元测试（`npm test`） |
+| `novahd_cookie.json` / `btschool_cookie.json` / `crabpt_cookie.json` | 自动登录成功后的 Cookie 缓存（运行时生成，已 gitignore） |
+| `tests/pt_checkin_test.js` | 单元测试（`npm test`，真实页面片段做 fixture） |
 
 ## 青龙任务命令
 
@@ -33,7 +33,9 @@ cd /ql/scripts/pt-checkin && npm install --production
 | `PT_SITE_HDAREA_CK` | 站点二选一 | HDArea Cookie；**该站不支持自动登录**，失效需重新导出 |
 | `PT_SITE_BTSCHOOL_CK` | 站点二选一 | BTSchool Cookie 种子；自动登录成功后缓存到 `btschool_cookie.json` 并优先使用 |
 | `PT_BTSCHOOL_ACCOUNTS` | 站点二选一 | BTSchool 账密，格式 `用户名#密码`，Cookie 失效时自动登录兜底（旧写法 `PT_BTSCHOOL_USERNAME` + `PT_BTSCHOOL_PASSWORD` 仍兼容） |
-| `PT_OCR_API_URL` | | OpenAI 兼容视觉接口地址（如 `https://xx/v1/chat/completions`），两站共用 |
+| `PT_SITE_CRABPT_CK` | 站点二选一 | CrabPT Cookie 种子；自动登录成功后缓存到 `crabpt_cookie.json` 并优先使用 |
+| `PT_CRABPT_ACCOUNTS` | 站点二选一 | CrabPT 账密，格式 `用户名#密码`，Cookie 失效时自动登录兜底（旧写法 `PT_CRABPT_USERNAME` + `PT_CRABPT_PASSWORD` 仍兼容） |
+| `PT_OCR_API_URL` | | OpenAI 兼容视觉接口地址（如 `https://xx/v1/chat/completions`），多站共用 |
 | `PT_OCR_API_KEY` | | 对应 API Key |
 | `PT_OCR_MODEL` | | 视觉模型名，默认 `gpt-4o-mini` |
 | `PT_PYTHON` | | ddddocr 降级用的 Python 解释器，默认 `python` |
@@ -51,6 +53,9 @@ cd /ql/scripts/pt-checkin && npm install --production
 | NovaHD | `GET/POST attendance.php`（未签页为验证码表单 `imagehash`+`imagestring`，无 action 字段；已签页显示统计文案） | challenge-response 挑战认证 + 验证码 OCR（登录/签到共用） |
 | HDArea | 首页判状态 + `POST sign_in.php` | 无（仅 Cookie） |
 | BTSchool | `GET index.php?action=addbonus`（非标准 NexusPHP，无 formhash） | 标准 NexusPHP 表单 + 验证码 OCR |
+| CrabPT | 先回首页判「签到已得」标记 → 未签再 `GET attendance.php` 直接触发签到（无表单无验证码，奖励为蟹币值） | 标准 NexusPHP 表单 + 验证码 OCR |
+
+> CrabPT 注意：`attendance.php` 是 **GET 即签到**，已签日重复 GET 幂等（显示当日结果不重复计数）；脚本仍先查首页避免多余请求。
 
 ### NovaHD 登录算法
 
@@ -79,10 +84,10 @@ POST /takelogin.php  (secret + response + username + password + two_step_code + 
 
 ## 登录限次保护（防封 IP）
 
-两个站的登录都有**连续失败封 IP** 限制（NovaHD 10 次、BTSchool 20 次），脚本做了三层保护：
+三个站的登录都有**连续失败封 IP** 限制（NovaHD 10 次、BTSchool 20 次、CrabPT 10 次），脚本做了三层保护：
 
-1. 每轮登录前解析登录页「你还有 [N] 次尝试机会」，剩余次数低于安全阈值（NovaHD 5 / BTSchool 10）立即放弃并推送警告
-2. 单次运行登录轮数上限：NovaHD 2 轮 / BTSchool 5 轮
+1. 每轮登录前解析登录页「你还有 [N] 次尝试机会」，剩余次数低于安全阈值（NovaHD 5 / BTSchool 10 / CrabPT 5）立即放弃并推送警告
+2. 单次运行登录轮数上限：NovaHD 2 轮 / BTSchool 5 轮 / CrabPT 3 轮
 3. 验证码识别失败自动换新验证码重试（每次失败消耗 1 次站点配额，受上两条约束）
 
 > ⚠️ 青龙面板请**关闭任务失败自动重试**，避免脚本被重复拉起叠加消耗站点登录配额。

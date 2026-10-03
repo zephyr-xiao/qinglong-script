@@ -24,6 +24,10 @@ cookies/
 *_log.txt
 replied_posts.json
 
+# 账号清单（含明文密码，严禁提交）与单元测试临时产物
+*_accounts.txt
+.test_tmp/
+
 # 独立子仓库（有自己的 remote，在各自仓库内维护）
 tg-signer-ql/
 
