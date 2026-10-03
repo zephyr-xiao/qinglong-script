@@ -38,7 +38,7 @@
 | 嘉立创签到 | [Foticing/LC-AutoSign](https://github.com/Foticing/LC-AutoSign) |
 | 纸鸢下载签到 | [elongou-checkin/mybt-signin](https://github.com/elongou-checkin/mybt-signin) |
 | New API 站点签到 | [zhangguoguo1314/quan-zidong-zhushou](https://github.com/zhangguoguo1314/quan-zidong-zhushou) |
-| TG 签到（tg-signer） | [amchii/tg-signer](https://github.com/amchii/tg-signer) |
+| TG 签到（tg-signer） | [xuanvivo/tg-signer-ql](https://github.com/xuanvivo/tg-signer-ql)（上游 [amchii/tg-signer](https://github.com/amchii/tg-signer)） |
 
 其余脚本为本仓库原创。感谢上述项目作者的开源工作。
 
