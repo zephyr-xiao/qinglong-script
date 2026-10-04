@@ -136,6 +136,6 @@ environment:
 
 ## 仓库流量
 
-GitHub 只保留最近 14 天的流量数据，这里每周自动抓取并存档到 [`stats/`](stats/README.md)，趋势如下：
+GitHub 只保留最近 14 天的流量数据，这里每天自动抓取并存档到 [`stats/`](stats/README.md)，趋势如下：
 
 [![仓库流量趋势](stats/traffic.svg)](stats/README.md)

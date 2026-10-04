@@ -34,6 +34,8 @@ REPO_ROOT = STATS_DIR.parent
 CSV_PATH = STATS_DIR / "traffic_daily.csv"
 LATEST_PATH = STATS_DIR / "latest.json"
 CSV_FIELDS = ["date", "views", "unique_visitors", "clones", "unique_cloners"]
+# 脚本只提交这三个数据产物，绝不把自身源码卷进数据提交
+DATA_FILES = ["stats/traffic_daily.csv", "stats/latest.json", "stats/traffic.svg"]
 
 _slug_cache: str | None = None
 
@@ -92,9 +94,13 @@ def merge_daily(rows: dict[str, dict], views: list[dict], clones: list[dict]) ->
 
 
 def render_csv(rows: dict[str, dict]) -> str:
-    """渲染成 CSV 文本（保持与旧版一致的 CRLF 行尾，避免无谓的行尾 diff）。"""
+    """渲染成 CSV 文本。
+
+    行尾统一用 LF：仓库 .gitattributes 声明了 `* text=auto eol=lf`，
+    若这里写成 CRLF，工作区文件就会和 git 里的内容不一致，导致「每次都比对出差异」。
+    """
     buf = io.StringIO()
-    writer = csv.DictWriter(buf, fieldnames=CSV_FIELDS)
+    writer = csv.DictWriter(buf, fieldnames=CSV_FIELDS, lineterminator="\n")
     writer.writeheader()
     for day in sorted(rows):
         writer.writerow({k: rows[day].get(k, 0) for k in CSV_FIELDS})
@@ -243,12 +249,12 @@ def render_svg(rows: dict[str, dict], days: int = CHART_DAYS) -> str:
 
 
 def commit_and_push(summary: str) -> bool:
-    """只提交 stats/ 目录；暂存区里若有其它改动则跳过，避免误提交。"""
-    run(["git", "-C", str(REPO_ROOT), "add", "stats"])
+    """只提交数据产物，不碰脚本自身——否则脚本一旦有未完成的改动会被顺手卷进来。"""
+    run(["git", "-C", str(REPO_ROOT), "add", *DATA_FILES])
     staged = run(["git", "-C", str(REPO_ROOT), "diff", "--cached", "--name-only"]).split()
-    others = [p for p in staged if not p.startswith("stats/")]
+    others = [p for p in staged if p not in DATA_FILES]
     if others:
-        print(f"⚠ 暂存区里还有 stats/ 以外的改动，跳过提交：{others}")
+        print(f"⚠ 暂存区里还有数据文件以外的改动，跳过提交：{others}")
         return False
     if not staged:
         print("数据无变化，跳过提交")
