@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import io
 import json
 import math
 import subprocess
@@ -90,12 +91,19 @@ def merge_daily(rows: dict[str, dict], views: list[dict], clones: list[dict]) ->
     return added
 
 
+def render_csv(rows: dict[str, dict]) -> str:
+    """渲染成 CSV 文本（保持与旧版一致的 CRLF 行尾，避免无谓的行尾 diff）。"""
+    buf = io.StringIO()
+    writer = csv.DictWriter(buf, fieldnames=CSV_FIELDS)
+    writer.writeheader()
+    for day in sorted(rows):
+        writer.writerow({k: rows[day].get(k, 0) for k in CSV_FIELDS})
+    return buf.getvalue()
+
+
 def write_csv(rows: dict[str, dict]) -> None:
     with CSV_PATH.open("w", newline="", encoding="utf-8") as fh:
-        writer = csv.DictWriter(fh, fieldnames=CSV_FIELDS)
-        writer.writeheader()
-        for day in sorted(rows):
-            writer.writerow({k: rows[day].get(k, 0) for k in CSV_FIELDS})
+        fh.write(render_csv(rows))
 
 
 # ---------------------------- SVG 图表 ----------------------------
@@ -256,6 +264,10 @@ def main() -> int:
     parser.add_argument("--dry-run", action="store_true", help="只打印，不写文件")
     args = parser.parse_args()
 
+    prev_csv = CSV_PATH.read_text(encoding="utf-8") if CSV_PATH.exists() else ""
+    prev_latest = (json.loads(LATEST_PATH.read_text(encoding="utf-8"))
+                   if LATEST_PATH.exists() else {})
+
     try:
         views = gh_json("traffic/views")
         clones = gh_json("traffic/clones")
@@ -291,9 +303,20 @@ def main() -> int:
         print("--dry-run：未写文件")
         return 0
 
+    # GitHub 的流量数据常滞后一两天，日更时难免碰上「抓到了但没新数据」。
+    # 若只比时间戳会产出大量空提交，所以剔除 fetched_at 后再判断有没有真变化。
+    svg_path = STATS_DIR / "traffic.svg"
+    csv_text, svg_text = render_csv(rows), render_svg(rows)
+    changed = (csv_text != prev_csv
+               or {k: v for k, v in latest.items() if k != "fetched_at"}
+               != {k: v for k, v in prev_latest.items() if k != "fetched_at"})
+    if not changed and svg_path.exists():
+        print("数据无变化，跳过写入与提交")
+        return 0
+
     write_csv(rows)
     LATEST_PATH.write_text(json.dumps(latest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    (STATS_DIR / "traffic.svg").write_text(render_svg(rows), encoding="utf-8")
+    svg_path.write_text(svg_text, encoding="utf-8")
 
     if args.no_push:
         print("已写入 stats/（--no-push，未提交）")
