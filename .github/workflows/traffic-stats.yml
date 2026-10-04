@@ -4,8 +4,8 @@ name: 流量统计快照
 # 放在 Actions 里跑，不依赖本地电脑是否开机。公开仓库的 Actions 免费。
 on:
   schedule:
-    # 每周一 01:00 UTC = 北京时间 09:00（GitHub 的 cron 一律按 UTC 解释）
-    - cron: "0 1 * * 1"
+    # 每天 01:00 UTC = 北京时间 09:00（GitHub 的 cron 一律按 UTC 解释）
+    - cron: "0 1 * * *"
   workflow_dispatch: # 也支持在 Actions 页面手动点运行
 
 # 需要写权限才能把快照提交回仓库
