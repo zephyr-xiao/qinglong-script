@@ -24,6 +24,7 @@
 | 纸鸢下载签到 | mybt.kiteyuan.info 每日签到 + 访问任务，Casdoor 账号密码自动登录换 JWT，JWT 缓存复用（401 才重登），多账号 + 网络重试，幂等跳过 | [mybt-checkin-ql/README.md](mybt-checkin-ql/README.md) | `task mybt-checkin-ql/mybt_checkin.py` |
 | 福利吧预注册签到 | wnflb2023.com「游客预注册签到」插件，连续签到 30 天转正，Cookie 直签或账号密码登录（验证码 ddddocr 自动识别 + Cookie 缓存），幂等跳过 + 进度统计 | [wnflb_checkin/README.md](wnflb_checkin/README.md) | `task wnflb_checkin/wnflb_checkin.py` |
 | 尚香书苑签到 | sxsy45.com Discuz k_misign 签到，登录图片验证码 ddddocr 自动识别 + 算术验证自动计算，Cookie 直签或账密登录（Cookie 缓存复用），幂等跳过 + 签到统计 | [sxsy45_checkin/README.md](sxsy45_checkin/README.md) | `task sxsy45_checkin/sxsy45_checkin.py` |
+| 维咔VikACG签到 | www.vikacg.cc 钱包签到领积分，账密登录换 JWT 双 token（30 天）+ refreshToken 静默续期 + 设备指纹持久化，完整浏览器头模拟免验证码，401 三级降级链，409 已签到幂等，代理支持 | [vikacg_checkin/README.md](vikacg_checkin/README.md) | `task vikacg_checkin/vikacg_checkin.py` |
 
 ## 来源与致谢
 
