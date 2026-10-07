@@ -1,13 +1,19 @@
 /**
  * @name iKuuu 自动签到
- * @description 青龙面板自动签到脚本（ikuuu 机场），改写自 https://github.com/wuang-wu/Ikuuu，动态域名 + 多账号 + 状态分档 + 失败才推送
+ * @description 青龙面板自动签到脚本（ikuuu 机场），账号密码自动登录 + 动态域名 + 多账号 + 状态分档 + 失败才推送
  * @cron 8 8 * * *
  *
  * 环境变量：
- *   ACCOUNTS                 【必填】账号列表，支持三种格式：
- *                              1) JSON 数组: [{"name":"主号","cookie":"..."},{"name":"副号","cookie":"..."}]
- *                              2) JSON 单对象: {"name":"主号","cookie":"..."}
- *                              3) 原始 cookie 字符串（自动当作"默认账号"）
+ *   ACCOUNTS                 【与 IKUUU_COOKIE 二选一】账密账号列表，格式：邮箱#密码，
+ *                              多账号用 & 或换行分隔
+ *                              例：a@qq.com#pwd1&b@163.com#pwd2
+ *                              按首个 # 切分（密码里可含 #）；密码请避免包含 & 和换行
+ *                              Cookie 失效时自动开浏览器（Playwright 过 Geetest
+ *                              验证码）重新登录续期，无需手工抓 cookie。
+ *   IKUUU_COOKIE             【与 ACCOUNTS 二选一】cookie 字符串直填模式（旧行为），
+ *                              多账号用换行分隔；此模式 Cookie 失效后只能手工更新，
+ *                              适合不想装 playwright 或临时兜底的场景。
+ *                              两个变量都配时可同时签到（cookie 账号在前）。
  *   HOST                     【可选】强制锁定签到域名，留空则自动从发布页抓取
  *   IKUUU_PUBLISH_URL        【可选】发布页地址，默认 https://ikuuu.win/
  *                                      ikuuu 的"最新域名"发布页会整体迁移域名，
@@ -15,24 +21,38 @@
  *   IKUUU_PROXY              【可选】HTTP 代理（ikuuu 被墙，建议配置），如 http://172.17.0.1:7890
  *                                      未配置时自动回退青龙全局代理（HTTPS_PROXY /
  *                                      HTTP_PROXY / ALL_PROXY / GLOBAL_AGENT_*）
+ *                                      登录用浏览器同样走该代理
+ *   IKUUU_HEADFUL            【可选】1 = 登录用有头浏览器（本地调试用，容器内勿开）
+ *   IKUUU_CHROMIUM_PATH      【可选】系统 Chromium 路径（青龙容器装系统包后填 /usr/bin/chromium）
  *   IKUUU_NOTIFY_ONLY_FAIL   【可选】1 = 仅失败时推送，0/留空 = 全部推送
- *   IKUUU_DEBUG              【可选】1 = 打印详细调试信息（域名抓取/响应原文/重试等）
+ *   IKUUU_DEBUG              【可选】1 = 打印详细调试信息（域名抓取/响应原文/登录截屏等）
+ *
+ * 登录会话 Cookie 缓存在脚本目录 .token/ 下（按邮箱隔离），会话有效期 24h，
+ * 每天任务时若缓存仍在余量内直接复用，过期才重新走浏览器登录。
  *
  * 推送：复用同目录 sendNotify.js（青龙官方 Notify），在青龙变量里配 DD_BOT_TOKEN 等即可。
  */
 
 const crypto = require('crypto');
+const fs = require('fs');
 const path = require('path');
 const { sendNotify } = require(path.join(__dirname, 'sendNotify'));
 // undici（sendNotify.js 已依赖）用于代理支持：ikuuu 被墙，青龙容器需走代理
 const { fetch: undiciFetch, ProxyAgent } = require('undici');
 
 const UA =
-  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
 
 const DEBUG = process.env.IKUUU_DEBUG === '1';
 const NOTIFY_ONLY_FAIL = process.env.IKUUU_NOTIFY_ONLY_FAIL === '1';
+const HEADFUL = process.env.IKUUU_HEADFUL === '1';
+const CHROMIUM_PATH = (process.env.IKUUU_CHROMIUM_PATH || '').trim();
 const TIMEOUT_MS = 15000;
+
+// 登录会话 Cookie 缓存：脚本目录 .token/（.gitignore 已覆盖），按账号邮箱隔离
+// ikuuu 会话有效期 24h（expire_in），留 30 分钟余量；cron 每天一次时约每天重登一次
+const COOKIE_CACHE_DIR = path.join(__dirname, '.token');
+const COOKIE_CACHE_MARGIN_MS = 30 * 60 * 1000;
 
 // 代理支持（ikuuu 被墙，直连签到域名需代理）：
 // 优先级 IKUUU_PROXY > 青龙全局代理变量 > 无代理（走公共 CORS 通道兜底）。
@@ -83,22 +103,309 @@ function dbg(...args) {
 }
 
 // ==========================================
-// 1. 账号解析
+// 1. 账号解析：ACCOUNTS = 邮箱#密码，多账号用 & 或换行分隔（青龙通用惯例）
 // ==========================================
+function maskEmail(email) {
+  if (!email) return '';
+  const at = email.indexOf('@');
+  if (at <= 0) return maskName(email);
+  const head = email.slice(0, at);
+  const visible = head.slice(0, 2);
+  return `${visible}${'*'.repeat(Math.max(1, head.length - 2))}${email.slice(at)}`;
+}
+
+// 推送/日志里的账号标识：账密账号用脱敏邮箱；cookie 账号用 uid 脱敏
+function accountLabel(account) {
+  if (account.email) return maskEmail(account.email) || '未知账号';
+  if (account.cookie) {
+    const m = /(?:^|;\s*)uid=([^;]+)/.exec(account.cookie);
+    if (m) return `Cookie(${maskName(m[1].trim())})`;
+    return 'Cookie(未命名)';
+  }
+  return '未知账号';
+}
+
 function normalizeAccounts(rawAccounts) {
   if (!rawAccounts) throw new Error('missing ACCOUNTS');
   const trimmed = rawAccounts.trim();
   if (!trimmed) throw new Error('empty ACCOUNTS');
 
+  const accounts = [];
+  for (const part of trimmed.split(/[&\n]+/)) {
+    const entry = part.trim();
+    if (!entry) continue;
+    // 按首个 # 切分：密码本身含 # 时，余下部分整体属于密码
+    const hash = entry.indexOf('#');
+    if (hash <= 0) {
+      throw new Error(`「${entry.substring(0, 20)}」不是 邮箱#密码 格式（ACCOUNTS 需要改为 邮箱#密码，多账号用 & 或换行分隔）`);
+    }
+    const email = entry.slice(0, hash).trim();
+    const password = entry.slice(hash + 1);
+    if (!email || !password) {
+      throw new Error('存在空邮箱或空密码的账号项');
+    }
+    accounts.push({ email, password });
+  }
+  if (accounts.length === 0) throw new Error('ACCOUNTS 没有解析到任何账号');
+  return accounts;
+}
+
+// IKUUU_COOKIE：cookie 字符串直填，多账号用换行分隔（cookie 值本身不含换行）
+// 必须含 uid=，否则签到一定 302，提前报错避免排查迷茫
+function parseCookieAccounts(raw) {
+  if (!raw) return [];
+  const accounts = [];
+  for (const part of raw.split(/\n+/)) {
+    const entry = part.trim();
+    if (!entry) continue;
+    if (!/(?:^|;\s*)uid=[^;\s]+/.test(entry)) {
+      throw new Error(`「${entry.substring(0, 20)}」不是有效 cookie（应包含 uid=...）`);
+    }
+    accounts.push({ cookie: entry });
+  }
+  return accounts;
+}
+
+// ==========================================
+// 1.5 登录会话 Cookie 缓存（按邮箱隔离，只存 cookie 不存密码）
+// ==========================================
+// 文件名安全化：邮箱里可能出现的字符有限，但多账号别互相覆盖
+// dir 参数默认脚本目录 .token/，单测可注入临时目录
+function cacheFileFor(email, dir = COOKIE_CACHE_DIR) {
+  const safe = String(email).replace(/[\\/:*?"<>|\s@]+/g, '_');
+  return path.join(dir, `ikuuu_${safe}.json`);
+}
+
+// 从 cookie 字符串里解析会话到期时间（expire_in / expire_time，Unix 秒），返回毫秒
+function extractExpireAt(cookieStr) {
+  const m = /(?:^|;\s*)(?:expire_in|expire_time)=(\d{9,12})(?:;|$)/.exec(cookieStr || '');
+  return m ? Number(m[1]) * 1000 : null;
+}
+
+function readCookieCache(email, dir = COOKIE_CACHE_DIR) {
   try {
-    const parsed = JSON.parse(trimmed);
-    if (Array.isArray(parsed)) return parsed;
-    if (parsed && typeof parsed === 'object' && parsed.cookie) return [parsed];
+    const data = JSON.parse(fs.readFileSync(cacheFileFor(email, dir), 'utf8'));
+    if (!data || !data.cookie) return null;
+    // 到期时间缺字段时按"已过期"处理，直接走重登，不用可疑凭证去撞站点
+    if (!data.expireAt) return null;
+    if (Date.now() >= data.expireAt - COOKIE_CACHE_MARGIN_MS) return null;
+    return data;
   } catch (e) {
-    dbg('ACCOUNTS 非合法 JSON，按原始 cookie 字符串处理');
+    return null;
+  }
+}
+
+function saveCookieCache(email, cookie, host, dir = COOKIE_CACHE_DIR) {
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+    const expireAt = extractExpireAt(cookie) || Date.now() + 24 * 3600 * 1000;
+    fs.writeFileSync(cacheFileFor(email, dir), JSON.stringify({ cookie, host, expireAt, savedAt: Date.now() }));
+    const until = new Date(expireAt).toLocaleString('zh-CN', { hour12: false });
+    console.log(`  📦 已缓存登录 Cookie（服务端到期 ${until}）`);
+  } catch (e) {
+    console.log(`  ⚠️ Cookie 缓存写入失败: ${e.message}`);
+  }
+}
+
+function clearCookieCache(email, dir = COOKIE_CACHE_DIR) {
+  try {
+    fs.unlinkSync(cacheFileFor(email, dir));
+  } catch (e) {
+    /* 缓存不存在属正常 */
+  }
+}
+
+// ==========================================
+// 1.6 浏览器自动登录（Playwright）
+//   ikuuu 登录是分阶段流程（POST /auth/login, phase=password），且强制 Geetest V4
+//   验证码（adaptive 模式，正常风控下为"点击按钮直过"）。纯 HTTP 无法复现，
+//   因此只在需要登录时开浏览器：填表 → 点按钮 → 提交 → 抓取会话 Cookie。
+// ==========================================
+// 解析 /auth/login 响应体（纯函数，便于单测）
+function classifyLoginBody(text, httpStatus) {
+  if (httpStatus >= 500) return { ok: false, msg: `HTTP ${httpStatus} 服务端错误` };
+  let data;
+  try {
+    data = JSON.parse(text);
+  } catch (e) {
+    return { ok: false, msg: `登录响应非 JSON（HTTP ${httpStatus}）: ${(text || '').substring(0, 60)}` };
+  }
+  switch (data.phase) {
+    case 'authenticated':
+      return { ok: true, msg: '登录成功' };
+    case 'password':
+      return { ok: false, msg: `密码阶段被拒: ${data.msg || data.result || '未知原因'}` };
+    case 'totp':
+      return { ok: false, msg: '账号开启了两步验证(2FA)，脚本无法自动完成' };
+    case 'email_code':
+      return { ok: false, msg: `站点要求邮箱验证码登录: ${data.msg || ''}` };
+    case 'reverse_email_verify':
+      return { ok: false, msg: '站点要求反向邮件验证（风控升级），请浏览器手动登录一次后重试' };
+    default:
+      return { ok: false, msg: `未知登录流程 phase=${data.phase}: ${data.msg || ''}` };
+  }
+}
+
+// 从 Playwright cookie 对象数组拼 Cookie 头字符串；只取本站域名、剔除统计类噪音
+function buildCookieString(cookies, host) {
+  const hostLower = (host || '').toLowerCase();
+  return (cookies || [])
+    .filter((c) => {
+      const d = (c.domain || '').toLowerCase().replace(/^\./, '');
+      const sameSite = d === hostLower || hostLower.endsWith(`.${d}`) || d.endsWith(`.${hostLower}`);
+      return sameSite && !/^_(ga|gid|gat)/.test(c.name);
+    })
+    .map((c) => `${c.name}=${c.value}`)
+    .join('; ');
+}
+
+// 浏览器登录：成功返回 { ok, cookie }，失败返回 { ok: false, msg }
+async function browserLogin({ host, email, password }) {
+  let playwright;
+  try {
+    playwright = require('playwright');
+  } catch (e) {
+    return {
+      ok: false,
+      msg: '未安装 playwright（自动登录需要）。在青龙容器执行: npm i --prefix /ql/data/scripts/wuang-wu_Ikuuu && cd /ql/data/scripts/wuang-wu_Ikuuu && npx playwright install chromium',
+    };
   }
 
-  return [{ name: '默认账号', cookie: trimmed }];
+  const debugDir = path.join(__dirname, '_ikuuu_debug');
+  const shot = async (page, name) => {
+    if (!DEBUG) return;
+    try {
+      fs.mkdirSync(debugDir, { recursive: true });
+      await page.screenshot({ path: path.join(debugDir, `${Date.now()}_${name}.png`) });
+    } catch (e) {
+      dbg('截屏失败:', e.message);
+    }
+  };
+
+  let browser;
+  try {
+    const launchArgs = {
+      headless: !HEADFUL,
+      args: [
+        '--no-sandbox',
+        '--disable-blink-features=AutomationControlled',
+        '--disable-dev-shm-usage',
+      ],
+    };
+    if (CHROMIUM_PATH) launchArgs.executablePath = CHROMIUM_PATH;
+    if (PROXY) launchArgs.proxy = { server: PROXY };
+    browser = await playwright.chromium.launch(launchArgs);
+
+    const context = await browser.newContext({
+      userAgent: UA,
+      locale: 'zh-CN',
+      viewport: { width: 1280, height: 800 },
+      timezoneId: 'Asia/Shanghai',
+    });
+    const page = await context.newPage();
+
+    // 监听登录接口响应（phase=authenticated 即成功）
+    let loginPhaseBody = null;
+    page.on('response', async (resp) => {
+      if (resp.url().includes('/auth/login') && resp.request().method() === 'POST') {
+        try {
+          loginPhaseBody = { status: resp.status(), text: await resp.text() };
+        } catch (e) {
+          /* body 可能已被消费 */
+        }
+      }
+    });
+
+    console.log(`  🌐 打开登录页 https://${host}/auth/login ...`);
+    await page.goto(`https://${host}/auth/login`, { waitUntil: 'domcontentloaded', timeout: 45000 });
+    await page.waitForTimeout(2500);
+
+    // 验证码最多整页重来 2 次（adaptive 高风险时可能弹拼图，重来一次常回到按钮直过）
+    let captchaReady = false;
+    for (let attempt = 1; attempt <= 2 && !captchaReady; attempt++) {
+      await page.fill('#email', email);
+      await page.fill('#password', password);
+      await page.check('#remember-me').catch(() => {});
+      dbg(`第 ${attempt} 次点击验证码按钮`);
+
+      const btn = page.locator('.geetest_btn_click');
+      if ((await btn.count()) === 0) {
+        dbg('未找到 .geetest_btn_click，等组件加载后重试');
+        await page.waitForTimeout(4000);
+        continue;
+      }
+      await btn.first().click({ timeout: 10000 }).catch(async (e) => {
+        dbg('常规点击被拦截，改用 force:', e.message.split('\n')[0]);
+        await btn.first().click({ force: true, timeout: 10000 });
+      });
+
+      // Captcha.isReady()（页面全局）为 true 即验证码通过
+      for (let i = 0; i < 20; i++) {
+        await page.waitForTimeout(1000);
+        captchaReady = await page.evaluate(() => !!(window.Captcha && window.Captcha.isReady()));
+        if (captchaReady) break;
+      }
+      if (!captchaReady) {
+        await shot(page, 'captcha_not_ready');
+        console.log(`  ⚠️ 验证码 ${attempt}/2 次未通过（可能被弹拼图），刷新页面重来...`);
+        await page.reload({ waitUntil: 'domcontentloaded' });
+        await page.waitForTimeout(2500);
+      }
+    }
+    if (!captchaReady) {
+      return {
+        ok: false,
+        msg: 'Geetest 验证码连续 2 轮未通过（风控弹了拼图）。请稍后重试，或用本机浏览器登录一次降低风控',
+      };
+    }
+
+    dbg('验证码通过，提交登录');
+    await page.click('.login.btn', { timeout: 10000 });
+
+    // 登录成功有三个信号：接口 phase=authenticated / 页面跳转 /user / 会话 Cookie 就位。
+    // 响应体常因页面跳转提前销毁而读不到（实测如此），跳转与 Cookie 才是可靠信号
+    const landedOnUser = () => {
+      try {
+        return new URL(page.url()).pathname === '/user';
+      } catch (e) {
+        return false;
+      }
+    };
+    const deadline = Date.now() + 20000;
+    while (Date.now() < deadline && !loginPhaseBody && !landedOnUser()) {
+      await page.waitForTimeout(500);
+    }
+    await page.waitForTimeout(2000);
+    await shot(page, 'after_submit');
+
+    const allCookies = await context.cookies();
+    const cookieStr = buildCookieString(allCookies, host);
+    const hasSession = cookieStr.includes('uid=') && cookieStr.includes('key=');
+
+    let verdict = loginPhaseBody ? classifyLoginBody(loginPhaseBody.text, loginPhaseBody.status) : null;
+    if ((!verdict || !verdict.ok) && landedOnUser() && hasSession) {
+      verdict = { ok: true, msg: '登录成功' };
+    }
+    if (!verdict) {
+      verdict = { ok: false, msg: `提交后未捕获登录响应（当前页面 ${page.url()}）` };
+    }
+    if (!verdict.ok) return verdict;
+    if (!hasSession) {
+      return {
+        ok: false,
+        msg: `登录成功但未拿到会话 Cookie（拿到: ${allCookies.map((c) => c.name).join(',')}）`,
+      };
+    }
+    dbg('登录 Cookie:', cookieStr.replace(/(uid|key|ip)=[^;]{4}[^;]*/g, '$1=****'));
+    return { ok: true, cookie: cookieStr };
+  } catch (err) {
+    const hint = /Executable doesn't exist/.test(err.message)
+      ? '。浏览器未安装：容器内执行 `npx playwright install chromium`，或设 IKUUU_CHROMIUM_PATH=/usr/bin/chromium'
+      : '';
+    return { ok: false, msg: `浏览器登录异常: ${String(err.message || err).substring(0, 200)}${hint}` };
+  } finally {
+    if (browser) await browser.close().catch(() => {});
+  }
 }
 
 // ==========================================
@@ -325,16 +632,16 @@ function classify(text, httpStatus, location) {
   return { status: 'parse_err', msg: raw || `未知响应: ${text.substring(0, 40)}` };
 }
 
-async function checkInOnce(account, host) {
+async function checkInOnce(cookieStr, host) {
   const checkInUrl = `https://${host}/user/checkin`;
-  dbg('请求签到:', checkInUrl, '账号', maskName(account.name));
+  dbg('请求签到:', checkInUrl);
 
   const response = await fetchWithProxy(checkInUrl, {
     method: 'POST',
     // 不跟随重定向：保留 302 + Location 才能区分「Cookie 失效跳登录」与「域名被墙」
     redirect: 'manual',
     headers: {
-      Cookie: account.cookie,
+      Cookie: cookieStr,
       'User-Agent': UA,
       Accept: 'application/json, text/plain, */*',
       Referer: `https://${host}/user`,
@@ -348,13 +655,13 @@ async function checkInOnce(account, host) {
   return classify(text, response.status, location);
 }
 
-// 带重试的签到
-async function checkIn(account, host) {
+// 带重试的签到（仅网络错误重试，业务结果直接返回）
+async function checkIn(cookieStr, host) {
   const maxRetry = 2;
   let lastResult;
   for (let i = 0; i <= maxRetry; i++) {
     try {
-      lastResult = await checkInOnce(account, host);
+      lastResult = await checkInOnce(cookieStr, host);
       // 网络错误才重试，业务结果直接返回
       return lastResult;
     } catch (err) {
@@ -377,6 +684,7 @@ const STATUS_FLAG = {
   success: '✅',
   already: '✅',
   cookie_dead: '❌',
+  login_fail: '❌',
   domain_block: '❌',
   parse_err: '⚠️',
   network_err: '❌',
@@ -386,6 +694,7 @@ const STATUS_LABEL = {
   success: '成功',
   already: '已签到',
   cookie_dead: 'Cookie失效',
+  login_fail: '登录失败',
   domain_block: '域名异常',
   parse_err: '响应异常',
   network_err: '网络异常',
@@ -411,20 +720,30 @@ async function main() {
     console.log('代理: 未配置（发布页走公共 CORS 通道兜底）');
   }
 
-  if (!process.env.ACCOUNTS) {
-    console.error('❌ 未配置 ACCOUNTS 环境变量');
+  // 两种账号来源可共存：ACCOUNTS（邮箱#密码，可自动重登）+ IKUUU_COOKIE（直填，失效需手工更新）
+  const accounts = [];
+  if ((process.env.ACCOUNTS || '').trim()) {
+    try {
+      accounts.push(...normalizeAccounts(process.env.ACCOUNTS));
+    } catch (err) {
+      console.error(`❌ ACCOUNTS 解析失败: ${err.message}`);
+      process.exit(1);
+    }
+  }
+  if ((process.env.IKUUU_COOKIE || '').trim()) {
+    try {
+      accounts.push(...parseCookieAccounts(process.env.IKUUU_COOKIE));
+    } catch (err) {
+      console.error(`❌ IKUUU_COOKIE 解析失败: ${err.message}`);
+      process.exit(1);
+    }
+  }
+  if (accounts.length === 0) {
+    console.error('❌ 未配置账号：请设置 ACCOUNTS（邮箱#密码，推荐）或 IKUUU_COOKIE（cookie 直填）');
     process.exit(1);
   }
-
-  let accounts;
-  try {
-    accounts = normalizeAccounts(process.env.ACCOUNTS);
-  } catch (err) {
-    console.error(`❌ ACCOUNTS 解析失败: ${err.message}`);
-    process.exit(1);
-  }
-
-  console.log(`共解析到 ${accounts.length} 个账号, 将串行签到\n`);
+  const pwdCount = accounts.filter((a) => a.email).length;
+  console.log(`共解析到 ${accounts.length} 个账号（账密 ${pwdCount} / cookie ${accounts.length - pwdCount}），将串行签到\n`);
 
   // 动态域名列表（依次尝试：域名被墙/网络异常时自动轮换下一个）
   const targetHosts = await getLatestHosts();
@@ -435,13 +754,47 @@ async function main() {
 
   for (let i = 0; i < accounts.length; i++) {
     const acc = accounts[i];
-    const masked = maskName(acc.name);
-    console.log(`[${i + 1}/${accounts.length}] 账号 [${masked}] 签到中...`);
+    const label = accountLabel(acc);
+    console.log(`[${i + 1}/${accounts.length}] 账号 [${label}] 签到中...`);
 
-    // 每个账号依次尝试候选域名；仅域名/网络类问题才轮换，业务结果直接采用
+    // ---- 第一步：确定认证 Cookie —— cookie 型直接用；账密型缓存优先，没有则先登录 ----
+    let cookie = acc.cookie || null;
+    if (!cookie && acc.email) {
+      const cached = readCookieCache(acc.email);
+      if (cached) {
+        cookie = cached.cookie;
+        const until = new Date(cached.expireAt).toLocaleString('zh-CN', { hour12: false });
+        console.log(`  📦 命中 Cookie 缓存（服务端 ${until} 到期），跳过登录`);
+      }
+    }
+    if (!cookie && acc.email && acc.password) {
+      console.log('  🔐 无可用 Cookie 缓存，先走浏览器自动登录...');
+      const login = await browserLogin({ host: targetHosts[0], email: acc.email, password: acc.password });
+      if (login.ok) {
+        saveCookieCache(acc.email, login.cookie, targetHosts[0]);
+        cookie = login.cookie;
+      } else {
+        console.log(`  ❌ 自动登录失败: ${login.msg}`);
+        results.push({
+          name: label,
+          result: { status: 'login_fail', msg: `自动登录失败: ${login.msg}` },
+          line: resultText({ status: 'login_fail', msg: `自动登录失败: ${login.msg}` }),
+        });
+        if (i < accounts.length - 1) await sleep(rand(3000, 8000));
+        continue;
+      }
+    }
+    if (!cookie) {
+      // 理论上到不了：解析层保证账号要么有 cookie 要么有 email+password
+      results.push({ name: label, result: { status: 'parse_err', msg: '账号缺少认证方式' }, line: '⚠️ 账号缺少认证方式' });
+      continue;
+    }
+
+    // ---- 第二步：依次尝试候选域名签到；仅域名/网络类问题才轮换 ----
     let result = null;
+    let resultHost = null;
     for (const host of targetHosts) {
-      const r = await checkIn(acc, host);
+      const r = await checkIn(cookie, host);
       if (r.status === 'domain_block' || r.status === 'network_err') {
         console.log(`  ↪ ${host} 返回 ${r.status}（${r.msg}），尝试下一个域名...`);
         result = r;
@@ -449,13 +802,30 @@ async function main() {
       }
       usedHost = host;
       result = r;
+      resultHost = host;
       break;
     }
 
-    const line = resultText(result);
-    console.log(`账号 [${masked}] 结果: ${line}\n`);
+    // ---- 第三步：Cookie 失效且有账密 → 浏览器重登一次（仅一次，防死循环）----
+    // cookie 直填账号没有重登能力，保持 cookie_dead 报告原样透出
+    if (result && result.status === 'cookie_dead' && acc.email && acc.password && resultHost) {
+      console.log('  🔐 Cookie 已失效，尝试账号密码自动登录...');
+      clearCookieCache(acc.email);
+      const login = await browserLogin({ host: resultHost, email: acc.email, password: acc.password });
+      if (login.ok) {
+        saveCookieCache(acc.email, login.cookie, resultHost);
+        usedHost = resultHost;
+        result = await checkIn(login.cookie, resultHost);
+      } else {
+        console.log(`  ❌ 自动登录失败: ${login.msg}`);
+        result = { status: 'login_fail', msg: `自动登录失败: ${login.msg}` };
+      }
+    }
 
-    results.push({ name: masked, result, line });
+    const line = resultText(result);
+    console.log(`账号 [${label}] 结果: ${line}\n`);
+
+    results.push({ name: label, result, line });
 
     // 多账号间随机间隔，降低风控
     if (i < accounts.length - 1) {
@@ -511,8 +881,18 @@ async function main() {
 // 导出纯函数供单元测试使用（青龙直接运行不受影响）
 module.exports = {
   classify,
+  classifyLoginBody,
+  buildCookieString,
   normalizeAccounts,
+  parseCookieAccounts,
+  accountLabel,
   maskName,
+  maskEmail,
+  extractExpireAt,
+  cacheFileFor,
+  readCookieCache,
+  saveCookieCache,
+  clearCookieCache,
   extractHosts,
   collapseStringConcat,
   getLatestHosts,

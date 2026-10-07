@@ -28,6 +28,9 @@ replied_posts.json
 *_accounts.txt
 .test_tmp/
 
+# 浏览器登录调试截屏（DEBUG 模式产出）
+_ikuuu_debug/
+
 # IDE
 .vscode/
 .idea/
