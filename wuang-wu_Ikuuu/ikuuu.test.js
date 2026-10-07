@@ -12,8 +12,18 @@ const assert = require('node:assert');
 
 const {
   classify,
+  classifyLoginBody,
+  buildCookieString,
   normalizeAccounts,
+  parseCookieAccounts,
+  accountLabel,
   maskName,
+  maskEmail,
+  extractExpireAt,
+  cacheFileFor,
+  readCookieCache,
+  saveCookieCache,
+  clearCookieCache,
   extractHosts,
   collapseStringConcat,
   getLatestHosts,
@@ -116,20 +126,6 @@ test('classify: 响应为 HTML 登录页 → cookie 失效', () => {
   assert.strictEqual(classify(html, 200).status, 'cookie_dead');
 });
 
-test('normalizeAccounts: 支持三种格式', () => {
-  const arr = normalizeAccounts('[{"name":"主号","cookie":"a=1"}]');
-  assert.deepStrictEqual(arr, [{ name: '主号', cookie: 'a=1' }]);
-
-  const obj = normalizeAccounts('{"name":"主号","cookie":"a=1"}');
-  assert.deepStrictEqual(obj, [{ name: '主号', cookie: 'a=1' }]);
-
-  const raw = normalizeAccounts('uid=1; key=abc');
-  assert.deepStrictEqual(raw, [{ name: '默认账号', cookie: 'uid=1; key=abc' }]);
-
-  assert.throws(() => normalizeAccounts(''));
-  assert.throws(() => normalizeAccounts(null));
-});
-
 test('maskName: 账号名脱敏', () => {
   assert.strictEqual(maskName('abcdef'), 'a****f');
   assert.strictEqual(maskName('ab'), 'a*');
@@ -145,4 +141,163 @@ test('getLatestHosts: 配置 HOST 时强制锁定并跳过网络抓取', async (
     if (backup === undefined) delete process.env.HOST;
     else process.env.HOST = backup;
   }
+});
+
+// ==========================================
+// 账号密码登录改造的新增用例
+// ==========================================
+const fs = require('node:fs');
+const nodePath = require('node:path');
+
+// 缓存测试目录用 .test_tmp/（.gitignore 已覆盖）
+function makeCacheDir() {
+  const base = nodePath.join(__dirname, '.test_tmp');
+  fs.mkdirSync(base, { recursive: true });
+  return fs.mkdtempSync(nodePath.join(base, 'cache-'));
+}
+
+test('normalizeAccounts: 单账号 邮箱#密码', () => {
+  assert.deepStrictEqual(normalizeAccounts('a@b.com#pw1'), [{ email: 'a@b.com', password: 'pw1' }]);
+});
+
+test('normalizeAccounts: 多账号 & 与换行可混用', () => {
+  const arr = normalizeAccounts('a@b.com#p1&c@d.com#p2\ne@f.com#p3');
+  assert.deepStrictEqual(arr, [
+    { email: 'a@b.com', password: 'p1' },
+    { email: 'c@d.com', password: 'p2' },
+    { email: 'e@f.com', password: 'p3' },
+  ]);
+});
+
+test('normalizeAccounts: 按首个 # 切分（密码可含 #），邮箱与条目空白被 trim', () => {
+  const one = normalizeAccounts('  a@b.com  #p#1  ');
+  assert.strictEqual(one[0].email, 'a@b.com');
+  assert.strictEqual(one[0].password, 'p#1');
+});
+
+test('normalizeAccounts: 非法输入报错并提示迁移到新格式', () => {
+  assert.throws(() => normalizeAccounts(''));
+  assert.throws(() => normalizeAccounts(null));
+  // 旧的 cookie 格式要报错提醒迁移，不能静默当账密用
+  assert.throws(() => normalizeAccounts('uid=1; ip=2'), /邮箱#密码/);
+  // 缺 #、空段、空密码都要报错
+  assert.throws(() => normalizeAccounts('a@b.com'), /邮箱#密码/);
+  assert.throws(() => normalizeAccounts('a@b.com#p1&&#p2'), /邮箱#密码/);
+  assert.throws(() => normalizeAccounts('a@b.com#'), /空密码/);
+});
+
+test('maskEmail / accountLabel: 邮箱脱敏与账号标识', () => {
+  assert.strictEqual(maskEmail('1987654321@qq.com'), '19********@qq.com');
+  assert.strictEqual(maskEmail('a@qq.com'), 'a*@qq.com');
+  assert.strictEqual(accountLabel({ email: '1987654321@qq.com' }), '19********@qq.com');
+  assert.match(accountLabel({ cookie: 'uid=1234567; key=k' }), /^Cookie\(1\*{5}7\)$/);
+  assert.strictEqual(accountLabel({ cookie: 'ip=x; key=k' }), 'Cookie(未命名)');
+  assert.strictEqual(accountLabel({}), '未知账号');
+});
+
+test('parseCookieAccounts: 单条与换行多条', () => {
+  const one = parseCookieAccounts('uid=1; ip=2; expire_in=3');
+  assert.deepStrictEqual(one, [{ cookie: 'uid=1; ip=2; expire_in=3' }]);
+
+  const multi = parseCookieAccounts('uid=1; key=a\n\nuid=2; key=b\n');
+  assert.deepStrictEqual(multi, [{ cookie: 'uid=1; key=a' }, { cookie: 'uid=2; key=b' }]);
+
+  assert.deepStrictEqual(parseCookieAccounts(''), []);
+  assert.deepStrictEqual(parseCookieAccounts(null), []);
+});
+
+test('parseCookieAccounts: 缺 uid= 的行直接报错（签到必然 302，早失败早定位）', () => {
+  assert.throws(() => parseCookieAccounts('email=x; key=k'), /uid=/);
+  assert.throws(() => parseCookieAccounts('uid=1; key=a\n垃圾行'), /uid=/);
+});
+
+test('extractExpireAt: 解析 expire_in / expire_time（Unix 秒 → 毫秒）', () => {
+  assert.strictEqual(extractExpireAt('uid=1; expire_in=1791347708; ip=x'), 1791347708 * 1000);
+  assert.strictEqual(extractExpireAt('expire_time=1791347708'), 1791347708 * 1000);
+  assert.strictEqual(extractExpireAt('uid=1; key=k'), null);
+  assert.strictEqual(extractExpireAt(''), null);
+  assert.strictEqual(extractExpireAt(null), null);
+});
+
+test('cookie 缓存: 写入→命中→清除，按邮箱隔离', () => {
+  const dir = makeCacheDir();
+  const cookie = 'uid=1234567; key=abc; expire_in=1991347708';
+  saveCookieCache('a@b.com', cookie, 'ikuuu.top', dir);
+
+  const hit = readCookieCache('a@b.com', dir);
+  assert.strictEqual(hit.cookie, cookie);
+  assert.strictEqual(hit.host, 'ikuuu.top');
+  assert.strictEqual(hit.expireAt, 1991347708 * 1000);
+
+  // 多账号隔离：别的邮箱读不到
+  assert.strictEqual(readCookieCache('other@b.com', dir), null);
+
+  clearCookieCache('a@b.com', dir);
+  assert.strictEqual(readCookieCache('a@b.com', dir), null);
+  // 重复清除不报错
+  clearCookieCache('a@b.com', dir);
+});
+
+test('cookie 缓存: 余量不足视为失效（30 分钟 margin）', () => {
+  const dir = makeCacheDir();
+  // 只剩 10 分钟 → 不应命中
+  const soon = Date.now() + 10 * 60 * 1000;
+  saveCookieCache('x@b.com', 'uid=1', 'ikuuu.top', dir);
+  // 直接改写 expireAt 模拟临近到期
+  const file = cacheFileFor('x@b.com', dir);
+  const data = JSON.parse(fs.readFileSync(file, 'utf8'));
+  data.expireAt = soon;
+  fs.writeFileSync(file, JSON.stringify(data));
+  assert.strictEqual(readCookieCache('x@b.com', dir), null);
+});
+
+test('cookie 缓存: 缺 expireAt / 文件损坏 → 视为无缓存', () => {
+  const dir = makeCacheDir();
+  fs.writeFileSync(cacheFileFor('y@b.com', dir), JSON.stringify({ cookie: 'uid=1' }));
+  assert.strictEqual(readCookieCache('y@b.com', dir), null);
+
+  fs.writeFileSync(cacheFileFor('z@b.com', dir), '{broken json');
+  assert.strictEqual(readCookieCache('z@b.com', dir), null);
+});
+
+test('classifyLoginBody: 各 phase 分档', () => {
+  assert.deepStrictEqual(classifyLoginBody('{"phase":"authenticated"}', 200), { ok: true, msg: '登录成功' });
+
+  const badPass = classifyLoginBody('{"phase":"password","result":"user_not_found","msg":"邮箱或密码错误"}', 200);
+  assert.strictEqual(badPass.ok, false);
+  assert.match(badPass.msg, /密码阶段被拒/);
+
+  assert.strictEqual(classifyLoginBody('{"phase":"totp"}', 200).ok, false);
+  assert.match(classifyLoginBody('{"phase":"totp"}', 200).msg, /两步验证/);
+  assert.strictEqual(classifyLoginBody('{"phase":"email_code"}', 200).ok, false);
+  assert.strictEqual(classifyLoginBody('{"phase":"reverse_email_verify"}', 200).ok, false);
+
+  const unknown = classifyLoginBody('{"phase":"wat","msg":"?"}', 200);
+  assert.strictEqual(unknown.ok, false);
+  assert.match(unknown.msg, /phase=wat/);
+});
+
+test('classifyLoginBody: 非 JSON / 5xx', () => {
+  const html = classifyLoginBody('<html>502</html>', 502);
+  assert.strictEqual(html.ok, false);
+
+  const notJson = classifyLoginBody('oops', 200);
+  assert.strictEqual(notJson.ok, false);
+  assert.match(notJson.msg, /非 JSON/);
+
+  assert.strictEqual(classifyLoginBody('{"phase":"authenticated"}', 503).ok, false);
+});
+
+test('buildCookieString: 只取本站 cookie 并剔除统计噪音', () => {
+  const cookies = [
+    { name: 'uid', value: '1234567', domain: 'ikuuu.top' },
+    { name: 'email', value: 'a%40b.com', domain: 'ikuuu.top' },
+    { name: 'key', value: 'k', domain: '.ikuuu.top' },
+    { name: '_ga', value: 'GA1.1', domain: '.ikuuu.top' },
+    { name: '_gid', value: 'x', domain: '.ikuuu.top' },
+    { name: 'captcha_v4_user', value: 'zzz', domain: 'gcaptcha4.geetest.com' },
+  ];
+  const str = buildCookieString(cookies, 'ikuuu.top');
+  assert.strictEqual(str, 'uid=1234567; email=a%40b.com; key=k');
+  assert.strictEqual(buildCookieString([], 'ikuuu.top'), '');
 });
