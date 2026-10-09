@@ -34,7 +34,7 @@
 示例：
 
 ```
-VIKACG_ACCOUNTS=aa****8514@gmail.com#password1&bb****66@gmail.com#password2
+VIKACG_ACCOUNTS=user1@example.com#pass1&user2@example.com#pass2
 ```
 
 ## 凭证缓存与降级链

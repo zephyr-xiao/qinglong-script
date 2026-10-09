@@ -114,8 +114,8 @@ python path\to\script.py
 
 | 名称 | 值 |
 |---|---|
-| `HTTP_PROXY` | `http://192.168.5.5:7890` |
-| `HTTPS_PROXY` | `http://192.168.5.5:7890` |
+| `HTTP_PROXY` | `http://192.168.1.100:7890` |
+| `HTTPS_PROXY` | `http://192.168.1.100:7890` |
 
 > 代理跑在宿主机上时容器内常用 `http://172.17.0.1:7890`；跑在局域网其它机器上则填其实际 IP。
 > 保存后新运行的任务即生效。
@@ -126,8 +126,8 @@ python path\to\script.py
 
 ```yaml
 environment:
-  - HTTP_PROXY=http://192.168.5.5:7890
-  - HTTPS_PROXY=http://192.168.5.5:7890
+  - HTTP_PROXY=http://192.168.1.100:7890
+  - HTTPS_PROXY=http://192.168.1.100:7890
   - NO_PROXY=localhost,127.0.0.1,192.168.0.0/16,10.0.0.0/8,172.16.0.0/12
 ```
 
