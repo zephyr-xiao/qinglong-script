@@ -14,6 +14,15 @@
  *                              多账号用换行分隔；此模式 Cookie 失效后只能手工更新，
  *                              适合不想装 playwright 或临时兜底的场景。
  *                              两个变量都配时可同时签到（cookie 账号在前）。
+ *   IKUUU_SOLVER_CMD         【可选】点选验证码外部解法器命令（详见 README）。
+ *                              极验按站点配置可能下发"点选"验证码（word/icon/nine），
+ *                              脚本自身不做图形识别：配置本命令后，脚本把挑战图与
+ *                              待点图案交给它，由它返回点击坐标。
+ *   IKUUU_SOLVER_CMD_FALLBACK【可选】备用解法器命令：主解法器"不可用"（没配 key /
+ *                              key 失效 / 网关不通 / 超时）时自动改用它。
+ *   IKUUU_RETRY_TIMES        【可选】失败账号延迟重试次数，默认 0（不重试）。
+ *                              限流、网关抖动这类"过一会儿就好"的故障靠它兜底。
+ *   IKUUU_RETRY_DELAY        【可选】每次重试前等待秒数，默认 300。
  *   HOST                     【可选】强制锁定签到域名，留空则自动从发布页抓取
  *   IKUUU_PUBLISH_URL        【可选】发布页地址，默认 https://ikuuu.win/
  *                                      ikuuu 的"最新域名"发布页会整体迁移域名，
@@ -35,7 +44,9 @@
 
 const crypto = require('crypto');
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
+const { spawn } = require('child_process');
 const { sendNotify } = require(path.join(__dirname, 'sendNotify'));
 // undici（sendNotify.js 已依赖）用于代理支持：ikuuu 被墙，青龙容器需走代理
 const { fetch: undiciFetch, ProxyAgent } = require('undici');
@@ -48,6 +59,21 @@ const NOTIFY_ONLY_FAIL = process.env.IKUUU_NOTIFY_ONLY_FAIL === '1';
 const HEADFUL = process.env.IKUUU_HEADFUL === '1';
 const CHROMIUM_PATH = (process.env.IKUUU_CHROMIUM_PATH || '').trim();
 const TIMEOUT_MS = 15000;
+
+// 点选验证码解法器（外部命令插件）：见 README「点选验证码与解法器」
+// 命令链：主解法器"不可用"（没配 key / key 失效 / 网关不通 / 超时）时，自动改用备用解法器
+const SOLVER_CMDS = [
+  (process.env.IKUUU_SOLVER_CMD || '').trim(),
+  (process.env.IKUUU_SOLVER_CMD_FALLBACK || '').trim(),
+].filter(Boolean);
+// 失败后延迟重试：对限流、短暂抖动这类"过一会儿就好"的故障最有效（0 = 不重试）
+const RETRY_TIMES = Math.max(0, Number(process.env.IKUUU_RETRY_TIMES || 0));
+const RETRY_DELAY_MS = Math.max(10, Number(process.env.IKUUU_RETRY_DELAY || 300)) * 1000;
+// 解法器超时（秒）：默认按"视觉大模型解法器"的耗时给（多次调用+重试），
+// 轻量解法器（纯 HTTP 打码平台）可调小
+const SOLVER_TIMEOUT_MS = Math.max(10, Number(process.env.IKUUU_SOLVER_TIMEOUT || 180)) * 1000;
+// 点选挑战最多整页重来几次（每次刷新会重新抽取验证形式）
+const MAX_CAPTCHA_ROUNDS = Math.max(1, Number(process.env.IKUUU_CAPTCHA_ROUNDS || 6));
 
 // 登录会话 Cookie 缓存：脚本目录 .token/（.gitignore 已覆盖），按账号邮箱隔离
 // ikuuu 会话有效期 24h（expire_in），留 30 分钟余量；cron 每天一次时约每天重登一次
@@ -217,9 +243,12 @@ function clearCookieCache(email, dir = COOKIE_CACHE_DIR) {
 
 // ==========================================
 // 1.6 浏览器自动登录（Playwright）
-//   ikuuu 登录是分阶段流程（POST /auth/login, phase=password），且强制 Geetest V4
-//   验证码（adaptive 模式，正常风控下为"点击按钮直过"）。纯 HTTP 无法复现，
-//   因此只在需要登录时开浏览器：填表 → 点按钮 → 提交 → 抓取会话 Cookie。
+//   ikuuu 登录是分阶段流程（POST /auth/login, phase=password），且强制 Geetest V4。
+//   验证形式由极验按站点配置下发（2026-10 实测为 icon/word/nine 三种点选，随机分配）：
+//     · 一键通过（ai）：点一下验证码按钮即通过，无需识别，脚本可独立完成；
+//     · 点选类（word/icon/nine）：必须点击图中指定图案，脚本自身不做图形识别，
+//       需要外部解法器（IKUUU_SOLVER_CMD）提供坐标，否则直接失败并说明形式。
+//   —— 详细机制与可选方案见 README「点选验证码与解法器」。
 // ==========================================
 // 解析 /auth/login 响应体（纯函数，便于单测）
 function classifyLoginBody(text, httpStatus) {
@@ -244,6 +273,372 @@ function classifyLoginBody(text, httpStatus) {
     default:
       return { ok: false, msg: `未知登录流程 phase=${data.phase}: ${data.msg || ''}` };
   }
+}
+
+// 极验验证形式（riskType 枚举）→ 中文名；未识别时原样回显
+const CAPTCHA_TYPE_LABEL = {
+  ai: '一键通过',
+  slide: '滑动拼图',
+  match: '消消乐',
+  winlinze: '五子棋',
+  word: '文字点选',
+  phrase: '语序点选',
+  nine: '九宫格点选',
+  icon: '图标点选',
+};
+
+function typeLabel(type) {
+  if (!type) return '未知形式';
+  return CAPTCHA_TYPE_LABEL[type] ? `${CAPTCHA_TYPE_LABEL[type]}(${type})` : type;
+}
+
+// 解析 gcaptcha4 /load 的响应体（JSONP 或纯 JSON），返回 data 段（纯函数，便于单测）
+function parseGeeLoadBody(text) {
+  if (!text) return null;
+  const trimmed = String(text).trim();
+  // 形如 geetest_1791516170996({...});
+  const m = /\(([\s\S]*)\)\s*;?\s*$/.exec(trimmed);
+  const jsonText = m && trimmed.startsWith('geetest_') ? m[1] : trimmed;
+  try {
+    const data = JSON.parse(jsonText);
+    return data && data.data ? data.data : data;
+  } catch (e) {
+    return null;
+  }
+}
+
+// 读取图片宽高（PNG/JPEG，纯函数，便于单测）；无法识别返回 null
+function imageSize(buf) {
+  if (!buf || buf.length < 24) return null;
+  if (buf.readUInt32BE(0) === 0x89504e47 && buf.readUInt32BE(4) === 0x0d0a1a0a) {
+    return { w: buf.readUInt32BE(16), h: buf.readUInt32BE(20) };
+  }
+  if (buf[0] === 0xff && buf[1] === 0xd8) {
+    let off = 2;
+    while (off + 9 < buf.length) {
+      if (buf[off] !== 0xff) { off++; continue; }
+      const marker = buf[off + 1];
+      if (marker === 0xd8 || marker === 0x01 || (marker >= 0xd0 && marker <= 0xd7)) { off += 2; continue; }
+      const len = buf.readUInt16BE(off + 2);
+      if ((marker >= 0xc0 && marker <= 0xc3) || (marker >= 0xc5 && marker <= 0xc7) ||
+          (marker >= 0xc9 && marker <= 0xcb) || (marker >= 0xcd && marker <= 0xcf)) {
+        return { h: buf.readUInt16BE(off + 5), w: buf.readUInt16BE(off + 7) };
+      }
+      off += 2 + len;
+    }
+  }
+  return null;
+}
+
+// 从解法器 stdout 提取 JSON（允许前后夹带日志行）（纯函数，便于单测）
+function extractSolverJson(text) {
+  if (!text) return null;
+  const start = text.indexOf('{');
+  const end = text.lastIndexOf('}');
+  if (start < 0 || end <= start) return null;
+  try {
+    return JSON.parse(text.slice(start, end + 1));
+  } catch (e) {
+    return null;
+  }
+}
+
+// 点击点：解法器输出校验（[[x,y],...]，坐标需落在图片自然尺寸内）（纯函数，便于单测）
+function normalizeClicks(clicks, size) {
+  if (!Array.isArray(clicks)) return [];
+  const ok = (n, max) => Number.isFinite(n) && n >= 0 && n <= max;
+  return clicks
+    .filter((c) => Array.isArray(c) && c.length === 2 && ok(Number(c[0]), size.w) && ok(Number(c[1]), size.h))
+    .map((c) => [Number(c[0]), Number(c[1])]);
+}
+
+// 验证码是否已通过（站点包装对象 window.Captcha 的 isReady 为 true）
+async function isCaptchaReady(page) {
+  return page
+    .evaluate(() => !!(window.Captcha && window.Captcha.isReady && window.Captcha.isReady()))
+    .catch(() => false);
+}
+
+// 读取点选挑战面板：挑战图地址、待点图案、显示区域与图片自然尺寸
+// 验证形式（含挑战图与待点图案）在页面加载时的 /load 就已确定，点按钮只是校验，
+// 因此这里要能等面板渲染出来，并对不同形式的 DOM 结构做兼容（背景图/普通 img）。
+async function readClickChallenge(page) {
+  return page.evaluate(async () => {
+    const win = document.querySelector('.geetest_window');
+    let target = null;
+    let imageUrl = null;
+    const fromBg = (el) => {
+      const cs = el ? getComputedStyle(el) : null;
+      const m = cs ? /url\("([^"]+)"\)/.exec(cs.backgroundImage || '') : null;
+      return m ? m[1] : null;
+    };
+    // 优先 .geetest_bg，其次窗口内任意带背景图的元素，最后退化到 <img>
+    const primary = document.querySelector('.geetest_bg');
+    if (fromBg(primary)) {
+      target = primary;
+      imageUrl = fromBg(primary);
+    } else if (win) {
+      for (const el of win.querySelectorAll('*')) {
+        const u = fromBg(el);
+        if (u) { target = el; imageUrl = u; break; }
+      }
+      if (!imageUrl) {
+        const img = win.querySelector('img');
+        if (img && /^https?:/.test(img.src)) { target = img; imageUrl = img.src; }
+      }
+    }
+    const rect = target ? target.getBoundingClientRect() : null;
+    let natural = null;
+    if (imageUrl) {
+      // 只取 naturalWidth/Height，不设 crossOrigin（避免触发 CORS 失败）
+      natural = await new Promise((resolve) => {
+        const img = new Image();
+        const done = () => resolve(img.naturalWidth ? { w: img.naturalWidth, h: img.naturalHeight } : null);
+        img.onload = done;
+        img.onerror = done;
+        img.src = imageUrl;
+        setTimeout(done, 4000);
+      });
+    }
+    return {
+      visible: !!(rect && rect.width > 40 && rect.height > 40 && imageUrl),
+      imageUrl,
+      tplUrls: Array.from(document.querySelectorAll('.geetest_ques_tips img')).map((i) => i.src),
+      // 面板提示语（"请在下图依次点击" / "选 3 个符合右图的图片" …）：解法器据此判断点几个、要不要按顺序
+      promptText: (() => {
+        const el = document.querySelector('.geetest_text_tips') || document.querySelector('.geetest_tip');
+        return el ? el.textContent.trim() : '';
+      })(),
+      rect: rect ? { x: rect.x, y: rect.y, w: rect.width, h: rect.height } : null,
+      natural,
+    };
+  }).catch(() => ({ visible: false, imageUrl: null, tplUrls: [], rect: null, natural: null }));
+}
+
+// 等点选面板渲染出来（面板可能晚于 isReady 轮询才出现）
+async function waitClickChallenge(page, timeoutMs = 10000) {
+  const deadline = Date.now() + timeoutMs;
+  let last = null;
+  while (Date.now() < deadline) {
+    last = await readClickChallenge(page);
+    if (last.visible) return last;
+    await page.waitForTimeout(500);
+  }
+  return last || { visible: false, imageUrl: null, tplUrls: [], rect: null, natural: null };
+}
+
+// 下载到本地文件（给外部解法器读）
+async function downloadToFile(url, file) {
+  const resp = await fetchWithProxy(url, {
+    method: 'GET',
+    headers: { 'User-Agent': UA, Referer: 'https://ikuuu.top/' },
+    signal: AbortSignal.timeout(TIMEOUT_MS),
+  });
+  if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+  fs.writeFileSync(file, Buffer.from(await resp.arrayBuffer()));
+  return file;
+}
+
+// 调单个外部解法器：stdin 传 JSON，stdout 收 JSON
+function runSolver(cmd, payload) {
+  return new Promise((resolve) => {
+    let child;
+    try {
+      child = spawn(cmd, { shell: true, windowsHide: true });
+    } catch (e) {
+      return resolve({ ok: false, msg: `解法器无法启动: ${e.message}` });
+    }
+    let out = '';
+    let err = '';
+    let done = false;
+    const finish = (r) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      resolve(r);
+    };
+    const timer = setTimeout(() => {
+      try { child.kill('SIGKILL'); } catch (e) { /* 已退出 */ }
+      finish({ ok: false, msg: `解法器超时（${SOLVER_TIMEOUT_MS / 1000}s）` });
+    }, SOLVER_TIMEOUT_MS);
+    child.stdout.on('data', (d) => { out += d; });
+    child.stderr.on('data', (d) => {
+      err += d;
+      // 解法器的日志（投票结果/重试/换模型等）转发到主日志：出问题时才有线索可查
+      String(d).split('\n').map((l) => l.trim()).filter(Boolean).forEach((l) => console.log(`  [解法器] ${l}`));
+    });
+    child.on('error', (e) => finish({ ok: false, msg: `解法器无法启动: ${e.message}` }));
+    child.on('close', (code) => {
+      const parsed = extractSolverJson(out);
+      if (!parsed) {
+        // 非 0 退出且没给出结果 → 解法器本身坏了（路径写错/依赖缺失/被 kill），换题无用
+        const raw = `${out}\n${err}`;
+        return finish({
+          ok: false,
+          unavailable: code !== 0,
+          msg: `解法器输出无法解析（exit=${code}）: ${firstErrorLine(raw)}${solverOutputHint(raw)}`,
+        });
+      }
+      if (parsed.ok === false) return finish({ ok: false, msg: parsed.msg || '解法器返回失败' });
+      finish({ ok: true, clicks: parsed.clicks || [] });
+    });
+    child.stdin.end(JSON.stringify(payload));
+  });
+}
+
+// 准备挑战图片并调用解法器，返回 { ok, clicks }（clicks 为图片自然坐标）
+async function solveChallenge(challenge, type) {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ikuuu-captcha-'));
+  try {
+    const ext = (challenge.imageUrl.match(/\.(jpe?g|png)(\?|$)/i) || [null, 'jpg'])[1];
+    const imagePath = path.join(tmpDir, `challenge.${ext}`);
+    await downloadToFile(challenge.imageUrl, imagePath);
+    const tplPaths = [];
+    for (let i = 0; i < challenge.tplUrls.length; i++) {
+      const p = path.join(tmpDir, `tpl${i + 1}.png`);
+      await downloadToFile(challenge.tplUrls[i], p);
+      tplPaths.push(p);
+    }
+    const size = imageSize(fs.readFileSync(imagePath)) || challenge.natural;
+    if (!size) return { ok: false, msg: '无法读取挑战图尺寸' };
+    const payload = {
+      type,
+      promptText: challenge.promptText || '',
+      imagePath,
+      tplPaths,
+      imageSize: size,
+      displaySize: { w: Math.round(challenge.rect.w), h: Math.round(challenge.rect.h) },
+    };
+    dbg('解法器入参:', JSON.stringify({ type, promptText: payload.promptText, imageSize: size, tplCount: tplPaths.length }));
+
+    // 依次尝试命令链：主解法器不可用时换备用；内容类失败（解错/分歧）不再换（换了解法器也没用，让主流程换题）
+    let last = null;
+    for (let i = 0; i < SOLVER_CMDS.length; i++) {
+      const r = await runSolver(SOLVER_CMDS[i], payload);
+      if (r.ok) {
+        const clicks = normalizeClicks(r.clicks, size);
+        if (clicks.length === 0) {
+          return { ok: false, msg: `解法器返回的坐标无效: ${JSON.stringify(r.clicks).substring(0, 120)}`, unavailable: false };
+        }
+        return { ok: true, clicks, size };
+      }
+      last = r;
+      const unavailable = r.unavailable === true || solverUnavailable(r.msg);
+      const hasNext = i < SOLVER_CMDS.length - 1;
+      if (hasNext && unavailable) {
+        console.log(`  ↪ 解法器#${i + 1} 不可用（${String(r.msg).substring(0, 60)}），改用备用解法器`);
+        continue;
+      }
+      break;
+    }
+    return { ok: false, msg: last.msg, unavailable: last.unavailable === true || solverUnavailable(last.msg) };
+  } catch (e) {
+    return { ok: false, msg: `准备挑战图片失败: ${e.message}`, unavailable: solverUnavailable(e.message) };
+  } finally {
+    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch (e) { /* 忽略清理失败 */ }
+  }
+}
+
+// 解法器失败信息分类（纯函数，便于单测）：
+//   true  = 解法器本身不可用（未配 key / 网关不通 / 认证失败 / 超时）→ 换题重抽没意义
+//   false = 内容类失败（投票分歧、思考被截断、输出无法解析）→ 值得换个抽取再试
+function solverUnavailable(msg) {
+  return /未配置|无法启动|超时|fetch failed|abort|ECONN|ENOTFOUND|HTTP (400|401|403|404|429|5\d\d)/i.test(msg || '');
+}
+
+// 解法器原始输出 → 针对常见配置错误的提示（纯函数，便于单测）
+// 目的：让"文件名写错/路径写错"这类问题一眼可辨，而不是让用户去读 Node 堆栈
+function solverOutputHint(raw) {
+  const s = String(raw || '');
+  if (/Cannot find module|MODULE_NOT_FOUND/i.test(s)) {
+    return '（提示：IKUUU_SOLVER_CMD 指向的文件不存在——本目录的解法器文件名是 solver_vlm.js，'
+      + '可填 node solver_vlm.js 或绝对路径 node /ql/data/scripts/wuang-wu_Ikuuu/solver_vlm.js）';
+  }
+  if (/command not found|is not recognized|No such file or directory/i.test(s)) {
+    return '（提示：IKUUU_SOLVER_CMD 里的可执行程序不存在，确认 node 在容器 PATH 里）';
+  }
+  if (/未配置 IKUUU_VLM/.test(s)) {
+    return '（提示：视觉解法器缺环境变量，按 README 补齐 IKUUU_VLM_BASE_URL / IKUUU_VLM_API_KEY / IKUUU_VLM_MODEL）';
+  }
+  return '';
+}
+
+// 把解法器的原始输出压成一行（去掉 Node 堆栈噪音，保留最关键的报错行）
+function firstErrorLine(raw) {
+  const lines = String(raw || '').split('\n').map((l) => l.trim()).filter(Boolean);
+  const key = lines.find((l) => /error|cannot find|not found|未配置|失败|invalid/i.test(l));
+  return (key || lines[0] || '').substring(0, 200);
+}
+
+// 拟人点击（分步移动 + 抖动 + 按下延时），坐标已是屏幕坐标
+async function humanClick(page, x, y) {
+  // 起点随机落在目标左上方，但要留在视口内（负坐标会丢事件）
+  const vp = page.viewportSize() || { width: 1280, height: 900 };
+  const from = {
+    x: Math.min(Math.max(10, x - 80 - Math.random() * 120), vp.width - 10),
+    y: Math.min(Math.max(10, y - 60 - Math.random() * 80), vp.height - 10),
+  };
+  await page.mouse.move(from.x, from.y);
+  const steps = 10 + Math.floor(Math.random() * 6);
+  for (let i = 1; i <= steps; i++) {
+    const t = i / steps;
+    await page.mouse.move(
+      from.x + (x - from.x) * t + (Math.random() * 3 - 1.5),
+      from.y + (y - from.y) * t + (Math.random() * 3 - 1.5),
+    );
+    await page.waitForTimeout(8 + Math.floor(Math.random() * 18));
+  }
+  await page.waitForTimeout(100 + Math.floor(Math.random() * 180));
+  await page.mouse.down();
+  await page.waitForTimeout(50 + Math.floor(Math.random() * 60));
+  await page.mouse.up();
+}
+
+// 按解法器坐标点击图案 → 点"确定" → 等验证通过
+// 坐标映射每次点击前即时换算：面板可能因滚动/重排移动，之前缓存的 rect 不可靠
+async function clickImagePoint(page, imageUrl, ix, iy, size) {
+  const pt = await page.evaluate(({ url, x, y, w, h }) => {
+    const bgUrlOf = (el) => {
+      const cs = el ? getComputedStyle(el) : null;
+      const m = cs ? /url\("([^"]+)"\)/.exec(cs.backgroundImage || '') : null;
+      return m ? m[1] : null;
+    };
+    let target = document.querySelector('.geetest_bg');
+    if (!target || bgUrlOf(target) !== url) {
+      target = null;
+      for (const el of document.querySelectorAll('.geetest_window, .geetest_window *')) {
+        if (bgUrlOf(el) === url) { target = el; break; }
+      }
+    }
+    if (!target) return null;
+    const r = target.getBoundingClientRect();
+    if (r.width < 40 || r.height < 40) return null;
+    return { x: r.x + (x / w) * r.width, y: r.y + (y / h) * r.height };
+  }, { url: imageUrl, x: ix, y: iy, w: size.w, h: size.h }).catch(() => null);
+  if (!pt) return false;
+  await humanClick(page, pt.x, pt.y);
+  return true;
+}
+
+async function submitClicks(page, challenge, clicks, size) {
+  let clicked = 0;
+  for (const [ix, iy] of clicks) {
+    const ok = await clickImagePoint(page, challenge.imageUrl, ix, iy, size);
+    if (!ok) {
+      console.log(`  ⚠️ 第 ${clicked + 1} 个点映射失败（面板已消失或结构变化）`);
+      break;
+    }
+    clicked += 1;
+    console.log(`  🖱 点击图片坐标 (${Math.round(ix)},${Math.round(iy)})`);
+    await page.waitForTimeout(350 + Math.floor(Math.random() * 500));
+  }
+  if (clicked < clicks.length) return false;
+  await page.locator('.geetest_submit').click({ timeout: 8000 }).catch(() => { /* 某些形式无提交键 */ });
+  for (let i = 0; i < 24; i++) {
+    await page.waitForTimeout(500);
+    if (await isCaptchaReady(page)) return true;
+  }
+  return false;
 }
 
 // 从 Playwright cookie 对象数组拼 Cookie 头字符串；只取本站域名、剔除统计类噪音
@@ -316,47 +711,110 @@ async function browserLogin({ host, email, password }) {
       }
     });
 
+    // 监听验证码组件的 /load 响应：captcha_type 决定本次下发哪种验证形式
+    let captchaType = null;
+    page.on('response', async (resp) => {
+      if (resp.url().includes('gcaptcha4.geetest.com/load')) {
+        try {
+          const data = parseGeeLoadBody(await resp.text());
+          dbg('/load 响应:', resp.url().substring(0, 70), '→ captcha_type =', data && data.captcha_type);
+          if (data && data.captcha_type) captchaType = data.captcha_type;
+        } catch (e) {
+          dbg('/load 响应读取失败:', e.message.split('\n')[0]);
+        }
+      }
+    });
+
+    // 记录 /verify 结果：点选失败时给出极验的判定原因，便于排查（行为轨迹/超时等）
+    page.on('response', async (resp) => {
+      if (resp.url().includes('gcaptcha4.geetest.com/verify')) {
+        try {
+          const data = parseGeeLoadBody(await resp.text());
+          dbg('/verify:', JSON.stringify({ result: data && data.result, reason: data && data.reason, fail_count: data && data.fail_count }));
+        } catch (e) {
+          /* 忽略：body 可能已被消费 */
+        }
+      }
+    });
+
     console.log(`  🌐 打开登录页 https://${host}/auth/login ...`);
     await page.goto(`https://${host}/auth/login`, { waitUntil: 'domcontentloaded', timeout: 45000 });
     await page.waitForTimeout(2500);
 
-    // 验证码最多整页重来 2 次（adaptive 高风险时可能弹拼图，重来一次常回到按钮直过）
+    // 验证码处理：按"抽到哪种形式"分支，最多整页重来 MAX_CAPTCHA_ROUNDS 次
+    //   · 一键通过（ai）：点按钮后自行通过，无需解法器（站点配置回退时走这条）；
+    //   · 点选类（word/icon/nine）：需要外部解法器给坐标，没有解法器就直接失败并说明形式。
     let captchaReady = false;
-    for (let attempt = 1; attempt <= 2 && !captchaReady; attempt++) {
+    let failMsg = null;
+    for (let round = 1; round <= MAX_CAPTCHA_ROUNDS && !captchaReady; round++) {
+      if (round > 1) {
+        captchaType = null;
+        await page.reload({ waitUntil: 'domcontentloaded' });
+        await page.waitForTimeout(2500);
+      }
       await page.fill('#email', email);
       await page.fill('#password', password);
       await page.check('#remember-me').catch(() => {});
-      dbg(`第 ${attempt} 次点击验证码按钮`);
+      dbg(`第 ${round}/${MAX_CAPTCHA_ROUNDS} 轮点击验证码按钮`);
 
       const btn = page.locator('.geetest_btn_click');
       if ((await btn.count()) === 0) {
-        dbg('未找到 .geetest_btn_click，等组件加载后重试');
         await page.waitForTimeout(4000);
-        continue;
+        if ((await btn.count()) === 0) {
+          failMsg = '页面未出现验证码按钮（页面结构可能变化）';
+          continue;
+        }
       }
       await btn.first().click({ timeout: 10000 }).catch(async (e) => {
         dbg('常规点击被拦截，改用 force:', e.message.split('\n')[0]);
         await btn.first().click({ force: true, timeout: 10000 });
       });
 
-      // Captcha.isReady()（页面全局）为 true 即验证码通过
-      for (let i = 0; i < 20; i++) {
+      // 1) 先等"一键通过"：isReady 变 true 即成功
+      for (let i = 0; i < 6 && !captchaReady; i++) {
         await page.waitForTimeout(1000);
-        captchaReady = await page.evaluate(() => !!(window.Captcha && window.Captcha.isReady()));
-        if (captchaReady) break;
+        captchaReady = await isCaptchaReady(page);
       }
-      if (!captchaReady) {
-        await shot(page, 'captcha_not_ready');
-        console.log(`  ⚠️ 验证码 ${attempt}/2 次未通过（可能被弹拼图），刷新页面重来...`);
-        await page.reload({ waitUntil: 'domcontentloaded' });
-        await page.waitForTimeout(2500);
+      if (captchaReady) {
+        dbg(`验证码通过（${typeLabel(captchaType)}）`);
+        break;
       }
+
+      // 2) 没直过 → 等点选挑战面板
+      const challenge = await waitClickChallenge(page);
+      dbg('挑战面板:', JSON.stringify({
+        visible: challenge.visible, type: captchaType,
+        natural: challenge.natural, tpl: challenge.tplUrls.length,
+      }));
+      await shot(page, `round${round}_${captchaType || 'unknown'}`);
+      if (!challenge.visible) {
+        failMsg = `验证码未通过，且未识别到点选面板（本次形式 ${typeLabel(captchaType)}）`;
+        continue;
+      }
+      console.log(`  🧩 站点下发点选验证码：${typeLabel(captchaType)}（第 ${round}/${MAX_CAPTCHA_ROUNDS} 次抽取）`);
+      if (SOLVER_CMDS.length === 0) {
+        failMsg = `站点已启用点选类验证码（${typeLabel(captchaType)}），脚本自身不做图形识别：`
+          + '请配置 IKUUU_SOLVER_CMD 外部解法器，或在青龙里用 IKUUU_COOKIE 直填 cookie（见 README）';
+        break;
+      }
+      const solved = await solveChallenge(challenge, captchaType);
+      if (!solved.ok) {
+        failMsg = `解法器未解决验证码: ${solved.msg}`;
+        console.log(`  ⚠️ ${failMsg}`);
+        // 解法器链整体不可用（没配 key / 网关不通 / 认证失败 / 超时）时换题重抽没有意义，
+        // 只会把整轮任务空转几百秒 —— 直接失败并如实报出原因
+        if (solved.unavailable) {
+          console.log('  ⛔ 解法器不可用（非题目本身问题），停止重抽');
+          break;
+        }
+        continue;
+      }
+      captchaReady = await submitClicks(page, challenge, solved.clicks, solved.size);
+      if (!captchaReady) failMsg = `解法器给出的 ${solved.clicks.length} 个点击未被通过`;
     }
     if (!captchaReady) {
-      return {
-        ok: false,
-        msg: 'Geetest 验证码连续 2 轮未通过（风控弹了拼图）。请稍后重试，或用本机浏览器登录一次降低风控',
-      };
+      await shot(page, 'captcha_failed');
+      return { ok: false, msg: failMsg || '验证码未能通过' };
     }
 
     dbg('验证码通过，提交登录');
@@ -709,6 +1167,82 @@ function resultText(result) {
 // ==========================================
 // 5. 主入口
 // ==========================================
+// 单账号完整流程：确认 Cookie → 轮换域名签到 → Cookie 失效则重登一次
+// 返回 { name, result, line, usedHost }
+async function runAccount(acc, targetHosts) {
+  const label = accountLabel(acc);
+  let usedHost = targetHosts[0];
+
+  // ---- 第一步：确定认证 Cookie —— cookie 型直接用；账密型缓存优先，没有则先登录 ----
+  let cookie = acc.cookie || null;
+  if (!cookie && acc.email) {
+    const cached = readCookieCache(acc.email);
+    if (cached) {
+      cookie = cached.cookie;
+      const until = new Date(cached.expireAt).toLocaleString('zh-CN', { hour12: false });
+      console.log(`  📦 命中 Cookie 缓存（服务端 ${until} 到期），跳过登录`);
+    }
+  }
+  if (!cookie && acc.email && acc.password) {
+    console.log('  🔐 无可用 Cookie 缓存，先走浏览器自动登录...');
+    const login = await browserLogin({ host: targetHosts[0], email: acc.email, password: acc.password });
+    if (login.ok) {
+      saveCookieCache(acc.email, login.cookie, targetHosts[0]);
+      cookie = login.cookie;
+    } else {
+      console.log(`  ❌ 自动登录失败: ${login.msg}`);
+      const r = { status: 'login_fail', msg: `自动登录失败: ${login.msg}` };
+      return { name: label, result: r, line: resultText(r), usedHost };
+    }
+  }
+  if (!cookie) {
+    // 理论上到不了：解析层保证账号要么有 cookie 要么有 email+password
+    const r = { status: 'parse_err', msg: '账号缺少认证方式' };
+    return { name: label, result: r, line: resultText(r), usedHost };
+  }
+
+  // ---- 第二步：依次尝试候选域名签到；仅域名/网络类问题才轮换 ----
+  let result = null;
+  let resultHost = null;
+  for (const host of targetHosts) {
+    const r = await checkIn(cookie, host);
+    if (r.status === 'domain_block' || r.status === 'network_err') {
+      console.log(`  ↪ ${host} 返回 ${r.status}（${r.msg}），尝试下一个域名...`);
+      result = r;
+      continue;
+    }
+    usedHost = host;
+    result = r;
+    resultHost = host;
+    break;
+  }
+
+  // ---- 第三步：Cookie 失效且有账密 → 浏览器重登一次（仅一次，防死循环）----
+  // cookie 直填账号没有重登能力，保持 cookie_dead 报告原样透出
+  if (result && result.status === 'cookie_dead' && acc.email && acc.password && resultHost) {
+    console.log('  🔐 Cookie 已失效，尝试账号密码自动登录...');
+    clearCookieCache(acc.email);
+    const login = await browserLogin({ host: resultHost, email: acc.email, password: acc.password });
+    if (login.ok) {
+      saveCookieCache(acc.email, login.cookie, resultHost);
+      usedHost = resultHost;
+      result = await checkIn(login.cookie, resultHost);
+    } else {
+      console.log(`  ❌ 自动登录失败: ${login.msg}`);
+      result = { status: 'login_fail', msg: `自动登录失败: ${login.msg}` };
+    }
+  }
+
+  const line = resultText(result);
+  console.log(`账号 [${label}] 结果: ${line}\n`);
+  return { name: label, result, line, usedHost };
+}
+
+// 值得隔一会儿重跑的状态：登录失败（解法器/网关抖动）与网络异常，都可能"过一会儿就好"
+function isRetryableStatus(status) {
+  return status === 'login_fail' || status === 'network_err';
+}
+
 async function main() {
   console.log('=== iKuuu 青龙自动签到开始 ===\n');
 
@@ -753,85 +1287,32 @@ async function main() {
   let usedHost = targetHosts[0];
 
   for (let i = 0; i < accounts.length; i++) {
-    const acc = accounts[i];
-    const label = accountLabel(acc);
-    console.log(`[${i + 1}/${accounts.length}] 账号 [${label}] 签到中...`);
-
-    // ---- 第一步：确定认证 Cookie —— cookie 型直接用；账密型缓存优先，没有则先登录 ----
-    let cookie = acc.cookie || null;
-    if (!cookie && acc.email) {
-      const cached = readCookieCache(acc.email);
-      if (cached) {
-        cookie = cached.cookie;
-        const until = new Date(cached.expireAt).toLocaleString('zh-CN', { hour12: false });
-        console.log(`  📦 命中 Cookie 缓存（服务端 ${until} 到期），跳过登录`);
-      }
-    }
-    if (!cookie && acc.email && acc.password) {
-      console.log('  🔐 无可用 Cookie 缓存，先走浏览器自动登录...');
-      const login = await browserLogin({ host: targetHosts[0], email: acc.email, password: acc.password });
-      if (login.ok) {
-        saveCookieCache(acc.email, login.cookie, targetHosts[0]);
-        cookie = login.cookie;
-      } else {
-        console.log(`  ❌ 自动登录失败: ${login.msg}`);
-        results.push({
-          name: label,
-          result: { status: 'login_fail', msg: `自动登录失败: ${login.msg}` },
-          line: resultText({ status: 'login_fail', msg: `自动登录失败: ${login.msg}` }),
-        });
-        if (i < accounts.length - 1) await sleep(rand(3000, 8000));
-        continue;
-      }
-    }
-    if (!cookie) {
-      // 理论上到不了：解析层保证账号要么有 cookie 要么有 email+password
-      results.push({ name: label, result: { status: 'parse_err', msg: '账号缺少认证方式' }, line: '⚠️ 账号缺少认证方式' });
-      continue;
-    }
-
-    // ---- 第二步：依次尝试候选域名签到；仅域名/网络类问题才轮换 ----
-    let result = null;
-    let resultHost = null;
-    for (const host of targetHosts) {
-      const r = await checkIn(cookie, host);
-      if (r.status === 'domain_block' || r.status === 'network_err') {
-        console.log(`  ↪ ${host} 返回 ${r.status}（${r.msg}），尝试下一个域名...`);
-        result = r;
-        continue;
-      }
-      usedHost = host;
-      result = r;
-      resultHost = host;
-      break;
-    }
-
-    // ---- 第三步：Cookie 失效且有账密 → 浏览器重登一次（仅一次，防死循环）----
-    // cookie 直填账号没有重登能力，保持 cookie_dead 报告原样透出
-    if (result && result.status === 'cookie_dead' && acc.email && acc.password && resultHost) {
-      console.log('  🔐 Cookie 已失效，尝试账号密码自动登录...');
-      clearCookieCache(acc.email);
-      const login = await browserLogin({ host: resultHost, email: acc.email, password: acc.password });
-      if (login.ok) {
-        saveCookieCache(acc.email, login.cookie, resultHost);
-        usedHost = resultHost;
-        result = await checkIn(login.cookie, resultHost);
-      } else {
-        console.log(`  ❌ 自动登录失败: ${login.msg}`);
-        result = { status: 'login_fail', msg: `自动登录失败: ${login.msg}` };
-      }
-    }
-
-    const line = resultText(result);
-    console.log(`账号 [${label}] 结果: ${line}\n`);
-
-    results.push({ name: label, result, line });
+    console.log(`[${i + 1}/${accounts.length}] 账号 [${accountLabel(accounts[i])}] 签到中...`);
+    const r = await runAccount(accounts[i], targetHosts);
+    results.push({ name: r.name, result: r.result, line: r.line });
+    if (r.usedHost) usedHost = r.usedHost;
 
     // 多账号间随机间隔，降低风控
     if (i < accounts.length - 1) {
       const gap = rand(3000, 8000);
       dbg(`账号间隔 ${gap}ms`);
       await sleep(gap);
+    }
+  }
+
+  // ---- 失败重试：限流/网关抖动这类故障等一会儿往往就好了（默认关闭，见 IKUUU_RETRY_TIMES）----
+  for (let attempt = 1; attempt <= RETRY_TIMES; attempt++) {
+    const retryIdx = results
+      .map((_, i) => i)
+      .filter((i) => isRetryableStatus(results[i].result.status));
+    if (retryIdx.length === 0) break;
+    console.log(`\n⏳ 第 ${attempt}/${RETRY_TIMES} 次重试：${RETRY_DELAY_MS / 1000}s 后重跑 ${retryIdx.length} 个失败账号...`);
+    await sleep(RETRY_DELAY_MS);
+    for (const i of retryIdx) {
+      console.log(`[重试 ${attempt}] 账号 [${results[i].name}] 签到中...`);
+      const r = await runAccount(accounts[i], targetHosts);
+      results[i] = { name: r.name, result: r.result, line: r.line };
+      if (r.usedHost) usedHost = r.usedHost;
     }
   }
 
@@ -873,8 +1354,10 @@ async function main() {
   }
 
   // 全失败才以非0退出（青龙便于识别失败任务红色标记）
+  // 用 exitCode 而非 process.exit：退出时 undici 代理连接可能仍在收尾，
+  // 强行退出会与 libuv 句柄关闭竞态（Windows 下实测触发断言崩溃，且会截断推送）
   if (successCount === 0) {
-    process.exit(1);
+    process.exitCode = 1;
   }
 }
 
@@ -882,6 +1365,16 @@ async function main() {
 module.exports = {
   classify,
   classifyLoginBody,
+  parseGeeLoadBody,
+  imageSize,
+  extractSolverJson,
+  normalizeClicks,
+  solverUnavailable,
+  isRetryableStatus,
+  solverOutputHint,
+  firstErrorLine,
+  typeLabel,
+  CAPTCHA_TYPE_LABEL,
   buildCookieString,
   normalizeAccounts,
   parseCookieAccounts,

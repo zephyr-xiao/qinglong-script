@@ -31,6 +31,9 @@ replied_posts.json
 # 浏览器登录调试截屏（DEBUG 模式产出）
 _ikuuu_debug/
 
+# 点选验证码解法器调试产物（合成图 + 模型原始回复）
+_vlm_debug/
+
 # IDE
 .vscode/
 .idea/
