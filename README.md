@@ -11,7 +11,7 @@
 | New API 站点自动签到 | 多站点 API/Discuz 签到，内置 Liminality 贝之/可萌/哈基米/DZZI.AI 等站点并支持 `QZD_CUSTOM` 自定义站点，凭证 token/Cookie 缓存复用 | [newapi_checkin/README.md](newapi_checkin/README.md) | `task newapi_checkin/newapi_checkin.py` |
 | whos.tv 签到 | Cookie 签到，带接口探测和代理支持 | [whos_tv_checkin/README.md](whos_tv_checkin/README.md) | `task whos_tv_checkin/whos_tv_checkin.py` |
 | SophNet 签到 | www.sophnet.com 福利中心签到，refreshToken 换 accessToken，纯 API 免验证码 | [sophnet_checkin/README.md](sophnet_checkin/README.md) | `task sophnet_checkin/sophnet_checkin.py` |
-| iKuuu 签到（Node.js） | ikuuu 机场签到，账号密码自动登录（Geetest 浏览器过码）+ Cookie 缓存续期 + cookie 直填双模式 + 动态域名 + 多账号 | [wuang-wu_Ikuuu/README.md](wuang-wu_Ikuuu/README.md) | `task wuang-wu_Ikuuu/ikuuu.js` |
+| iKuuu 签到（Node.js） | ikuuu 机场签到，账号密码自动登录（Geetest 点选验证码由视觉大模型解法器过码，支持备用模型/备用解法器链）+ Cookie 缓存续期 + cookie 直填双模式 + 动态域名 + 多账号 + 失败延迟重试 | [wuang-wu_Ikuuu/README.md](wuang-wu_Ikuuu/README.md) | `task wuang-wu_Ikuuu/ikuuu.js` |
 | gpt.qt.cool 签到 | gpt.qt.cool 签到，Playwright + OpenCV 滑动验证码自动识别，登录态 storage_state 缓存复用 | [gptqtcool_checkin/README.md](gptqtcool_checkin/README.md) | `task gptqtcool_checkin/gptqtcool_checkin.py` |
 | 司机社签到 | xsijishe 司机社签到，Cookie 直签或邮箱 + 本地 ddddocr OCR 登录，Cookie 缓存复用 | [xsijishe_checkin/README.md](xsijishe_checkin/README.md) | `task xsijishe_checkin/xsijishe_checkin.py` |
 | 采蘑菇论坛回帖签到 | caimogu.cc 自动回帖刷活跃度，Playwright 驱动 + AI/模板双模式评论生成（反套话词库、REPLY/SKIP 判定、防重复回帖） | [caimogu_checkin/README.md](caimogu_checkin/README.md) | `task caimogu_checkin/caimogu_checkin.py` |

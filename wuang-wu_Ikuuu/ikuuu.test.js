@@ -4,7 +4,8 @@
  * 运行： node --test ikuuu.test.js
  *
  * 覆盖重点：发布页域名提取（ikuuu 用 javascript-obfuscator 把域名拆成
- * 'ikuuu'+'.top' 再拼接，是本次踩坑的核心）+ 响应分类 + 账号解析。
+ * 'ikuuu'+'.top' 再拼接，是本次踩坑的核心）+ 响应分类 + 账号解析
+ * + 点选验证码配套（/load 解析、解法器输出校验、图片尺寸解析）。
  */
 
 const test = require('node:test');
@@ -13,6 +14,16 @@ const assert = require('node:assert');
 const {
   classify,
   classifyLoginBody,
+  parseGeeLoadBody,
+  imageSize,
+  extractSolverJson,
+  normalizeClicks,
+  solverUnavailable,
+  isRetryableStatus,
+  solverOutputHint,
+  firstErrorLine,
+  typeLabel,
+  CAPTCHA_TYPE_LABEL,
   buildCookieString,
   normalizeAccounts,
   parseCookieAccounts,
@@ -30,6 +41,8 @@ const {
   PUBLISH_HOSTS,
   FALLBACK_HOSTS,
 } = require('./ikuuu');
+// 视觉解法器的纯函数（脚本被 require 时不会跑主流程）
+const { parseModelReply, wantedCount, buildPrompt, computeMaxTokens } = require('./solver_vlm');
 
 // 模拟发布页：域名被拆成多段字符串字面量后拼接（取自 ikuuu.win 真实页面结构）
 const OBFUSCATED_PAGE = [
@@ -300,4 +313,177 @@ test('buildCookieString: 只取本站 cookie 并剔除统计噪音', () => {
   const str = buildCookieString(cookies, 'ikuuu.top');
   assert.strictEqual(str, 'uid=1234567; email=a%40b.com; key=k');
   assert.strictEqual(buildCookieString([], 'ikuuu.top'), '');
+});
+
+// ==========================================
+// 点选验证码配套（/load 解析、解法器输出校验、图片尺寸）
+// ==========================================
+
+test('parseGeeLoadBody: JSONP 与纯 JSON 两种响应体都能解析出 data', () => {
+  const jsonp = 'geetest_1791516170996({"status": "success", "data": {"lot_number":"abc", "captcha_type":"word",'
+    + ' "ques":["static_resources/word/a.png"]}});';
+  const d1 = parseGeeLoadBody(jsonp);
+  assert.strictEqual(d1.captcha_type, 'word');
+  assert.strictEqual(d1.lot_number, 'abc');
+
+  const plain = JSON.stringify({ status: 'success', data: { captcha_type: 'icon' } });
+  assert.strictEqual(parseGeeLoadBody(plain).captcha_type, 'icon');
+
+  // 没有 data 包裹时按顶层对象返回
+  assert.strictEqual(parseGeeLoadBody('{"captcha_type":"nine"}').captcha_type, 'nine');
+});
+
+test('parseGeeLoadBody: 空串/非 JSON 返回 null', () => {
+  assert.strictEqual(parseGeeLoadBody(''), null);
+  assert.strictEqual(parseGeeLoadBody(undefined), null);
+  assert.strictEqual(parseGeeLoadBody('<html>error</html>'), null);
+});
+
+test('typeLabel: 已知形式给中文名，未知/空值不抛异常', () => {
+  assert.match(typeLabel('word'), /文字点选/);
+  assert.match(typeLabel('icon'), /图标点选/);
+  assert.match(typeLabel('nine'), /九宫格点选/);
+  assert.match(typeLabel('ai'), /一键通过/);
+  assert.strictEqual(typeLabel('brandnew'), 'brandnew');
+  assert.strictEqual(typeLabel(null), '未知形式');
+  assert.ok(Object.keys(CAPTCHA_TYPE_LABEL).includes('word'));
+});
+
+test('imageSize: 解析 PNG 与 JPEG 尺寸', () => {
+  // PNG：8 字节签名 + IHDR（宽高为大端 uint32，偏移 16/20）
+  const png = Buffer.alloc(32);
+  Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]).copy(png, 0);
+  png.writeUInt32BE(300, 16);
+  png.writeUInt32BE(200, 20);
+  assert.deepStrictEqual(imageSize(png), { w: 300, h: 200 });
+
+  // JPEG：SOI + APP0 + SOF0（高/宽为 uint16，位于段内偏移 5/7）
+  const sof = Buffer.from([0xff, 0xc0, 0x00, 0x11, 0x08, 0x00, 0xc8, 0x01, 0x2c, 0x03, 0x01, 0x11, 0x00, 0x02, 0x11, 0x01, 0x03, 0x11, 0x01]);
+  const jpg = Buffer.concat([Buffer.from([0xff, 0xd8]), Buffer.from([0xff, 0xe0, 0x00, 0x04, 0x00, 0x00]), sof, Buffer.from([0xff, 0xd9])]);
+  assert.deepStrictEqual(imageSize(jpg), { w: 300, h: 200 });
+
+  assert.strictEqual(imageSize(Buffer.from('not an image at all')), null);
+  assert.strictEqual(imageSize(null), null);
+});
+
+test('extractSolverJson: 允许解法器 stdout 前后夹带日志行', () => {
+  assert.deepStrictEqual(extractSolverJson('{"ok":true,"clicks":[[1,2]]}'), { ok: true, clicks: [[1, 2]] });
+  assert.deepStrictEqual(
+    extractSolverJson('[solver] loading model...\n{"ok":true,"clicks":[[10,20],[30,40]]}\n[solver] done\n'),
+    { ok: true, clicks: [[10, 20], [30, 40]] },
+  );
+  assert.deepStrictEqual(extractSolverJson('{"ok":false,"msg":"模型缺失"}'), { ok: false, msg: '模型缺失' });
+  assert.strictEqual(extractSolverJson('no json here'), null);
+  assert.strictEqual(extractSolverJson('{ broken json '), null);
+  assert.strictEqual(extractSolverJson(''), null);
+});
+
+test('normalizeClicks: 过滤非法坐标，越界点位丢弃', () => {
+  const size = { w: 300, h: 200 };
+  const got = normalizeClicks([[10, 20], [299, 199], [301, 100], [-1, 5], ['50', '60'], [1, 2, 3], null, 'x'], size);
+  assert.deepStrictEqual(got, [[10, 20], [299, 199], [50, 60]]);
+  assert.deepStrictEqual(normalizeClicks('not-array', size), []);
+  assert.deepStrictEqual(normalizeClicks([], size), []);
+});
+
+test('solverUnavailable: 区分"解法器不可用"与"内容类失败"', () => {  // 不可用：重抽没意义，应当直接失败
+  assert.strictEqual(solverUnavailable('视觉模型解法失败: HTTP 401: {"error":{"message":"无效的令牌"}}'), true);
+  assert.strictEqual(solverUnavailable('视觉模型解法失败: HTTP 429: inference exceeds tpm/rpm limit'), true);
+  assert.strictEqual(solverUnavailable('视觉模型解法失败: HTTP 400: field MaxTokens invalid, should be in [1, 65536]'), true);
+  assert.strictEqual(solverUnavailable('视觉模型解法失败: HTTP 503: upstream unavailable'), true);
+  assert.strictEqual(solverUnavailable('未配置 IKUUU_VLM_API_KEY'), true);
+  assert.strictEqual(solverUnavailable('解法器无法启动: spawn node ENOENT'), true);
+  assert.strictEqual(solverUnavailable('解法器超时（180s）'), true);
+  assert.strictEqual(solverUnavailable('视觉模型解法失败: fetch failed'), true);
+  // 内容类：值得换个抽取再试
+  assert.strictEqual(solverUnavailable('视觉模型解法失败: 模型无正文输出（finish_reason=length，可能 token 不足）'), false);
+  assert.strictEqual(solverUnavailable('各次调用结果分歧过大（最大偏差 40px）'), false);
+  assert.strictEqual(solverUnavailable('各次调用给出的点数不一致（1/3）'), false);
+  assert.strictEqual(solverUnavailable('模型输出无法解析为 JSON: ```json {"clicks": [[1,2]]```'), false);
+  assert.strictEqual(solverUnavailable(''), false);
+  assert.strictEqual(solverUnavailable(undefined), false);
+});
+
+test('isRetryableStatus: 只重试"可能过一会儿就好"的失败', () => {
+  assert.strictEqual(isRetryableStatus('login_fail'), true);   // 解法器/网关抖动
+  assert.strictEqual(isRetryableStatus('network_err'), true);  // 网络异常
+  // 这些重跑一遍没用：密码错、2FA、域名异常、响应解析不了、已成功
+  assert.strictEqual(isRetryableStatus('success'), false);
+  assert.strictEqual(isRetryableStatus('already'), false);
+  assert.strictEqual(isRetryableStatus('cookie_dead'), false);
+  assert.strictEqual(isRetryableStatus('domain_block'), false);
+  assert.strictEqual(isRetryableStatus('parse_err'), false);
+});
+
+test('solverOutputHint / firstErrorLine: 把 Node 堆栈变成人话提示', () => {  // 实测踩过的坑：IKUUU_SOLVER_CMD 写成 wuang-wu_Ikuuu/solver.js → 文件名/路径双错
+  const raw = 'node:internal/modules/cjs/loader:1210\n  throw err;\n  ^\n'
+    + "Error: Cannot find module '/ql/data/scripts/wuang-wu_Ikuuu/wuang-wu_Ikuuu/solver.js'\n    at Module._resolveFilename";
+  assert.match(solverOutputHint(raw), /文件名是 solver_vlm\.js/);
+  assert.strictEqual(firstErrorLine(raw), "Error: Cannot find module '/ql/data/scripts/wuang-wu_Ikuuu/wuang-wu_Ikuuu/solver.js'");
+
+  assert.match(solverOutputHint('sh: node: command not found'), /可执行程序不存在/);
+  assert.match(solverOutputHint('{"ok":false,"msg":"未配置 IKUUU_VLM_API_KEY"}'), /IKUUU_VLM_BASE_URL/);
+  assert.strictEqual(solverOutputHint('普通输出'), '');
+});
+
+// ==========================================
+// 视觉解法器 solver_vlm.js 的纯函数
+// ==========================================
+
+test('parseModelReply: 正常 / 从思考里捞回 / 截断 / 无法解析', () => {  const mk = (message, finish) => ({ choices: [{ message, finish_reason: finish }] });
+  // 正常：正文里有 JSON
+  assert.deepStrictEqual(
+    parseModelReply(mk({ content: '{"clicks":[[1,2],[3,4]]}' }, 'stop')).data,
+    { clicks: [[1, 2], [3, 4]] },
+  );
+  // 正文空、思考里写了答案 → 捞回来（推理模型常见的"结论在 reasoning 里"）
+  const salvaged = parseModelReply(mk({ content: '', reasoning: '看图…\n{"clicks":[[10,20],[30,40]]}' }, 'length'));
+  assert.strictEqual(salvaged.ok, true);
+  assert.strictEqual(salvaged.salvaged, true);
+  assert.deepStrictEqual(salvaged.data.clicks, [[10, 20], [30, 40]]);
+  // 正文空、思考里也没有答案 → 标记 truncated（上层按双倍 token 上限 + 强制指令重试一次）
+  const cut = parseModelReply(mk({ content: '', reasoning: '还在推理…' }, 'length'));
+  assert.strictEqual(cut.ok, false);
+  assert.strictEqual(cut.truncated, true);
+  // 正文有内容但不是 JSON → 不是截断，交给换题重抽
+  const bad = parseModelReply(mk({ content: '这张图我看不清' }, 'stop'));
+  assert.strictEqual(bad.ok, false);
+  assert.strictEqual(bad.truncated, false);
+  // 空响应不抛异常
+  assert.strictEqual(parseModelReply(null).ok, false);
+  assert.strictEqual(parseModelReply({}).ok, false);
+});
+
+test('computeMaxTokens: token 上限按倍数放大但夹在网关上限内', () => {
+  // 实测新 API 类网关上限 65536（100000 会被判非法），故夹到 60000
+  assert.strictEqual(computeMaxTokens(50000, 1), 50000);
+  assert.strictEqual(computeMaxTokens(50000, 2), 60000);   // 双倍重试不会撞上限
+  assert.strictEqual(computeMaxTokens(12000, 2), 24000);   // 未触顶时正常放大
+  assert.strictEqual(computeMaxTokens(500, 1), 1000);      // 兜底下限
+  assert.strictEqual(computeMaxTokens(12000, 0), 12000);   // 倍数不低于 1
+});
+
+test('wantedCount: 从提示语里取"要选几个"', () => {
+  assert.strictEqual(wantedCount('选 3 个符合右图的图片'), 3);
+  assert.strictEqual(wantedCount('请选出2个相同的'), 2);
+  assert.strictEqual(wantedCount('请在下图依次点击'), 0);   // 没有数量要求
+  assert.strictEqual(wantedCount(''), 0);
+  assert.strictEqual(wantedCount(undefined), 0);
+});
+
+test('buildPrompt: 按形式与提示语生成提示词', () => {
+  const nine = buildPrompt('nine', 1, { w: 300, h: 261 }, '选 3 个符合右图的图片');
+  assert.match(nine, /3×3 九个格子/);
+  assert.match(nine, /\*\*3 个\*\*/);           // 数量取自站点提示语
+  assert.match(nine, /"cells"/);                 // 逐格枚举（提升定位准确率）
+  assert.match(nine, /选 3 个符合右图的图片/);    // 提示语原文透传
+
+  const word = buildPrompt('word', 3, { w: 300, h: 200 }, '请在下图依次点击');
+  assert.match(word, /\[1\]\[2\]\[3\]/);          // 三个待点图案按序
+  assert.match(word, /第 1 步/);                  // 先枚举
+  assert.match(word, /"clicks"/);
+  assert.match(word, /300 像素、高 200 像素/);     // 坐标系说明与 imageSize 一致
+
+  const icon = buildPrompt('icon', 3, { w: 300, h: 200 }, '');
+  assert.match(icon, /线条图形/);                 // icon 形状描述
 });
