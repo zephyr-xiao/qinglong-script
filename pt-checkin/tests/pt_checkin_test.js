@@ -11,6 +11,10 @@ const {
   parseNovahdAttendance,
   parseHdareaAttendance,
   mergeCookies,
+  judgeLoginSuccess,
+  judgeNovahdSign,
+  judgeBtschoolIndex,
+  credentialFingerprint,
 } = require('../pt_checkin.js');
 
 let passed = 0;
@@ -113,6 +117,86 @@ test('parseHdareaAttendance 签到响应', () => {
   assert.strictEqual(info.hasSignSuccess, true);
   assert.strictEqual(info.reward, '10魔力值');
   assert.strictEqual(info.continuousDays, '5');
+});
+
+// ----------------------------------------
+// 正向证据制回归（复现三处「假成功」）
+// ----------------------------------------
+
+// 假成功点 1：登录把裸 302 当成功（NexusPHP 验证码错误时常 302 回 login.php）
+test('登录判定：302 回登录页不算成功', () => {
+  assert.strictEqual(
+    judgeLoginSuccess({ location: 'login.php?returnto=index.php', cookie: 'sid=abc', text: '' }),
+    false
+  );
+});
+test('登录判定：302 无 Location 不算成功', () => {
+  assert.strictEqual(judgeLoginSuccess({ location: '', cookie: 'sid=abc', text: '' }), false);
+});
+test('登录判定：302 跳离登录页算成功', () => {
+  assert.strictEqual(judgeLoginSuccess({ location: 'index.php', cookie: 'sid=abc', text: '' }), true);
+});
+test('登录判定：下发登录态 Cookie（uid / c_secure_pass）算成功', () => {
+  assert.strictEqual(judgeLoginSuccess({ location: '', cookie: 'uid=12345; pass=x', text: '' }), true);
+  assert.strictEqual(judgeLoginSuccess({ location: '', cookie: 'c_secure_pass=deadbeef', text: '' }), true);
+});
+test('登录判定：pageSaysOk 需显式开启且正文不含 login.php', () => {
+  assert.strictEqual(
+    judgeLoginSuccess({ location: '', cookie: 'sid=abc', text: '<a href="index.php">首页</a>' }),
+    false
+  );
+  assert.strictEqual(
+    judgeLoginSuccess({ location: '', cookie: 'sid=abc', text: '<a href="index.php">首页</a>', allowPageSaysOk: true }),
+    true
+  );
+  assert.strictEqual(
+    judgeLoginSuccess({ location: '', cookie: 'sid=abc', text: '<form action="login.php">', allowPageSaysOk: true }),
+    false
+  );
+});
+
+// 假成功点 2：验证码错时未签页含「N 个魔力值」规则文案，旧逻辑凭 reward 正则误判成功
+const NOVAHD_UNSIGNED_HTML = `
+<form method="post" action="attendance.php">
+<input type="hidden" name="imagehash" value="0123456789abcdef0123456789abcdef">
+<input type="text" name="imagestring" value="">
+</form>
+<p>签到规则：每天签到可得 5 个魔力值，连续签到 7 天可额外获得 100 个魔力值。</p>`;
+test('NovaHD 未签页含规则文案不判成功（strongSuccess 为假）', () => {
+  const info = parseNovahdAttendance(NOVAHD_UNSIGNED_HTML);
+  assert.strictEqual(info.strongSuccess, false);
+  assert.strictEqual(judgeNovahdSign(NOVAHD_UNSIGNED_HTML), 'unknown');
+});
+test('NovaHD 签到响应「图片代码无效」优先判失败', () => {
+  assert.strictEqual(judgeNovahdSign(`${NOVAHD_UNSIGNED_HTML}<p>图片代码无效！</p>`), 'captcha_err');
+});
+test('NovaHD 明确成功文案才判成功', () => {
+  assert.strictEqual(
+    judgeNovahdSign('签到成功！本次签到获得 <b>50</b> 个魔力值，已连续签到 <b>3</b> 天'),
+    'success'
+  );
+});
+
+// 假成功点 3：BTSchool 首页加载异常/维护页无「每日签到」入口，旧逻辑直接算已签
+test('BTSchool 首页有签到入口=未签', () => {
+  assert.strictEqual(judgeBtschoolIndex('<a href="index.php?action=addbonus">每日签到</a>'), 'unsigned');
+});
+test('BTSchool 无入口但为正常首页=已签', () => {
+  assert.strictEqual(judgeBtschoolIndex('<a href="logout.php">退出</a> 魔力值：100'), 'already');
+});
+test('BTSchool 无入口且非正常首页=结果未知（不冒报已签）', () => {
+  assert.strictEqual(judgeBtschoolIndex('<html><body>502 Bad Gateway</body></html>'), 'unknown');
+});
+
+// 缓存来源指纹：种子/账号变化即失效
+test('credentialFingerprint 随种子变化且稳定', () => {
+  process.env.PT_FP_TEST_CK = 'seedA';
+  const a = credentialFingerprint('PT_FP_TEST_CK', 'user1');
+  assert.strictEqual(a, credentialFingerprint('PT_FP_TEST_CK', 'user1'));
+  process.env.PT_FP_TEST_CK = 'seedB';
+  assert.notStrictEqual(a, credentialFingerprint('PT_FP_TEST_CK', 'user1'));
+  delete process.env.PT_FP_TEST_CK;
+  assert.strictEqual(credentialFingerprint('PT_FP_TEST_CK', ''), '');
 });
 
 console.log(`\n${passed} 个用例全部通过`);
