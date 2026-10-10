@@ -22,8 +22,9 @@ cron: 15 8 * * *
 站点：https://whos.tv/        签到页：https://whos.tv/points-center/tasks
 
 环境变量：
-  WHOSTV_COOKIE   完整 Cookie 字符串；多账号用 & 分隔
-  WHOSTV_ACCOUNT  账号密码，格式 用户名#密码；多账号用 & 分隔
+  WHOSTV_COOKIE   完整 Cookie 字符串；多账号用 & 或换行分隔
+                   （其中 cf_clearance / __cf* 会被忽略，保留浏览器会话里的新鲜值）
+  WHOSTV_ACCOUNT  账号密码，格式 用户名#密码；多账号用 & 或换行分隔
                   例：user1@mail.com#pass1&user2#pass2
   WHOSTV_PROXY    HTTP/SOCKS 代理；whos.tv 在大陆网络被屏蔽，建议走代理
                    例：http://172.17.0.1:7890   或   socks5://172.17.0.1:7891
@@ -31,12 +32,22 @@ cron: 15 8 * * *
   WHOSTV_NOTIFY   true/false，默认 true，是否调用青龙 notify.py 推送
   WHOSTV_NOTIFY_ONLY_FAIL  true/false，默认 false，仅当存在失败时才推送
                    （需 WHOSTV_NOTIFY=true 时生效，全部成功则静默）
-  WHOSTV_TIMEOUT  HTTP 超时秒数，默认 30（fetch 请求）
+  WHOSTV_TIMEOUT  HTTP 超时秒数，默认 30（fetch 请求），最小 1
   WHOSTV_BROWSER_PATH  可选，指定 chromium 可执行文件路径（默认自动探测）
+  WHOSTV_BROWSER_WAIT  浏览器启动等待上限秒数，默认 180，最小 10
+  WHOSTV_BROWSER_PORT  浏览器调试端口，默认 9222（同时决定运行锁与 profile 目录）
+  WHOSTV_CHALLENGE_ROUNDS  Cloudflare 挑战总轮数，默认 4，最小 1
+                   （出口 IP 信誉波动时 CF 放行是概率性的，多轮抽签比单轮死等更有效；
+                     总耗时上限随之变化，见 README「耗时预期」）
   WHOSTV_DEBUG    true 时输出探测细节（试过哪些路径、状态码、响应片段）
 
 两种认证方式可同时使用，也可单独使用。Cookie 优先执行，账号登录随后执行。
 若两者都不配置则脚本退出。
+
+退出码：全部账号成功为 0，任一账号失败为 1（便于外部监控区分部分失败）。
+
+并发保护：同一调试端口（即同一 profile 目录）同时只允许一个实例运行，
+第二个实例会因抢不到运行锁而退出，避免两个任务互相劫持同一个浏览器。
 
 作者: zephyr_xiao
 """
@@ -52,8 +63,8 @@ import sys
 import tempfile
 import time
 import traceback
-import urllib.request
 from datetime import datetime
+from urllib.parse import urlsplit
 
 # 强制 stdout/stderr 使用 UTF-8，避免 Windows 控制台 GBK 报错
 try:
@@ -115,11 +126,49 @@ LOGIN_URL = f"{HOME}/api/login"
 
 # Cloudflare 挑战单轮最长等待秒数（实测通过时间约 5~150 秒，波动较大）
 CF_CHALLENGE_TIMEOUT = 180
-# 挑战未通过时的额外轮数。出口 IP 信誉波动时 CF 放行是概率性的（同环境
-# 实测通过率约 1/3 且随机），多轮 + 轮间隔抽签比单轮死等通过率高得多
-CF_CHALLENGE_RETRY = 3
+# 挑战总轮数默认值。出口 IP 信誉波动时 CF 放行是概率性的（同环境实测通过率
+# 约 1/3 且随机），多轮 + 轮间隔抽签比单轮死等通过率高得多。
+# 可用 WHOSTV_CHALLENGE_ROUNDS 覆盖，总耗时上限随之变化（见 README「耗时预期」）。
+CF_CHALLENGE_ROUNDS_DEFAULT = 4
 # 轮间隔秒数：刷新页面重新触发挑战，给 CF 风控窗口滑动的时间
 CF_CHALLENGE_ROUND_DELAY = 20
+
+# 挑战页 / 硬拦截页的特征串。必须区分这两类：
+#   - 挑战进行中：还会自动通过，继续等即可；
+#   - 硬拦截（Access denied / blocked）：换 IP 才有用，重试纯属浪费。
+# 注意不要用 "challenge-platform" 当判据——Cloudflare 在**正常页面**里也会
+# 注入该脚本，拿它判断会误伤真实页面。
+CF_CHALLENGE_TITLE_MARKERS = ("请稍候", "Just a moment", "正在验证")
+CF_CHALLENGE_BODY_MARKERS = (
+    "challenge-running",
+    "challenge-stage",
+    "cf-challenge-running",
+    "Enable JavaScript and cookies to continue",
+    "Verifying you are human",
+    "正在验证您是否是真人",
+    "正在检查您的浏览器",
+)
+CF_BLOCK_TITLE_MARKERS = (
+    "Attention Required",
+    "Error 1020",
+    "Access denied",
+    "Sorry, you have been blocked",
+)
+# 内容里的硬拦截特征：只取 CF 专有措辞，避免误伤正文恰好含 "Access denied" 的真实页面
+CF_BLOCK_BODY_MARKERS = (
+    "cf-error-details",
+    "Error 1020",
+    "Sorry, you have been blocked",
+    "you have been blocked",
+    "Attention Required",
+)
+
+# 运行锁：同一 profile 目录（按端口隔离）同时只允许一个实例。
+# 残留判定以 pid 存活为主（崩溃留下的锁能立刻被接管），时间戳只是兜底：
+# pid 被别的进程复用时靠它兜住，所以取值要明显大于最坏运行时长
+# （4 轮挑战 + 多账号签到，实测最坏约 45 分钟），避免把正在跑的实例误判成残留。
+LOCK_FILENAME = ".whostv_run.lock"
+LOCK_STALE_SECONDS = 120 * 60
 
 # 网络级失败（超时/断网，拿不到任何 HTTP 响应）的自动重试次数与间隔。
 # 仅网络层失败才重试；服务器已有响应（含 4xx/5xx）属业务结果，重试无意义
@@ -176,11 +225,45 @@ def env_bool(name: str, default: bool) -> bool:
     return v.strip().lower() in ("1", "true", "yes", "y", "on")
 
 
-def env_int(name: str, default: int) -> int:
+def env_int(name: str, default: int, minimum: int = None) -> int:
+    """
+    读取整型环境变量。取值非法或小于 minimum 时回退默认值并告警，
+    避免 WHOSTV_TIMEOUT=0 这类配置让请求变成"立即超时"。
+    """
     try:
-        return int(os.getenv(name) or default)
+        value = int(os.getenv(name) or default)
     except Exception:
         return default
+    if minimum is not None and value < minimum:
+        print(f"⚠️ {name}={value} 小于允许下限 {minimum}，回退默认值 {default}")
+        return default
+    return value
+
+
+def split_env_list(value: str) -> list:
+    """按 & 或换行切分多账号配置（Cookie 与账号密码两种模式共用同一套分隔符）。"""
+    if not value:
+        return []
+    return [part.strip() for part in re.split(r"[&\n]+", value) if part.strip()]
+
+
+def mask_proxy(proxy: str) -> str:
+    """代理地址脱敏：隐藏 user:pass@ 里的密码，避免带凭据的代理泄漏进日志。"""
+    return re.sub(r"(://[^:/@]+:)[^@]*(@)", r"\1***\2", proxy or "")
+
+
+def redact_secrets(text: str) -> str:
+    """
+    把 JSON 里疑似令牌/会话字段的值打码，避免 debug 日志泄漏凭据。
+    只做字符串替换，不做结构解析——响应可能是半截 JSON 或被截断。
+    """
+    if not text:
+        return text
+    return re.sub(
+        r'(?i)("(?:[^"]*(?:token|session|sid|auth|secret|password|cookie)[^"]*)"\s*:\s*")([^"]{4,})(")',
+        lambda m: m.group(1) + "***" + m.group(3),
+        text,
+    )
 
 
 # 青龙面板「配置文件 / 环境变量」里配置的全局代理变量
@@ -196,8 +279,8 @@ def resolve_proxy(*specific_keys: str) -> tuple:
     解析代理地址，返回 (代理地址, 来源变量名)，两者均可能为空字符串。
 
     优先级：脚本专属变量 > 青龙全局代理变量 > 空（直连）。
-    Patchright 的 launch 参数不会读取环境变量，浏览器链路必须在这里显式取值；
-    HTTP 链路走 urllib，其 ProxyHandler 本身就会读环境变量，无需干预。
+    站点的所有请求都走浏览器会话内的 fetch，而 Patchright 的 launch 参数
+    不会读取环境变量，因此浏览器链路必须在这里显式取值。
     """
     for name in (*specific_keys, *GLOBAL_PROXY_KEYS):
         value = (os.getenv(name) or "").strip()
@@ -216,6 +299,17 @@ def parse_cookie_str(s: str) -> dict:
         k, v = part.split("=", 1)
         jar[k.strip()] = v.strip()
     return jar
+
+
+def _is_cf_cookie(name: str) -> bool:
+    """
+    是否是 Cloudflare 自己维护的 cookie（cf_clearance / __cf_bm / cf_chl_* 等）。
+
+    这类值由当前浏览器会话自己持有：用户从别处复制来的旧值写回去只会覆盖掉
+    会话里刚拿到的新鲜值，反而重新触发挑战，因此注入业务 Cookie 时一律剔除。
+    """
+    n = (name or "").lower()
+    return n == "cf_clearance" or n.startswith("cf_") or n.startswith("__cf")
 
 
 def parse_credentials(env_value: str) -> list:
@@ -242,7 +336,8 @@ def mask(s: str) -> str:
     if "@" in s:
         head, tail = s.split("@", 1)
         if len(head) <= 2:
-            return head[0] + "*@" + tail
+            # head 可能为空（服务端返回 "@domain" 这类畸形显示名），不能直接取下标
+            return (head[:1] or "") + "*@" + tail
         return head[:2] + "*" * (len(head) - 2) + "@" + tail
     if len(s) <= 2:
         return s[0] + "*"
@@ -289,6 +384,53 @@ def looks_like_login_page(html: str) -> bool:
         if kw.lower() in lowered:
             hits += 1
     return hits >= 1
+
+
+def looks_like_cf_page(text: str) -> bool:
+    """
+    响应体是否是 Cloudflare 的挑战页/拦截页（而不是站点业务响应）。
+
+    只在"看起来像 HTML"时才判定，避免把正常 JSON 业务响应误判成 CF 页。
+    用途：签到过程中撞上 CF 页时，要报"挑战失效需重跑"，而不是让兜底探测
+    白跑十几个候选接口后报成"站点可能改版"。
+    """
+    if not text:
+        return False
+    head = text[:8000]
+    low = head.lower()
+    if "<html" not in low and "<!doctype" not in low:
+        return False
+    return any(
+        m.lower() in low for m in CF_CHALLENGE_BODY_MARKERS + CF_BLOCK_BODY_MARKERS
+    )
+
+
+def classify_challenge_state(title: str, html: str) -> str:
+    """
+    根据页面标题与内容判定 Cloudflare 状态，返回 'ok' / 'challenge' / 'blocked'。
+
+    判据必须是双向的：标题不是挑战标题**且**页面内容也不含 CF 特征才算通过。
+    只看标题会把 "Attention Required! | Cloudflare" 这类硬拦截页判成"挑战通过"，
+    于是多轮抽签重试整体失效，失败被后移成一句莫名其妙的 403。
+    """
+    title = title or ""
+    for m in CF_CHALLENGE_TITLE_MARKERS:
+        if m in title:
+            return "challenge"
+    for m in CF_BLOCK_TITLE_MARKERS:
+        if m in title:
+            return "blocked"
+    if not title:
+        # 标题还没出来，视同仍在加载/挑战中，继续等
+        return "challenge"
+    low = (html or "")[:8000].lower()
+    for m in CF_CHALLENGE_BODY_MARKERS:
+        if m.lower() in low:
+            return "challenge"
+    for m in CF_BLOCK_BODY_MARKERS:
+        if m.lower() in low:
+            return "blocked"
+    return "ok"
 
 
 def extract_api_candidates(text: str) -> list:
@@ -339,18 +481,41 @@ def _find_chromium(browser_path: str) -> str:
     return ""
 
 
+def parse_proxy_addr(proxy: str):
+    """
+    从代理地址里取出 (host, port)，解析不出返回 None。
+
+    用 urlsplit 而不是正则：正则方案对 socks5://（scheme 含数字）、
+    带凭据的 http://user:pass@host:port、IPv6 字面量都解析失败，于是最需要
+    诊断的"代理不通"场景反而静默跳过探测。省略 scheme 的 172.17.0.1:7890 也支持。
+    """
+    if not proxy:
+        return None
+    raw = proxy.strip()
+    if "://" not in raw:
+        raw = "//" + raw
+    try:
+        parts = urlsplit(raw)
+        host, port = parts.hostname, parts.port
+    except ValueError:
+        return None
+    if not host or not port:
+        return None
+    return host, int(port)
+
+
 def _probe_proxy(proxy: str) -> None:
     """TCP 探测代理 host:port 在容器内是否可达（DNS 波动 / 网络隔离一测便知）。"""
-    m = re.match(r"^[a-zA-Z]+://([^:/\\]+):(\d+)", proxy.strip())
-    if not m:
-        print(f"  代理地址解析失败，跳过连通性探测: {proxy}")
+    addr = parse_proxy_addr(proxy)
+    if not addr:
+        print(f"  代理地址无法解析出 host:port，跳过连通性探测: {mask_proxy(proxy)}")
         return
-    host, port = m.group(1), int(m.group(2))
+    host, port = addr
     try:
         with socket.create_connection((host, port), timeout=3):
-            print(f"  代理 {proxy} 可达（TCP 连通）")
+            print(f"  代理 {mask_proxy(proxy)} 可达（TCP 连通）")
     except OSError as e:
-        print(f"  ❌ 代理 {proxy} 不可达: {e}")
+        print(f"  ❌ 代理 {mask_proxy(proxy)} 不可达: {e}")
 
 
 def diagnose_browser_env(proxy: str = "") -> None:
@@ -454,11 +619,59 @@ def diagnose_browser_env(proxy: str = "") -> None:
         _probe_proxy(proxy)
 
 
+def _dechunk(body: bytes) -> bytes:
+    """解开 HTTP/1.1 chunked 传输编码（DevTools 端点一般带 Content-Length，这里只作兜底）。"""
+    out, pos = [], 0
+    while pos < len(body):
+        line_end = body.find(b"\r\n", pos)
+        if line_end < 0:
+            break
+        try:
+            size = int(body[pos:line_end].split(b";")[0].strip() or b"0", 16)
+        except ValueError:
+            break
+        if size <= 0:
+            break
+        start = line_end + 2
+        out.append(body[start:start + size])
+        pos = start + size + 2
+    return b"".join(out)
+
+
 def _http_json(port: int, path: str = "/json", timeout: float = 2) -> object:
-    """GET http://127.0.0.1:port/path 并解析 JSON；失败返回 None。"""
+    """
+    GET http://127.0.0.1:port/path 并解析 JSON；失败返回 None。
+
+    刻意用裸 socket 而不是 urllib：urllib 会读取环境里的 HTTP_PROXY/ALL_PROXY，
+    把发往 127.0.0.1 的调试端口请求也交给代理（实测配了 HTTP_PROXY 后
+    proxy_bypass('127.0.0.1') 返回 False），青龙里配了全局代理时探测必然失败，
+    继而把残留浏览器实例误判成"端口被其他进程占用"。裸 socket 不受环境变量影响。
+    """
     try:
-        with urllib.request.urlopen(f"http://127.0.0.1:{port}{path}", timeout=timeout) as r:
-            return json.loads(r.read().decode("utf-8", errors="replace"))
+        with socket.create_connection(("127.0.0.1", port), timeout=timeout) as sock:
+            sock.settimeout(timeout)
+            sock.sendall(
+                f"GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n"
+                "Accept: application/json\r\nConnection: close\r\n\r\n".encode("ascii")
+            )
+            chunks = []
+            while True:
+                try:
+                    buf = sock.recv(65536)
+                except (socket.timeout, OSError):
+                    break
+                if not buf:
+                    break
+                chunks.append(buf)
+    except OSError:
+        return None
+    head, sep, body = b"".join(chunks).partition(b"\r\n\r\n")
+    if not sep:
+        return None
+    if b"chunked" in head.lower():
+        body = _dechunk(body)
+    try:
+        return json.loads(body.decode("utf-8", errors="replace"))
     except Exception:
         return None
 
@@ -478,6 +691,121 @@ def port_in_use(port: int, timeout: float = 1) -> bool:
             return True
     except OSError:
         return False
+
+
+def profile_dir_for(port: int) -> str:
+    """
+    该调试端口对应的 profile 目录（同时作为运行锁的落点）。
+
+    必须是规范化的临时路径：不能写死 "/tmp/..."——Windows 上 Chrome 收到
+    字面量混合斜杠路径时 ProcessSingleton 判定异常，会把启动请求转交给
+    "现有的浏览器会话"后立即退出（返回码 0、调试端口永不监听）。
+    """
+    return os.path.abspath(
+        os.path.join(tempfile.gettempdir(), "whostv_profile", str(port))
+    )
+
+
+def _pid_alive(pid: int) -> bool:
+    """
+    判断进程是否还活着（用于识别残留锁）。
+
+    不能用 os.kill(pid, 0)：Windows 上 os.kill 的 sig 参数会直接传给
+    TerminateProcess，sig=0 会把那个进程真的杀掉，必须走 OpenProcess。
+    """
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        import ctypes
+
+        kernel32 = ctypes.windll.kernel32
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        STILL_ACTIVE = 259
+        handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not handle:
+            # 拿不到句柄：ERROR_ACCESS_DENIED(5) 说明进程存在但没权限查，
+            # 按存活处理更安全（宁可误判成在跑，也不要抢走别人的锁）
+            return kernel32.GetLastError() == 5
+        try:
+            code = ctypes.c_ulong()
+            ok = kernel32.GetExitCodeProcess(handle, ctypes.byref(code))
+            return bool(ok) and code.value == STILL_ACTIVE
+        finally:
+            kernel32.CloseHandle(handle)
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+
+
+def _lock_is_stale(lock_path: str) -> bool:
+    """锁文件是否是残留（进程已死或时间戳过期）。读取失败一律当残留，避免死锁。"""
+    try:
+        with open(lock_path, "r", encoding="ascii", errors="replace") as fp:
+            parts = fp.read().split()
+    except OSError:
+        return True
+    if len(parts) < 2:
+        return True
+    try:
+        pid, started_at = int(parts[0]), int(parts[1])
+    except ValueError:
+        return True
+    if not _pid_alive(pid):
+        return True
+    return (time.time() - started_at) > LOCK_STALE_SECONDS
+
+
+def acquire_lock(profile_dir: str) -> bool:
+    """
+    抢占该 profile 目录的运行锁，返回是否抢到。
+
+    存在的意义：create_browser 的 CDP 接管无法区分"上次崩溃残留的孤儿实例"
+    与"另一个正在跑的实例"，两个任务同时跑会共用同一个浏览器并互相
+    Browser.close。锁用 O_CREAT|O_EXCL 原子创建，内容为 "pid 时间戳"。
+    """
+    os.makedirs(profile_dir, exist_ok=True)
+    lock_path = os.path.join(profile_dir, LOCK_FILENAME)
+    for _ in range(2):
+        try:
+            fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            if not _lock_is_stale(lock_path):
+                return False
+            try:
+                os.remove(lock_path)
+            except OSError:
+                return False
+            continue
+        except OSError:
+            return False
+        try:
+            os.write(fd, f"{os.getpid()} {int(time.time())}\n".encode("ascii"))
+        finally:
+            os.close(fd)
+        return True
+    return False
+
+
+def release_lock(profile_dir: str) -> None:
+    """释放运行锁（只删自己创建的锁，避免误删他人刚接管的锁）。"""
+    lock_path = os.path.join(profile_dir, LOCK_FILENAME)
+    try:
+        with open(lock_path, "r", encoding="ascii", errors="replace") as fp:
+            pid = int((fp.read().split() or ["0"])[0])
+    except (OSError, ValueError):
+        return
+    if pid != os.getpid():
+        return
+    try:
+        os.remove(lock_path)
+    except OSError:
+        pass
 
 
 def _clear_profile_locks(profile_dir: str) -> None:
@@ -535,10 +863,7 @@ def create_browser(proxy: str, debug: bool, port: int = BROWSER_PORT_DEFAULT,
     可用实例，改走 connect_over_cdp 接管复用，省一次冷启动。
     finalize() 供任务结束时强杀浏览器进程，两路径语义一致。
     """
-    # ★ profile 目录必须用规范 Windows/Linux 临时路径：不能写死 "/tmp/..."——
-    #   Windows 上 Chrome 收到字面量混合斜杠路径时 ProcessSingleton 判定异常，
-    #   会把启动请求转交给"现有的浏览器会话"后立即退出（返回码 0、调试端口永不监听）
-    profile_dir = os.path.abspath(os.path.join(tempfile.gettempdir(), "whostv_profile", str(port)))
+    profile_dir = profile_dir_for(port)
     os.makedirs(profile_dir, exist_ok=True)
     _clear_profile_locks(profile_dir)
 
@@ -564,8 +889,9 @@ def create_browser(proxy: str, debug: bool, port: int = BROWSER_PORT_DEFAULT,
         # ② 端口被占用但不是可用的 chromium 调试服务 → 换端口或清理占用进程
         if port_in_use(port):
             raise RuntimeError(
-                f"端口 {port} 已被其他进程占用但不是可用的浏览器调试端口，"
-                "请设置 WHOSTV_BROWSER_PORT 换一个端口"
+                f"端口 {port} 已被占用，但它不是可用的浏览器调试端口"
+                "（可能是残留的 chromium 进程、另一个正在运行的任务，或其他程序）。"
+                "请设置 WHOSTV_BROWSER_PORT 换一个端口，或先清理占用该端口的进程"
             )
 
         # ③ 正常路径：Patchright 自己启动（持久化上下文，有头模式）
@@ -596,22 +922,68 @@ def create_browser(proxy: str, debug: bool, port: int = BROWSER_PORT_DEFAULT,
         raise
 
 
-def wait_for_challenge(page, timeout: int = CF_CHALLENGE_TIMEOUT) -> bool:
+def challenge_state(page) -> str:
+    """读取当前页面标题与内容，判定 Cloudflare 状态（'ok' / 'challenge' / 'blocked'）。"""
+    try:
+        title = page.title() or ""
+    except Exception:
+        title = ""
+    # 标题已能定性时不必再抓页面内容（page.content() 在长页面上开销不小）
+    quick = classify_challenge_state(title, "")
+    if quick != "ok":
+        return quick
+    try:
+        html = page.content() or ""
+    except Exception:
+        html = ""
+    return classify_challenge_state(title, html)
+
+
+def wait_for_challenge(page, timeout: int = CF_CHALLENGE_TIMEOUT) -> str:
     """
-    等待 Cloudflare 挑战页自动通过。
+    等待 Cloudflare 挑战页自动通过，返回 'ok' / 'challenge' / 'blocked'。
+
     挑战页标题为「请稍候…」/「Just a moment...」，通过后跳转为站点真实标题。
-    轮询标题，超时返回 False。
+    仅凭标题判定会把 "Attention Required! | Cloudflare" 这类硬拦截页误判成
+    "挑战通过"，从而让多轮重试整体失效，因此还要核对页面内容。
     """
     deadline = time.time() + timeout
+    state = "challenge"
     while time.time() < deadline:
-        try:
-            title = page.title() or ""
-        except Exception:
-            title = ""
-        if title and "请稍候" not in title and "Just a moment" not in title:
-            return True
+        state = challenge_state(page)
+        if state != "challenge":
+            return state
         time.sleep(3)
-    return False
+    return state
+
+
+def ensure_challenge(page, rounds: int, debug: bool = False) -> str:
+    """
+    打开站点并等到 Cloudflare 挑战通过，返回 'ok' / 'challenge' / 'blocked'。
+
+    rounds 是总轮数：出口 IP 信誉波动时 CF 放行是概率性的，多轮抽签比单轮
+    死等通过率高得多。命中硬拦截页时立即返回——那种情况重试没有意义，
+    只有换出口 IP 才可能过。
+    """
+    state = "challenge"
+    for attempt in range(1, rounds + 1):
+        goto_with_retry(page, HOME, timeout=(CF_CHALLENGE_TIMEOUT + 30) * 1000,
+                        debug=debug)
+        state = wait_for_challenge(page)
+        if state == "ok":
+            if debug:
+                try:
+                    print(f"   [debug] 挑战通过（第 {attempt} 轮）| 标题: {page.title()}")
+                except Exception:
+                    pass
+            return "ok"
+        if state == "blocked":
+            return "blocked"
+        if attempt < rounds:
+            print(f"⚠️ 挑战第 {attempt}/{rounds} 轮未通过，"
+                  f"{CF_CHALLENGE_ROUND_DELAY}s 后刷新重试...")
+            time.sleep(CF_CHALLENGE_ROUND_DELAY)
+    return state
 
 
 def browser_fetch(page, url: str, method: str = "POST",
@@ -747,7 +1119,7 @@ def login_one_account(page, username: str, password: str,
                       timeout: int, debug: bool, label: str) -> tuple:
     """
     在浏览器会话内用账号密码登录 whos.tv。
-    返回 (success: bool, message: str)。
+    返回 (success: bool, message: str, cf_blocked: bool)。
     登录成功后浏览器自动携带认证 Cookie（HYPERF_SESSION_ID）。
     """
     status, text = fetch_with_retry(
@@ -762,17 +1134,20 @@ def login_one_account(page, username: str, password: str,
         print(f"   ❌ 登录请求网络级失败: {network_fail_reason(text)}")
 
     if debug:
-        body = (text or "")[:200].replace("\n", " ")
+        # 登录响应体可能带会话令牌，打印前先打码
+        body = redact_secrets((text or "")[:200].replace("\n", " "))
         print(f"   [debug] POST {LOGIN_URL} -> HTTP {status} | {body}")
 
     # 解析响应
     try:
         data = json.loads(text)
     except Exception:
-        # 网络级失败给出具体原因；其余保持原格式（如 Cloudflare 拦截返回 HTML 页）
         if status == 0:
-            return False, f"登录网络异常: {network_fail_reason(text)}"
-        return False, f"登录失败: 响应非 JSON (HTTP {status})"
+            return False, f"登录网络异常: {network_fail_reason(text)}", False
+        # 非 JSON 且是 CF 页 → 挑战失效，交给外层重过挑战后重试
+        if looks_like_cf_page(text):
+            return False, "登录请求被 Cloudflare 拦截（挑战已失效）", True
+        return False, f"登录失败: 响应非 JSON (HTTP {status})", False
 
     code = data.get("code")
     try:
@@ -784,17 +1159,17 @@ def login_one_account(page, username: str, password: str,
         # 提取用户名用于展示
         profile = (data.get("data") or {})
         display_name = profile.get("username") or profile.get("email") or username
-        return True, f"登录成功 [{mask(display_name)}]"
+        return True, f"登录成功 [{mask(display_name)}]", False
 
     # 登录失败，分类错误信息
     message = data.get("message") or ""
     if "密码" in message or "password" in message:
-        return False, f"登录失败: 密码错误 | {message}"
+        return False, f"登录失败: 密码错误 | {message}", False
     if "不存在" in message or "not found" in message or "not exist" in message:
-        return False, f"登录失败: 账号不存在 | {message}"
+        return False, f"登录失败: 账号不存在 | {message}", False
     if "封" in message or "ban" in message or "disable" in message:
-        return False, f"登录失败: 账号已被封禁 | {message}"
-    return False, f"登录失败 (code={code_int}): {message}"
+        return False, f"登录失败: 账号已被封禁 | {message}", False
+    return False, f"登录失败 (code={code_int}): {message}", False
 
 
 # ====================== 签到核心 ======================
@@ -875,7 +1250,11 @@ def is_success_response(resp_text: str, status_code: int) -> tuple:
 
 
 def try_signin_post(page, url: str, timeout: int, debug: bool) -> tuple:
-    """对一个候选 URL 发 POST。返回 (success, msg)。"""
+    """
+    对一个候选 URL 发 POST。返回 (success, msg, cf_blocked)。
+    cf_blocked=True 表示这次响应其实是 Cloudflare 拦截页，调用方应走"重过挑战"，
+    而不是当成业务失败继续试下一个候选接口。
+    """
     status, text = fetch_with_retry(page, url, timeout=timeout, debug=debug)
 
     if status == 0:
@@ -883,50 +1262,64 @@ def try_signin_post(page, url: str, timeout: int, debug: bool) -> tuple:
         print(f"   ❌ 签到请求网络级失败: {network_fail_reason(text)}")
 
     ok, msg = is_success_response(text, status)
+    cf_blocked = (not ok) and looks_like_cf_page(text)
     if debug:
-        body = (text or "")[:120].replace("\n", " ")
+        body = redact_secrets((text or "")[:120].replace("\n", " "))
         print(f"   [debug] POST {url} -> HTTP {status} | {body}")
-    return ok, msg
+    return ok, msg, cf_blocked
 
 
 def _do_signin(page, label: str, timeout: int, debug: bool) -> tuple:
     """
     对已认证的浏览器会话执行签到流程（Cookie 模式和账号模式共享）。
-    返回 (success: bool, message: str)。
+    返回 (success: bool, message: str, cf_blocked: bool)。
+    cf_blocked=True 表示签到被 Cloudflare 拦截页挡住（cf_clearance 已失效），
+    外层应重新过挑战后重试，而不是报"站点可能改版"。
     """
     # ★ 先直接调 v2 签到 API（不依赖 HTML 按钮状态）
     signin_url = f"{HOME}/api/user/tasks/signin"
-    ok, msg = try_signin_post(page, signin_url, timeout, debug)
+    ok, msg, cf_blocked = try_signin_post(page, signin_url, timeout, debug)
 
     if ok:
-        return True, msg
+        return True, msg, False
+
+    # Cloudflare 拦截页：请求根本没到业务层，重过挑战才有意义
+    if cf_blocked:
+        return False, "签到请求被 Cloudflare 拦截（挑战已失效）", True
 
     # Cookie 失效判定（"401" 单独匹配会误伤积分/ID 等数字，需精确匹配
     # "HTTP 401" / "code=401" 两种已知失效文案）
     if "Cookie 失效" in msg or "HTTP 401" in msg or "code=401" in msg:
-        return False, f"Cookie 失效，请重新登录后复制 Cookie"
+        return False, "Cookie 失效，请重新登录后复制 Cookie", False
 
     # 已知接口失败，走探测兜底
     # 网络级失败短路：已知接口重试后仍拿不到任何响应，网络/代理大概率已断，
     # 继续拉任务页+白名单探测只会逐个超时（候选最多 15 个 × 各 30s），快速失败止损
     m_http0 = re.match(r"^HTTP 0 \| (__(?:TIMEOUT|NETWORK|JSERROR)__\|.*)$", msg)
     if m_http0:
-        return False, f"网络异常无法完成签到（{network_fail_reason(m_http0.group(1))}），请检查代理 WHOSTV_PROXY 与容器网络"
+        return False, (
+            f"网络异常无法完成签到（{network_fail_reason(m_http0.group(1))}），"
+            "请检查代理 WHOSTV_PROXY 与容器网络"
+        ), False
 
     # 浏览器会话内拉取任务页 HTML（登录态检查 + 扫描候选接口）
     status, html = fetch_with_retry(page, TASKS_URL, method="GET", timeout=timeout, debug=debug)
+    # 挑战中途失效时任务页拿到的也是 CF 页，这里必须先识别，
+    # 否则会被当成普通失败、白跑十几个候选接口，最后误报"站点可能改版"
+    if looks_like_cf_page(html):
+        return False, "任务页被 Cloudflare 拦截（挑战已失效）", True
     if status != 200:
-        return False, f"任务页 HTTP {status}，已知接口也失败: {msg}"
+        return False, f"任务页 HTTP {status}，已知接口也失败: {msg}", False
 
     # 检查登录态：登录页直接判 Cookie 失效；
     # state is None（HTML 未识别到签到按钮，可能是站点改版或 SPA 壳）不阻断，
     # 继续走 A 层 + C 层白名单探测兜底
     state = find_checkin_state(html)
     if state is None and looks_like_login_page(html):
-        return False, f"Cookie 失效，请重新登录后复制 Cookie"
+        return False, "Cookie 失效，请重新登录后复制 Cookie", False
 
     if state == "true":
-        return True, f"今日已签到（页面状态）"
+        return True, "今日已签到（页面状态）", False
 
     # A 层：HTML 内联扫描
     candidates = [absolutize(p) for p in extract_api_candidates(html)]
@@ -944,21 +1337,27 @@ def _do_signin(page, label: str, timeout: int, debug: bool) -> tuple:
     # 逐个尝试探测接口
     last_msg = msg  # 保留已知接口的错误信息
     for url in candidates:
-        ok2, msg2 = try_signin_post(page, url, timeout, debug)
+        ok2, msg2, cf2 = try_signin_post(page, url, timeout, debug)
         if ok2:
-            return True, f"签到成功 [{url}] {msg2}"
+            return True, f"签到成功 [{url}] {msg2}", False
+        # Cloudflare 拦截：剩余候选同样会被拦，直接交给外层重过挑战
+        if cf2:
+            return False, f"探测 {url} 被 Cloudflare 拦截（挑战已失效）", True
         # Cookie 失效短路：候选接口已确认未授权时，不必白跑剩余候选
         if "Cookie 失效" in msg2 or "HTTP 401" in msg2 or "code=401" in msg2:
-            return False, f"Cookie 失效，请重新登录后复制 Cookie（探测 {url} 返回未授权）"
+            return False, f"Cookie 失效，请重新登录后复制 Cookie（探测 {url} 返回未授权）", False
         # 网络级失败短路：探测途中网络断开，剩余候选同样会逐个超时，止损退出
         m_fail = re.match(r"^HTTP 0 \| (__(?:TIMEOUT|NETWORK|JSERROR)__\|.*)$", msg2)
         if m_fail:
-            return False, f"网络异常中断签到探测（{network_fail_reason(m_fail.group(1))}），最后请求: {url}"
+            return False, (
+                f"网络异常中断签到探测（{network_fail_reason(m_fail.group(1))}），"
+                f"最后请求: {url}"
+            ), False
         last_msg = f"{url} -> {msg2}"
 
     if state is None:
-        return False, f"页面未找到签到按钮（站点可能改版），已知接口失败: {msg[:80]}"
-    return False, f"所有候选接口均失败（已知: {msg[:80]} | 最后: {last_msg[:80]}）"
+        return False, f"页面未找到签到按钮（站点可能改版），已知接口失败: {msg[:80]}", False
+    return False, f"所有候选接口均失败（已知: {msg[:80]} | 最后: {last_msg[:80]}）", False
 
 
 # ====================== 两种模式的入口函数 ======================
@@ -967,33 +1366,42 @@ def signin_one_account(idx: int, cookie_str: str, timeout: int, debug: bool,
                        page) -> tuple:
     """
     Cookie 模式：对单个账号执行签到流程。
-    返回 (success: bool, message: str)。
+    返回 (success: bool, message: str, cf_blocked: bool)。
     """
     label = f"账号 {idx}"
 
     # 注入 Cookie（清掉上一账号的登录态，但保留 cf_clearance）
     cookies = parse_cookie_str(cookie_str)
     if not cookies:
-        return False, f"{label}: ❌ Cookie 解析为空"
+        return False, f"{label}: ❌ Cookie 解析为空", False
+    # 剔除 Cloudflare 自管的 cookie：用户粘进来的旧 cf_clearance 会覆盖掉
+    # 会话里刚拿到的新鲜值，反而重新触发挑战
+    cf_names = [k for k in cookies if _is_cf_cookie(k)]
+    business = {k: v for k, v in cookies.items() if not _is_cf_cookie(k)}
+    if cf_names and debug:
+        print("   [debug] 已忽略 Cookie 串里的 Cloudflare cookie（改用会话内的新鲜值）: "
+              f"{', '.join(cf_names)}")
+    if not business:
+        return False, f"{label}: ❌ Cookie 串只含 Cloudflare cookie，缺少业务会话 Cookie", False
     reset_cookies_keep_cf(page)
     # Playwright 的 add_cookies 要求 domain 与 path 成对，否则注入被拒
     page.context.add_cookies([
         {"name": k, "value": v, "domain": ".whos.tv", "path": "/"}
-        for k, v in cookies.items()
+        for k, v in business.items()
     ])
 
     # 执行签到
-    ok, msg = _do_signin(page, label, timeout, debug)
+    ok, msg, cf_blocked = _do_signin(page, label, timeout, debug)
     prefix = "✅" if ok else "❌"
     decorated = f"{label}: {prefix} {msg}"
-    return ok, decorated
+    return ok, decorated, cf_blocked
 
 
 def signin_with_login(idx: int, username: str, password: str, timeout: int,
                       debug: bool, page) -> tuple:
     """
     账号模式：先登录再签到。
-    返回 (success: bool, message: str)。
+    返回 (success: bool, message: str, cf_blocked: bool)。
     """
     label = f"账号 {idx} [{mask(username)}]"
 
@@ -1001,91 +1409,67 @@ def signin_with_login(idx: int, username: str, password: str, timeout: int,
     reset_cookies_keep_cf(page)
 
     # ① 登录
-    login_ok, login_msg = login_one_account(page, username, password, timeout, debug, label)
+    login_ok, login_msg, login_cf = login_one_account(
+        page, username, password, timeout, debug, label
+    )
     if not login_ok:
-        return False, f"{label}: ❌ {login_msg}"
+        return False, f"{label}: ❌ {login_msg}", login_cf
 
     if debug:
         print(f"   [debug] {login_msg}")
 
     # ② 签到
-    ok, msg = _do_signin(page, label, timeout, debug)
+    ok, msg, cf_blocked = _do_signin(page, label, timeout, debug)
     prefix = "✅" if ok else "❌"
     decorated = f"{label}: {prefix} {msg}"
-    return ok, decorated
+    return ok, decorated, cf_blocked
+
+
+def run_with_cf_recovery(runner, page, debug: bool) -> tuple:
+    """
+    执行一次账号流程；若失败原因是 Cloudflare 拦截，则重新过挑战后再试一次。
+
+    cf_clearance 在连续多账号中途失效是现实场景，此时直接放弃会让后面所有
+    账号一起白跑；补一轮挑战通常就能救回来。返回 (success, message)。
+    """
+    ok, msg, cf_blocked = runner()
+    if ok or not cf_blocked:
+        return ok, msg
+    print("   ⚠️ 检测到 Cloudflare 挑战失效，重新过挑战后重试本账号...")
+    if ensure_challenge(page, 1, debug) == "ok":
+        ok, msg, _ = runner()
+        return ok, msg
+    return False, f"{msg}（重新过挑战仍未通过，建议换代理节点后重跑）"
 
 
 # ====================== 入口 ======================
 
-def main():
-    title = "whos.tv 签到"
-
-    raw_cookie = os.getenv("WHOSTV_COOKIE", "").strip()
-    raw_account = os.getenv("WHOSTV_ACCOUNT", "").strip()
-
-    if not raw_cookie and not raw_account:
-        print("❌ 未配置任何认证方式，请设置 WHOSTV_COOKIE 或 WHOSTV_ACCOUNT 环境变量")
-        sys.exit(1)
-
-    notify = env_bool("WHOSTV_NOTIFY", True)
-    notify_only_fail = env_bool("WHOSTV_NOTIFY_ONLY_FAIL", False)
-    timeout = env_int("WHOSTV_TIMEOUT", 30)
-    debug = env_bool("WHOSTV_DEBUG", False)
-    proxy, proxy_source = resolve_proxy("WHOSTV_PROXY")
-    browser_wait = env_int("WHOSTV_BROWSER_WAIT", BROWSER_WAIT_DEFAULT)
-    browser_port = env_int("WHOSTV_BROWSER_PORT", BROWSER_PORT_DEFAULT)
-
-    # 收集两类账号
-    cookie_accounts = [c.strip() for c in raw_cookie.split("&") if c.strip()] if raw_cookie else []
-    login_accounts = parse_credentials(raw_account)
-
-    total = len(cookie_accounts) + len(login_accounts)
-    if total == 0:
-        print("❌ 未解析到有效账号，请检查环境变量格式")
-        sys.exit(1)
-
-    print("=" * 60)
-    print(f"🐳 whos.tv 签到  |  共 {total} 个账号  |  {datetime.now():%Y-%m-%d %H:%M:%S}")
-    if raw_cookie:
-        print(f"🍪 Cookie 账号: {len(cookie_accounts)} 个")
-    if login_accounts:
-        print(f"🔑 账号密码: {len(login_accounts)} 个")
-    if not proxy:
-        print("🌐 代理: 未配置（直连；whos.tv 在大陆网络大概率无法访问）")
-    elif proxy_source == "WHOSTV_PROXY":
-        print(f"🌐 代理: {proxy}")
-    else:
-        print(f"🌐 代理: {proxy}（来源: {proxy_source}）")
-    print("=" * 60)
-
-    # 启动浏览器并等待 Cloudflare 挑战通过（带多轮抽签重试）
-    # 出口 IP 信誉波动时 CF 放行是概率性的（实测同环境通过率约 1/3 且随机），
-    # 单轮长等无意义，多轮 + 轮间隔（让 CF 风控窗口滑动）才能抽中放行
+def _run_accounts(title, notify, notify_only_fail, timeout, debug, proxy,
+                  browser_wait, browser_port, challenge_rounds,
+                  cookie_accounts, login_accounts, total) -> int:
+    """
+    启动浏览器 → 过 Cloudflare 挑战 → 逐个账号签到 → 汇总并推送。
+    返回成功账号数；浏览器/挑战致命失败时推送并抛 SystemExit(1)。
+    """
+    # 启动浏览器并等待 Cloudflare 挑战通过（多轮抽签重试）
     print("\n🚀 启动浏览器，等待 Cloudflare 挑战通过（每轮最长"
-          f" {CF_CHALLENGE_TIMEOUT} 秒 × {CF_CHALLENGE_RETRY + 1} 轮，轮间隔"
+          f" {CF_CHALLENGE_TIMEOUT} 秒 × {challenge_rounds} 轮，轮间隔"
           f" {CF_CHALLENGE_ROUND_DELAY}s）...")
-    page = None
     finalize = None
     try:
         page, finalize = create_browser(proxy, debug, browser_port, browser_wait)
-        challenge_ok = False
-        for attempt in range(CF_CHALLENGE_RETRY + 1):
-            goto_with_retry(page, HOME, timeout=(CF_CHALLENGE_TIMEOUT + 30) * 1000,
-                            debug=debug)
-            challenge_ok = wait_for_challenge(page)
-            if challenge_ok:
-                break
-            if attempt < CF_CHALLENGE_RETRY:
-                print(f"⚠️ 挑战第 {attempt + 1}/{CF_CHALLENGE_RETRY + 1} 轮未通过，"
-                      f"{CF_CHALLENGE_ROUND_DELAY}s 后刷新重试...")
-                time.sleep(CF_CHALLENGE_ROUND_DELAY)
-        if not challenge_ok:
+        state = ensure_challenge(page, challenge_rounds, debug)
+        if state == "blocked":
             raise RuntimeError(
-                f"Cloudflare 挑战在 {CF_CHALLENGE_RETRY + 1} 轮内均未通过"
+                "出口 IP 被 Cloudflare 硬拦截（Access denied / Error 1020），"
+                "重试无用，请更换代理节点后重跑"
+            )
+        if state != "ok":
+            raise RuntimeError(
+                f"Cloudflare 挑战在 {challenge_rounds} 轮内均未通过"
                 "（出口 IP 被 CF 高风险判定且放行窗口未抽中，建议换代理节点）"
             )
         if debug:
-            print(f"   [debug] 挑战通过 | 标题: {page.title()}")
             try:
                 print(f"   [debug] UserAgent: {page.evaluate('navigator.userAgent')}")
             except Exception:
@@ -1103,7 +1487,7 @@ def main():
             finalize()
         if notify:
             send_notify(f"❌ {title} 全部失败（0/{total}）", f"浏览器启动或挑战失败: {e}")
-        sys.exit(1)
+        raise SystemExit(1)
 
     try:
         results = []
@@ -1113,7 +1497,9 @@ def main():
         for i, ck in enumerate(cookie_accounts, start=1):
             print(f"\n▶ 处理 Cookie 账号 {i} ...")
             try:
-                ok, msg = signin_one_account(i, ck, timeout, debug, page)
+                ok, msg = run_with_cf_recovery(
+                    lambda: signin_one_account(i, ck, timeout, debug, page), page, debug
+                )
             except Exception:
                 ok, msg = False, f"Cookie 账号 {i}: ❌ 脚本异常\n{traceback.format_exc(limit=2)}"
             if ok:
@@ -1128,7 +1514,10 @@ def main():
             seq = len(cookie_accounts) + j
             print(f"\n▶ 处理账号 {seq} [{mask(user)}] ...")
             try:
-                ok, msg = signin_with_login(seq, user, pwd, timeout, debug, page)
+                ok, msg = run_with_cf_recovery(
+                    lambda: signin_with_login(seq, user, pwd, timeout, debug, page),
+                    page, debug,
+                )
             except Exception:
                 ok, msg = False, f"账号 {seq} [{mask(user)}]: ❌ 脚本异常\n{traceback.format_exc(limit=2)}"
             if ok:
@@ -1181,7 +1570,71 @@ def main():
     else:
         print("ℹ️ WHOSTV_NOTIFY=false，已禁用推送")
 
-    sys.exit(0 if success_cnt > 0 else 1)
+    return success_cnt
+
+
+def main():
+    title = "whos.tv 签到"
+
+    raw_cookie = os.getenv("WHOSTV_COOKIE", "").strip()
+    raw_account = os.getenv("WHOSTV_ACCOUNT", "").strip()
+
+    if not raw_cookie and not raw_account:
+        print("❌ 未配置任何认证方式，请设置 WHOSTV_COOKIE 或 WHOSTV_ACCOUNT 环境变量")
+        sys.exit(1)
+
+    notify = env_bool("WHOSTV_NOTIFY", True)
+    notify_only_fail = env_bool("WHOSTV_NOTIFY_ONLY_FAIL", False)
+    timeout = env_int("WHOSTV_TIMEOUT", 30, minimum=1)
+    debug = env_bool("WHOSTV_DEBUG", False)
+    proxy, proxy_source = resolve_proxy("WHOSTV_PROXY")
+    browser_wait = env_int("WHOSTV_BROWSER_WAIT", BROWSER_WAIT_DEFAULT, minimum=10)
+    browser_port = env_int("WHOSTV_BROWSER_PORT", BROWSER_PORT_DEFAULT, minimum=1)
+    challenge_rounds = env_int(
+        "WHOSTV_CHALLENGE_ROUNDS", CF_CHALLENGE_ROUNDS_DEFAULT, minimum=1
+    )
+
+    # 收集两类账号（& 与换行都算分隔符，两种模式保持一致）
+    cookie_accounts = split_env_list(raw_cookie)
+    login_accounts = parse_credentials(raw_account)
+
+    total = len(cookie_accounts) + len(login_accounts)
+    if total == 0:
+        print("❌ 未解析到有效账号，请检查环境变量格式")
+        sys.exit(1)
+
+    print("=" * 60)
+    print(f"🐳 whos.tv 签到  |  共 {total} 个账号  |  {datetime.now():%Y-%m-%d %H:%M:%S}")
+    if raw_cookie:
+        print(f"🍪 Cookie 账号: {len(cookie_accounts)} 个")
+    if login_accounts:
+        print(f"🔑 账号密码: {len(login_accounts)} 个")
+    if not proxy:
+        print("🌐 代理: 未配置（直连；whos.tv 在大陆网络大概率无法访问）")
+    elif proxy_source == "WHOSTV_PROXY":
+        print(f"🌐 代理: {mask_proxy(proxy)}")
+    else:
+        print(f"🌐 代理: {mask_proxy(proxy)}（来源: {proxy_source}）")
+    print("=" * 60)
+
+    # 运行锁：同一 profile 目录（按端口隔离）只允许一个实例，否则两个任务会
+    # 共用同一个浏览器并互相 Browser.close（CDP 接管分不清残留实例和在跑的实例）
+    profile_dir = profile_dir_for(browser_port)
+    if not acquire_lock(profile_dir):
+        print(f"❌ 另一个 whos.tv 签到实例正在运行（端口 {browser_port} 的运行锁被占用），本次退出")
+        sys.exit(1)
+
+    try:
+        success_cnt = _run_accounts(
+            title, notify, notify_only_fail, timeout, debug, proxy,
+            browser_wait, browser_port, challenge_rounds,
+            cookie_accounts, login_accounts, total,
+        )
+    finally:
+        release_lock(profile_dir)
+
+    # 退出码：全部成功为 0，任一失败为 1（便于外部监控区分部分失败）
+    sys.exit(0 if success_cnt == total else 1)
 
 
 if __name__ == "__main__":
