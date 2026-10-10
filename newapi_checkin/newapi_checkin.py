@@ -7,14 +7,12 @@ cron: 8 8 * * *
 适配青龙面板 - 仅依赖 requests + 标准库
 
 支持站点：
-  - Liminality 贝之中转站 (beizhi.sylu.cc, New API 新版)   Bearer Token
   - 可萌中转站      (api456.me, New API)               New-Api-User Header + Session Cookie
   - 哈基米 API 站   (api.gemai.cc, New API)            New-Api-User Header
   - DZZI.AI 大肘子API (api.dzzi.ai, New API)            Bearer Token
   - 自定义任意 API 站                                    通过 QZD_CUSTOM JSON 配置
 
 环境变量：
-  QZD_BEIZHI    用户名#密码 (多账号 & 分隔)
   QZD_API456    用户名#密码 (多账号 & 分隔)
   QZD_GEMAI     用户名#密码 (多账号 & 分隔)
   QZD_DZZI      用户名#密码 (多账号 & 分隔)
@@ -98,30 +96,6 @@ def send_notify(title: str, content: str) -> bool:
 # ====================== 站点预设（来自源项目 SITE_PRESETS） ======================
 
 SITE_PRESETS = {
-    "beizhi": {
-        "name": "Liminality贝之中转站",
-        "type": "custom-api",
-        "api_config": {
-            "login_url": "https://beizhi.sylu.cc/api/user/login",
-            "login_method": "POST",
-            "login_body_template": '{"username": "{{username}}", "password": "{{password}}"}',
-            "login_content_type": "application/json",
-            "token_path": "data.access_token",
-            "token_expires_path": "data.access_expires_at",
-            "signin_url": "https://beizhi.sylu.cc/api/user/checkin",
-            "signin_method": "POST",
-            "signin_body": "{}",
-            "signin_content_type": "application/json",
-            "auth_header_template": "Bearer {{token}}",
-            "auth_header_name": "Authorization",
-            "success_field": "success",
-            "message_field": "message",
-            "quota_info_url": "https://beizhi.sylu.cc/api/user/self",
-            "quota_field": "data.quota",
-            "quota_per_unit": 500000,
-            "quota_currency": "$",
-        },
-    },
     "api456": {
         "name": "可萌中转站",
         "type": "custom-api",
@@ -197,7 +171,6 @@ SITE_PRESETS = {
 
 # 环境变量名 -> 预设 key 的映射（按需扩展）
 ENV_PRESET_MAP = {
-    "QZD_BEIZHI": "beizhi",
     "QZD_API456": "api456",
     "QZD_GEMAI": "gemai",
     "QZD_DZZI": "dzzi",
@@ -1081,7 +1054,6 @@ def main():
         msg = (
             "⚠️ 未配置任何站点账号。\n"
             "请在青龙面板「环境变量」中配置以下任意一项：\n"
-            "  QZD_BEIZHI  = 用户名#密码（贝之中转站）\n"
             "  QZD_API456  = 用户名#密码（可萌中转站）\n"
             "  QZD_GEMAI   = 用户名#密码（哈基米API）\n"
             "  QZD_DZZI    = 用户名#密码（DZZI.AI）\n"
