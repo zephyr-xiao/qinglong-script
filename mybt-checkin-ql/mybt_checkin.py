@@ -9,17 +9,19 @@ cron: 5 8 * * *
 登录态按账号本地缓存复用，失效时先用 refresh_token 续期、失败才重新登录（缓存不存密码）。
 
 环境变量：
-  MYBT_ACCOUNT           账号：用户名#密码（多账号用 & 或换行分隔）
+  MYBT_ACCOUNT           账号：用户名#密码（多账号用 & 或换行分隔；密码不能含 & 或换行）
   MYBT_TOKEN             手动 JWT 兜底（无账号密码时必填；自动登录失败时回退）
   MYBT_COOKIE            附加 Cookie（如 cf_clearance=...）
   MYBT_TURNSTILE_TOKEN   登录触发人机验证时手动提供的验证码 token
   MYBT_DO_VISIT          true/false 是否执行访问任务，默认 true
   MYBT_NOTIFY            true/false 是否推送，默认 true
   MYBT_NOTIFY_ONLY_FAIL  true/false 仅失败时推送，默认 false
+  MYBT_EXIT_STRICT       true/false 只要有账号未成功即 exit(1)，默认 false（仅全失败才 exit 1）
   MYBT_TIMEOUT           HTTP 超时秒数，默认 30
   MYBT_DEBUG             true/false 输出调试细节，默认 false
   MYBT_PROXY             HTTP/SOCKS 代理，如 http://172.17.0.1:7890
-  MYBT_BASE_URL / MYBT_AUTH_URL / MYBT_SECRET   站点/认证地址/签名密钥（一般不用改）
+  MYBT_BASE_URL / MYBT_AUTH_URL   站点/认证地址（一般不用改）
+  MYBT_SECRET            签名密钥，默认留空：由 /auth/me 的 sign_secret 自动回填，仅站点收紧验签时才需显式提供
 作者: zephyr_xiao
 """
 import base64
@@ -46,11 +48,6 @@ except Exception:
 # 2. requests 缺失友好提示
 try:
     import requests
-    try:
-        import urllib3
-        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-    except Exception:
-        pass
 except ImportError:
     print("❌ 缺少 requests 库，请在青龙面板「依赖管理」-「Python」中安装 requests")
     sys.exit(1)
@@ -94,7 +91,9 @@ def send_notify(title: str, content: str) -> bool:
 
 DEFAULT_BASE_URL = "https://mybt.kiteyuan.info"
 DEFAULT_AUTH_URL = "https://auth.kiteyuan.info"
-DEFAULT_SECRET = "change-this-secret"
+# 签名密钥默认留空：首次 /auth/me 属于站点免签名白名单，真实 sign_secret 由该接口回填；
+# 只有站点收紧为全接口验签、或 /auth/me 不再下发 sign_secret 时，才需要用 MYBT_SECRET 显式提供。
+DEFAULT_SECRET = ""
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36")
 
@@ -103,13 +102,42 @@ TOKEN_MARGIN_SECONDS = 12 * 3600
 TOKEN_FALLBACK_TTL_SECONDS = 24 * 3600
 TOKEN_CACHE_FILE = Path(__file__).resolve().parent / "mybt_token.json"
 
-ALREADY_KEYWORDS = [
-    "已签到", "已经签到", "今日已签", "您已签到", "您今日已",
-    "签到过", "重复签到", "连续签到", "已完成", "已领取",
-    "already", "already signed", "signed in", "signed-in", "signed",
+# 幂等提示：仅用「精确短语」匹配，绝不放裸词（如 signed / already / 已完成 / 已领取），
+# 否则 "not signed in"、"unsigned" 之类失败文案会被误判成「已签到」而静默报成功。
+ALREADY_PHRASES = [
+    "已签到", "已经签到", "今日已签", "您已签到", "您今日已签",
+    "签到过", "重复签到", "连续签到", "今日已完成", "任务已完成",
+    "已领取过", "今日已领取",
+    "already signed", "already sign", "already checked", "signed in today",
 ]
-# ⚠️ 不要把"签到成功""签到完成"放入此列表！
-#   这两个词是首次签到成功的标志，不是"重复签到"的幂等提示。
+# 鉴权失效文案（HTTP 200 但业务层提示未登录/过期）
+AUTH_ERROR_PHRASES = [
+    "未登录", "请先登录", "登录已过期", "登录过期", "token 过期", "token过期",
+    "令牌过期", "令牌无效", "无效的令牌", "登录态失效",
+    "unauthorized", "unauthenticated", "token expired", "invalid token",
+    "not logged in", "not signed in", "login required",
+]
+# 明确成功文案（用于把「形态未知」的响应确认为成功）
+SUCCESS_PHRASES = ["签到成功", "成功", "获得", "领取成功"]
+# 明确失败文案（无业务码但文案已说明失败，直接判失败而非「未确认」）
+FAIL_PHRASES = [
+    "失败", "错误", "异常", "无效", "已达上限", "次数不足", "余额不足",
+    "fail", "error", "invalid", "denied", "forbidden",
+]
+# 各动作的「成功标志字段」：命中任一即确认为成功
+OK_KEYS_BY_ACTION = {
+    "登录态检查": ("user", "sign_secret", "uid", "id", "username"),
+    "签到": ("added", "points", "reward", "bonus"),
+    "访问任务": ("added", "points", "reward", "bonus"),
+}
+# 判定结论
+V_OK = "ok"                  # 明确成功
+V_ALREADY = "already"        # 幂等：今日已做过，视为成功
+V_UNCONFIRMED = "unconfirmed"  # 无法确认为成功（保守判非成功，报告里单列）
+V_FAIL = "fail"              # 明确失败
+V_AUTH = "auth"              # 登录态失效（401/403 或业务层未登录）
+# HTTP 层鉴权失败码（优先级最高，绝不交给文案关键字判定）
+AUTH_STATUS = {401, 403}
 
 
 def env_str(name, default=""):
@@ -182,10 +210,50 @@ def parse_cookie_str(s: str) -> dict:
     return jar
 
 
-def _is_already_signed_in(msg: str) -> bool:
+def _is_already_done(msg: str) -> bool:
+    """幂等提示：精确短语匹配（不区分大小写）。"""
     if not msg:
         return False
-    return any(kw.lower() in msg.lower() for kw in ALREADY_KEYWORDS)
+    low = msg.lower()
+    return any(p.lower() in low for p in ALREADY_PHRASES)
+
+
+def _is_auth_error(msg: str) -> bool:
+    """业务层鉴权失效（HTTP 200 但提示未登录/过期）。"""
+    if not msg:
+        return False
+    low = msg.lower()
+    return any(p.lower() in low for p in AUTH_ERROR_PHRASES)
+
+
+def _is_success_text(msg: str) -> bool:
+    if not msg:
+        return False
+    return any(p in msg for p in SUCCESS_PHRASES)
+
+
+def _is_fail_text(msg: str) -> bool:
+    if not msg:
+        return False
+    low = msg.lower()
+    return any(p.lower() in low for p in FAIL_PHRASES)
+
+
+def _biz_code_failure(data: dict):
+    """业务码非成功值 → 返回该值，否则 None。成功码约定为 0 / 200。"""
+    for key in ("code", "status", "errcode", "errno"):
+        v = data.get(key)
+        if isinstance(v, bool):
+            continue
+        if isinstance(v, int) and v not in (0, 200):
+            return v
+        if isinstance(v, str) and v.strip().lower() in ("error", "fail", "failed", "false"):
+            return v
+    return None
+
+
+def _has_ok_key(action: str, data: dict) -> bool:
+    return any(k in data for k in OK_KEYS_BY_ACTION.get(action, ()))
 
 
 _NETWORK_ERR_KEYWORDS = (
@@ -230,7 +298,7 @@ def sha256_hex(text: str) -> str:
 
 
 def sort_query(query: str) -> str:
-    """按 key 排序 query 参数，与站点前端签名逻辑一致；重复 key 取首次出现。"""
+    """按 key 排序 query 参数，与站点前端签名逻辑一致；重复 key 保留首次出现的位置、取末次出现的值。"""
     if not query:
         return ""
     keys, values = [], {}
@@ -279,11 +347,6 @@ def jwt_exp(token: str) -> int:
         return 0
 
 
-def jwt_uid(token: str) -> str:
-    data = _jwt_payload(token)
-    return str(data.get("uid") or data.get("id") or "")
-
-
 def _load_token_cache() -> dict:
     try:
         with open(TOKEN_CACHE_FILE, "r", encoding="utf-8") as f:
@@ -293,13 +356,16 @@ def _load_token_cache() -> dict:
 
 
 def _save_token_cache(accounts_map: dict):
+    """原子写：先写临时文件再替换，避免中断产生半截 JSON 而丢失 refresh_token。"""
     try:
         payload = {
             "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "accounts": accounts_map,
         }
-        with open(TOKEN_CACHE_FILE, "w", encoding="utf-8") as f:
+        tmp = TOKEN_CACHE_FILE.with_name(TOKEN_CACHE_FILE.name + ".tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, TOKEN_CACHE_FILE)
     except Exception as e:
         print(f"⚠️ 写入 token 缓存失败: {e}")
 
@@ -381,6 +447,7 @@ def refresh_site_token(base_url, refresh_token, timeout=30, proxy=""):
         data = _json_or(r.text)
         token = str(data.get("token") or "").strip()
         if not token:
+            print(f"           ⚠️ refresh_token 续期未返回新 token（HTTP {r.status_code}），将回退完整登录")
             dbg(f"refresh 未返回 token: HTTP {r.status_code} {r.text[:200]!r}")
             return {}
         return {
@@ -389,6 +456,7 @@ def refresh_site_token(base_url, refresh_token, timeout=30, proxy=""):
             "expires_in": int(data.get("expires_in") or 0),
         }
     except Exception as e:
+        print(f"           ⚠️ refresh_token 续期异常（{type(e).__name__}），将回退完整登录")
         dbg(f"refresh_token 续期异常: {type(e).__name__}: {e}")
         return {}
 
@@ -480,7 +548,10 @@ class CasdoorLogin:
             msg = login_json.get("msg") or login_json.get("message") or r3.text[:300]
             low = str(msg).lower()
             if "captcha" in low or "turnstile" in low or "人机" in str(msg):
-                raise RuntimeError(f"login requires captcha/turnstile: {msg}")
+                raise RuntimeError(
+                    "站点登录触发了人机验证（Cloudflare Turnstile）：请提供 MYBT_TURNSTILE_TOKEN"
+                    "（浏览器过一次验证后取出的一次性 token），或改用 MYBT_TOKEN 手动 JWT 兜底。"
+                    f" 服务端原文: {msg}")
             raise RuntimeError(f"login failed: {msg}")
         data, data2 = login_json.get("data"), login_json.get("data2")
         code, redirect = None, None
@@ -504,7 +575,7 @@ class CasdoorLogin:
             m = re.search(r"[?&#]token=([A-Za-z0-9_\-\.]+)", r.url + "\n" + r.text)
             if m:
                 token = m.group(1)
-                return token, jwt_uid(token)
+                return {"token": token, "refresh_token": "", "expires_in": 0}
             m = re.search(r"code=([A-Za-z0-9_\-\.]+)", r.url + "\n" + r.text)
             if m:
                 code = m.group(1)
@@ -530,13 +601,13 @@ class CasdoorLogin:
         token = _extract_token(location, r4.text)
         if token:
             dbg("callback 直接返回 token")
-            return {"token": token, "refresh_token": "", "expires_in": 0, "uid": jwt_uid(token)}
+            return {"token": token, "refresh_token": "", "expires_in": 0}
 
         if not location:
             # 未发生重定向（callback 就地 200），再从最终 URL / body 里找一次
             token = _extract_token(r4.url, r4.text)
             if token:
-                return {"token": token, "refresh_token": "", "expires_in": 0, "uid": jwt_uid(token)}
+                return {"token": token, "refresh_token": "", "expires_in": 0}
             raise RuntimeError(
                 f"callback 未返回登录票据. status={r4.status_code} final={r4.url} body={r4.text[:200]!r}")
 
@@ -568,18 +639,16 @@ class CasdoorLogin:
             "token": token,
             "refresh_token": str(data.get("refresh_token") or "").strip(),
             "expires_in": int(data.get("expires_in") or 0),
-            "uid": jwt_uid(token),
         }
 
 
 # ============================ 站点 API 客户端 ============================
 
 class MybtClient:
-    def __init__(self, base_url, token, user_id="", secret=DEFAULT_SECRET,
+    def __init__(self, base_url, token, secret=DEFAULT_SECRET,
                  cookie="", timeout=30, proxy=""):
         self.base_url = base_url.rstrip("/")
         self.token = (token or "").removeprefix("Bearer ").strip()
-        self.user_id = user_id or ""
         self.secret = secret or DEFAULT_SECRET
         self.timeout = timeout
         self.sess = requests.Session()
@@ -633,27 +702,65 @@ class MybtClient:
 
 # ============================ 响应判定 ============================
 
-def summarize(action, status, data, raw):
-    """把接口响应归纳为 (是否成功, 展示消息)。"""
+def judge(action, status, data, raw):
+    """分层判定接口响应，返回 (结论, 展示消息)。
+
+    结论 ∈ {V_OK, V_ALREADY, V_UNCONFIRMED, V_FAIL, V_AUTH}。
+    判定顺序：网络 → HTTP 鉴权码 → 业务层鉴权文案 → HTTP 失败码 → 业务码 → 成功标志/文案。
+    无法确认为成功的形态一律给 V_UNCONFIRMED（保守，报告里单列，不与真失败混淆）。
+    """
     if status == 0:
-        return False, f"{action}: {raw}"
+        return V_FAIL, f"{action}: {raw}"
+
+    err = ""
     if isinstance(data, dict):
         err = str(data.get("error") or data.get("message") or data.get("msg") or "")
-        if status >= 400:
-            if _is_already_signed_in(err):
-                return True, f"{action}: {err}"
-            return False, f"{action}: HTTP {status} - {err or raw[:200]}"
-        if err and _is_already_signed_in(err):
-            return True, f"{action}: {err}"
+
+    # 1) HTTP 层鉴权失败：优先级最高，绝不交给幂等/成功关键字判定
+    if status in AUTH_STATUS:
+        return V_AUTH, f"{action}: 登录态失效 HTTP {status}"
+
+    # 2) 业务层鉴权失败（HTTP 200 但提示未登录/过期）
+    if err and _is_auth_error(err):
+        return V_AUTH, f"{action}: 登录态失效 - {err}"
+
+    # 3) HTTP 失败码
+    if status >= 400:
+        if _is_already_done(err):
+            return V_ALREADY, f"{action}: {err}"
+        return V_FAIL, f"{action}: HTTP {status} - {err or raw[:200]}"
+
+    # 4) HTTP 2xx：业务层
+    if isinstance(data, dict):
         if data.get("success") is False:
-            return False, f"{action}: {err or raw[:200]}"
+            return V_FAIL, f"{action}: {err or raw[:200]}"
+        bad_code = _biz_code_failure(data)
+        if bad_code is not None:
+            return V_FAIL, f"{action}: 业务码 {bad_code} - {err or raw[:200]}"
+        if err and _is_already_done(err):
+            return V_ALREADY, f"{action}: {err}"
+        if err and _is_fail_text(err):
+            return V_FAIL, f"{action}: {err}"
+        if data.get("success") is True or data.get("ok") is True:
+            return V_OK, f"{action}: 成功"
+        code = data.get("code")
+        if isinstance(code, int) and not isinstance(code, bool) and code in (0, 200):
+            return V_OK, f"{action}: 成功"
         added = data.get("added")
         if added is not None:
-            return True, f"{action}: 成功，获得 {added} 积分"
-        return True, f"{action}: 成功 - {json.dumps(data, ensure_ascii=False)[:300]}"
+            return V_OK, f"{action}: 成功，获得 {added} 积分"
+        if _has_ok_key(action, data) or _is_success_text(err):
+            return V_OK, f"{action}: 成功"
+        # 形态无法确认为成功
+        return V_UNCONFIRMED, f"{action}: 未确认 - {json.dumps(data, ensure_ascii=False)[:200]}"
+
+    # 5) 非 dict 的 2xx 响应
     if 200 <= status < 300:
-        return True, f"{action}: HTTP {status}"
-    return False, f"{action}: HTTP {status} - {raw[:200]}"
+        if _is_success_text(raw) or _is_already_done(raw):
+            return V_OK, f"{action}: HTTP {status}"
+        return V_UNCONFIRMED, f"{action}: 未确认 - {raw[:200]}"
+
+    return V_FAIL, f"{action}: HTTP {status} - {raw[:200]}"
 
 
 # ============================ 任务编排 ============================
@@ -688,45 +795,58 @@ def _casdoor_login(account, base_url, auth_url):
 
 def _run_chain(client, do_visit):
     """登录态检查 → 签到 → 访问任务 → 积分统计。
-    返回 (是否全部成功, 消息列表, 是否登录态失效)。"""
+
+    返回 (是否全部成功, 消息列表, 是否登录态失效, 是否仅"未确认")。
+    """
     lines = []
-    status, data, raw = _call_with_retry(client.me)
-    ok, msg = summarize("登录态检查", status, data, raw)
-    if ok:
-        # me() 成功响应含 sign_secret/邮箱等敏感信息，报告里只显示"正常"
-        msg = "登录态检查: 正常"
-    lines.append(msg)
-    print(f"           {msg}")
-    if not ok:
-        return False, lines, status == 401
-    if isinstance(data, dict):
-        if data.get("sign_secret"):
-            client.set_sign_secret(data["sign_secret"])
-        user = data.get("user")
-        if isinstance(user, dict):
-            info = f"用户: {user.get('username')} 当前积分: {user.get('points')}"
-            lines.append(info)
-            print(f"           {info}")
-            if user.get("id"):
-                client.user_id = str(user.get("id"))
-    ok_all = True
-    status, data, raw = _call_with_retry(client.signin)
-    ok, msg = summarize("签到", status, data, raw)
-    lines.append(msg)
-    print(f"           {msg}")
-    ok_all = ok_all and ok
-    if do_visit:
-        status, data, raw = _call_with_retry(client.visit)
-        ok, msg = summarize("访问任务", status, data, raw)
+    verdicts = []
+
+    def note(msg):
         lines.append(msg)
         print(f"           {msg}")
-        ok_all = ok_all and ok
+
+    status, data, raw = _call_with_retry(client.me)
+    verdict, msg = judge("登录态检查", status, data, raw)
+    if verdict == V_OK:
+        # me() 成功响应含 sign_secret/邮箱等敏感信息，报告里只显示"正常"
+        msg = "登录态检查: 正常"
+    note(msg)
+    verdicts.append(verdict)
+    if verdict == V_AUTH:
+        return False, lines, True, False
+    if verdict != V_OK:
+        return False, lines, False, verdict == V_UNCONFIRMED
+
+    # 回填签名密钥；拿不到且未显式配置则无法签名后续请求
+    if isinstance(data, dict) and data.get("sign_secret"):
+        client.set_sign_secret(data["sign_secret"])
+    if not client.secret:
+        note("❌ 未取得签名密钥（/auth/me 未返回 sign_secret）且未配置 MYBT_SECRET，无法签名后续请求")
+        return False, lines, False, False
+    if isinstance(data, dict):
+        user = data.get("user")
+        if isinstance(user, dict):
+            note(f"用户: {mask(str(user.get('username') or ''))} 当前积分: {user.get('points')}")
+
+    actions = [("签到", client.signin)]
+    if do_visit:
+        actions.append(("访问任务", client.visit))
+    for name, fn in actions:
+        status, data, raw = _call_with_retry(fn)
+        verdict, msg = judge(name, status, data, raw)
+        note(msg)
+        verdicts.append(verdict)
+        if verdict == V_AUTH:
+            return False, lines, True, False
+
+    # 签到后积分（尽力而为，不影响成败判定）
     status, data, raw = _call_with_retry(client.me)
     if status == 200 and isinstance(data, dict) and isinstance(data.get("user"), dict):
-        after = f"签到后积分: {data['user'].get('points')}"
-        lines.append(after)
-        print(f"           {after}")
-    return ok_all, lines, False
+        note(f"签到后积分: {data['user'].get('points')}")
+
+    ok_all = all(v in (V_OK, V_ALREADY) for v in verdicts)
+    unconfirmed_only = (not ok_all) and V_FAIL not in verdicts
+    return ok_all, lines, False, unconfirmed_only
 
 
 def run_one_task(account):
@@ -769,15 +889,16 @@ def run_one_task(account):
         token = fallback_token
         note("🔑 使用 MYBT_TOKEN")
 
-    # 登录态失效（401）时最多补救一次，防死循环
+    # 登录态失效（401/403）时最多补救一次，防死循环
     for attempt in (1, 2):
-        client = MybtClient(base_url, token, user_id=jwt_uid(token), secret=secret,
+        client = MybtClient(base_url, token, secret=secret,
                             cookie=cookie, timeout=env_int("MYBT_TIMEOUT", 30),
                             proxy=env_str("MYBT_PROXY"))
-        ok_all, chain_lines, auth_dead = _run_chain(client, do_visit)
+        ok_all, chain_lines, auth_dead, unconfirmed_only = _run_chain(client, do_visit)
         lines.extend(chain_lines)
         if not auth_dead:
-            return {"success": ok_all, "label": label, "message": "；".join(lines)}
+            return {"success": ok_all, "label": label, "message": "；".join(lines),
+                    "unconfirmed": bool(unconfirmed_only)}
         if attempt > 1:
             break
 
@@ -802,7 +923,8 @@ def run_one_task(account):
         else:
             break
         token = session["token"]
-    return {"success": False, "label": label, "message": "；".join(lines) or "登录态失效（HTTP 401）"}
+    return {"success": False, "label": label,
+            "message": "；".join(lines) or "登录态失效（HTTP 401/403）", "unconfirmed": False}
 
 
 # ============================ 主流程 ============================
@@ -830,44 +952,60 @@ def main():
             result = run_one_task(task)
         except Exception:
             traceback.print_exc()
-            result = {"success": False, "label": account_label(task), "message": "脚本异常"}
+            result = {"success": False, "label": account_label(task),
+                      "message": "脚本异常", "unconfirmed": False}
         cost = time.time() - t0
 
         if result.get("success"):
             success_cnt += 1
             print(f"           ✅ 完成 ({cost:.1f}s)\n")
+        elif result.get("unconfirmed"):
+            print(f"           ❓ 未确认 ({cost:.1f}s)\n")
         else:
             print(f"           ❌ 失败 ({cost:.1f}s)\n")
         results.append(result)
 
         # 风控间隔（必须！多账号别一把梭）
         if idx < len(tasks):
-            time.sleep(random.uniform(1, 2))
+            time.sleep(random.uniform(3, 5))
 
     # 汇总报告（Markdown 格式给 notify.py；标题按成败分档）
     total = len(tasks)
+    unconfirmed_results = [r for r in results if not r.get("success") and r.get("unconfirmed")]
+    fail_results = [r for r in results if not r.get("success") and not r.get("unconfirmed")]
     if success_cnt == total:
         title = f"✅ {title} 全部成功（{success_cnt}/{total}）"
-    elif success_cnt == 0:
+    elif success_cnt == 0 and fail_results:
         title = f"❌ {title} 全部失败（0/{total}）"
+    elif success_cnt == 0:
+        title = f"❓ {title} 全部未确认（0/{total}）"
     else:
         title = f"⚠️ {title} 部分失败（{success_cnt}/{total}）"
 
     _label_prefix = re.compile(r"^账号\s*\d+\s*[:：]\s*")
-    ok_lines = [f"- **[{r.get('label', f'账号 {i}')}]** "
-                f"{_label_prefix.sub('', r.get('message') or r.get('error', ''), count=1)}"
-                for i, r in enumerate(results, 1) if r.get("success")]
-    fail_lines = [f"- **[{r.get('label', f'账号 {i}')}]** "
-                  f"{_label_prefix.sub('', r.get('message') or r.get('error', ''), count=1)}"
-                  for i, r in enumerate(results, 1) if not r.get("success")]
+
+    def _fmt(r, i):
+        return (f"- **[{r.get('label', f'账号 {i}')}]** "
+                f"{_label_prefix.sub('', r.get('message') or r.get('error', ''), count=1)}")
+
+    ok_lines = [_fmt(r, i) for i, r in enumerate(results, 1) if r.get("success")]
+    unconfirmed_lines = [_fmt(r, i) for i, r in enumerate(results, 1)
+                         if not r.get("success") and r.get("unconfirmed")]
+    fail_lines = [_fmt(r, i) for i, r in enumerate(results, 1)
+                  if not r.get("success") and not r.get("unconfirmed")]
 
     lines = [f"# {title} - 执行报告", ""]
     lines.append(f"⏰ 执行时间: {datetime.now():%Y-%m-%d %H:%M:%S}")
-    lines.append(f"📊 总计 {total} 个账号，✅ 成功 {success_cnt}，❌ 失败 {total - success_cnt}")
+    lines.append(f"📊 总计 {total} 个账号，✅ 成功 {success_cnt}，"
+                 f"❓ 未确认 {len(unconfirmed_results)}，❌ 失败 {len(fail_results)}")
     lines.append("")
     if ok_lines:
         lines.append("## 成功")
         lines.extend(ok_lines)
+        lines.append("")
+    if unconfirmed_lines:
+        lines.append("## 未确认（响应形态无法确认为成功，按保守口径计为未成功）")
+        lines.extend(unconfirmed_lines)
         lines.append("")
     if fail_lines:
         lines.append("## 失败")
@@ -885,7 +1023,10 @@ def main():
     else:
         print("ℹ️ MYBT_NOTIFY=false，已禁用推送")
 
-    # 退出码：全失败 exit(1)（青龙任务红色标记）；部分失败/全成功 exit(0)
+    # 退出码：默认仅全失败 exit(1)（青龙任务红色标记）；
+    # 配 MYBT_EXIT_STRICT=true 则只要有账号未成功（含未确认）即 exit(1)
+    if env_bool("MYBT_EXIT_STRICT", False):
+        sys.exit(0 if success_cnt == total else 1)
     sys.exit(0 if success_cnt > 0 else 1)
 
 
