@@ -6,7 +6,7 @@
 
 - 单文件 Python 脚本，只依赖 `requests` + 标准库；
 - 支持多站点、多账号；
-- 内置站点：Liminality 贝之中转站、可萌中转站、哈基米 API 站、DZZI.AI；
+- 内置站点：可萌中转站、哈基米 API 站、DZZI.AI；
 - 支持 `QZD_CUSTOM` 扩展任意自定义 API 站（含 Discuz 论坛）；
 - 自动登录、提取 Token / Cookie、签到、识别“今日已签到”；
 - **余额展示**：签到后显示账户总余额；当日首签成功还会显示本次签到获得的额度（按签到前后余额差计算）。内置站已预配 `quota_info_url` 等字段，自定义站可在 `api_config` 中按需添加（`quota_info_url` / `quota_field` / `quota_per_unit` / `quota_currency`）；
@@ -34,7 +34,6 @@ task newapi_checkin/newapi_checkin.py
 
 | 变量名 | 必填 | 格式 | 示例 |
 |---|---:|---|---|
-| `QZD_BEIZHI` | 否 | `用户名#密码`，多账号用 `&` 或换行分隔 | `123#pwd123` |
 | `QZD_API456` | 否 | `用户名#密码`，多账号用 `&` 或换行分隔 | `123#pwd123` |
 | `QZD_GEMAI` | 否 | `用户名#密码`，多账号用 `&` 或换行分隔 | `zhangsan#pwd123` |
 | `QZD_DZZI` | 否 | `用户名#密码`，多账号用 `&` 或换行分隔 | `zhangsan#pwd123` |
@@ -50,7 +49,6 @@ task newapi_checkin/newapi_checkin.py
 
 | key | 名称 | 站点地址 | 认证方式 |
 |---|---|---|---|
-| `beizhi` | Liminality 贝之中转站 | https://beizhi.sylu.cc | Bearer Token（短期 token + 过期时间缓存） |
 | `api456` | 可萌中转站 | https://api456.me | New-Api-User Header + Session Cookie |
 | `gemai` | 哈基米 API 站 | https://api.gemai.cc | New-Api-User Header |
 | `dzzi` | DZZI.AI（大肘子API） | https://api.dzzi.ai | Bearer Token |
@@ -138,7 +136,7 @@ pip install requests
 Linux / macOS：
 
 ```bash
-export QZD_BEIZHI="your_username#yourpass"
+export QZD_API456="your_username#yourpass"
 export QZD_NOTIFY=false
 python newapi_checkin.py
 ```
@@ -146,7 +144,7 @@ python newapi_checkin.py
 Windows PowerShell：
 
 ```powershell
-$env:QZD_BEIZHI="your_username#yourpass"
+$env:QZD_API456="your_username#yourpass"
 $env:QZD_NOTIFY="false"
 python .\newapi_checkin.py
 ```
