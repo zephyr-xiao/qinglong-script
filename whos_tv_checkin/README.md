@@ -18,13 +18,15 @@
 - 支持 **Cookie 认证**（直接复制 Cookie 字符串）；
 - 支持 **账号密码认证**（自动登录获取 Cookie，无需手动维护）；
 - 两种方式可同时使用；
-- 支持多账号，使用 `&` 分隔；
+- 支持多账号，使用 `&` 或换行分隔；
 - 支持代理，适合大陆网络访问受限场景；
-- 自动通过 Cloudflare 人机验证挑战；
+- 自动通过 Cloudflare 人机验证挑战，可区分「挑战中」与「硬拦截」；
+- 挑战中途失效时自动补过一轮挑战并重试该账号；
+- 运行锁防止同一端口并发执行互相劫持浏览器；
 - 自动探测签到接口；
 - 支持"已签到"幂等识别；
 - 支持青龙 `notify.py` 推送；
-- Debug 模式可输出探测路径、状态码和响应片段。
+- Debug 模式可输出探测路径、状态码和响应片段（响应体中的令牌会自动打码）。
 
 ## 环境要求
 
@@ -67,15 +69,16 @@ xvfb-run -a task whos_tv_checkin/whos_tv_checkin.py
 
 | 变量名 | 必填 | 默认值 | 说明 |
 |---|---:|---|---|
-| `WHOSTV_COOKIE` | 二选一 | - | 完整 Cookie 字符串，多账号用 `&` 分隔 |
-| `WHOSTV_ACCOUNT` | 二选一 | - | 账号密码，格式 `用户名#密码`，多账号用 `&` 分隔 |
-| `WHOSTV_PROXY` | 建议 | - | HTTP/SOCKS 代理，国内网络建议配置；留空时自动回退青龙全局代理（`HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY`） |
+| `WHOSTV_COOKIE` | 二选一 | - | 完整 Cookie 字符串，多账号用 `&` 或换行分隔；串里的 `cf_clearance` / `__cf*` 会被忽略（见下文） |
+| `WHOSTV_ACCOUNT` | 二选一 | - | 账号密码，格式 `用户名#密码`，多账号用 `&` 或换行分隔 |
+| `WHOSTV_PROXY` | 建议 | - | HTTP/SOCKS 代理，国内网络建议配置；留空时自动回退青龙全局代理（`HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY`）。支持 `http://`、`socks5://`、`socks5h://` 与 `http://user:pass@host:port` 写法 |
 | `WHOSTV_BROWSER_PATH` | 否 | 自动探测 | 指定 chromium 可执行文件路径（默认自动查找） |
 | `WHOSTV_NOTIFY` | 否 | `true` | 是否调用青龙 `notify.py` 推送 |
 | `WHOSTV_NOTIFY_ONLY_FAIL` | 否 | `false` | 仅当存在失败时才推送（需 `WHOSTV_NOTIFY=true`，全部成功则静默） |
-| `WHOSTV_TIMEOUT` | 否 | `30` | 接口请求超时时间，单位秒 |
-| `WHOSTV_BROWSER_WAIT` | 否 | `180` | 启动 chromium 后等待就绪的最大秒数（受限容器冷启动可能较慢，同时作为 Patchright 启动超时） |
-| `WHOSTV_BROWSER_PORT` | 否 | `9222` | 浏览器调试端口，被其他进程占用时换一个（profile 目录随端口生成） |
+| `WHOSTV_TIMEOUT` | 否 | `30` | 接口请求超时时间，单位秒（最小 `1`，更小的值会回退默认） |
+| `WHOSTV_BROWSER_WAIT` | 否 | `180` | 启动 chromium 后等待就绪的最大秒数（受限容器冷启动可能较慢，同时作为 Patchright 启动超时；最小 `10`） |
+| `WHOSTV_BROWSER_PORT` | 否 | `9222` | 浏览器调试端口，被其他进程占用时换一个（profile 目录与运行锁随端口生成） |
+| `WHOSTV_CHALLENGE_ROUNDS` | 否 | `4` | Cloudflare 挑战总轮数（最小 `1`）。轮数越多，低信誉出口 IP 抽中放行的概率越高，但最坏耗时也越长 |
 | `WHOSTV_DEBUG` | 否 | `false` | 输出探测细节（试过哪些路径、状态码、响应片段） |
 
 > **网络级失败自动重试**：请求拿不到任何 HTTP 响应（超时 / 代理抖动断连）时自动重发
@@ -99,8 +102,35 @@ WHOSTV_PROXY=http://172.17.0.1:7890
 WHOSTV_PROXY=socks5://172.17.0.1:7891
 ```
 
-> 注意：脚本每次运行都会启动一次真实浏览器并等待 Cloudflare 挑战通过
-> （实测约 5~90 秒，波动较大），单次任务总耗时约 1~3 分钟属正常现象。
+## 耗时预期
+
+脚本每次运行都会启动一次真实浏览器并等待 Cloudflare 挑战通过（实测单轮通过约
+5~150 秒，波动很大），所以总耗时随出口 IP 信誉变化明显：
+
+| 情形 | 大致耗时 |
+|---|---|
+| 一轮就通过（常见） | 约 1~4 分钟 |
+| 每多抽一轮 | +3~4 分钟 |
+| 挑战抽到最后一轮才通过 | 约 30 分钟 + 账号处理时间 |
+
+挑战能否通过取决于出口 IP 信誉：同一环境实测放行率约 1/3 且随机，因此脚本用
+「多轮 + 轮间隔刷新」抽签，而不是单轮死等；轮数可用 `WHOSTV_CHALLENGE_ROUNDS` 调。
+若 4 轮全部未通过，脚本会在约 30 分钟后直接失败退出，不会进入账号处理。
+
+## 并发保护
+
+同一 `WHOSTV_BROWSER_PORT`（即同一 profile 目录）同时只允许一个实例运行。脚本会在
+profile 目录下创建运行锁，抢不到锁的实例直接退出并提示，避免两个任务共用同一个
+浏览器、互相 `Browser.close` 造成串号或半途失败。上次异常退出留下的残留锁会被自动
+接管——判定以「持有进程是否还活着」为主（崩溃的实例 pid 已死，下一次运行立刻能接管），
+锁文件时间戳（2 小时）只是 pid 被复用时兜底，不需要手工清理。
+
+## 退出码
+
+- `0`：全部账号成功；
+- `1`：任一账号失败（含部分失败），便于外部监控区分。
+
+> 青龙面板本身不按退出码判定任务成败，这条约定只对自行做监控的场景有意义。
 
 ## 认证方式
 
@@ -118,6 +148,10 @@ WHOSTV_PROXY=socks5://172.17.0.1:7891
 ```text
 WHOSTV_COOKIE=cookie_for_account_1&cookie_for_account_2
 ```
+
+> **Cookie 串里的 `cf_clearance` / `__cf*` 会被自动忽略**：这些是 Cloudflare 与浏览器
+> 指纹绑定的会话值，由脚本启动的浏览器自己维护。若把从别处复制的旧值一起写回去，
+> 反而会覆盖掉会话里刚拿到的新鲜值、重新触发挑战。所以直接整段复制即可，不必手工剔除。
 
 ### 方式二：账号密码认证
 
@@ -208,6 +242,9 @@ xvfb-run -a timeout 30 chromium --no-sandbox --disable-dev-shm-usage \
 - 任务命令使用 `xvfb-run -a` 前缀（headless 无头模式会被拦截）；
 - `WHOSTV_PROXY` 配置正确，代理出口 IP 信誉正常。
 
+> 脚本能识别出"这是 CF 页而不是站点响应"，会自动补过一轮挑战再重试该账号；
+> 若重试后仍报同样的错，说明出口 IP 已不被 CF 接受，需要换代理节点。
+
 ### 报错"响应非 JSON (HTTP 0)"或"登录网络异常"？
 
 HTTP 0 表示请求根本没拿到服务器响应（不是站点拒绝），脚本会打印具体原因并自动重试：
@@ -233,13 +270,23 @@ HTTP 0 表示请求根本没拿到服务器响应（不是站点拒绝），脚�
 - profile 目录用系统临时目录（`%TEMP%\whostv_profile\<端口>`），多端口天然隔离；
   若启动报错提示已有实例占用，换一个 `WHOSTV_BROWSER_PORT` 即可。
 
-### 报错"Cloudflare 挑战未通过"？
+### 报错"Cloudflare 挑战在 N 轮内均未通过"？
 
-脚本会等待挑战最长 120 秒并重试 1 次。若仍失败：
+脚本会等待挑战最长 180 秒 × `WHOSTV_CHALLENGE_ROUNDS` 轮（默认 4 轮）。若仍失败：
 
 - 检查代理是否可用、出口 IP 是否被 Cloudflare 判定为高风险（共享/机房 IP 更容易触发）；
-- 换一个代理节点后重试；
+- 换一个代理节点后重试，或调大 `WHOSTV_CHALLENGE_ROUNDS` 多抽几轮；
 - 可开启 `WHOSTV_DEBUG=true` 观察浏览器启动与挑战状态。
+
+### 报错"出口 IP 被 Cloudflare 硬拦截（Access denied / Error 1020）"？
+
+这和"挑战未通过"不是一回事：CF 直接拒绝了这个出口 IP，重试多少次都没用，只能换代理节点。
+脚本识别到这类页面会立即失败退出，不再空耗轮数。
+
+### 签到中途提示"被 Cloudflare 拦截（挑战已失效）"？
+
+多账号连续执行时 `cf_clearance` 可能中途失效，签到请求拿到的就是 CF 页面而不是业务响应。
+脚本会自动重新过一轮挑战并重试该账号；若仍失败，会提示换代理节点后重跑。
 
 ### 请求超时或连接失败？
 
@@ -279,13 +326,15 @@ WHOSTV_DEBUG=true
 
 ### 多账号怎么配置？
 
-Cookie 模式用 `&` 分隔：
+两种模式的分隔符一致：`&` 或换行都可以。
+
+Cookie 模式：
 
 ```text
 WHOSTV_COOKIE=cookie1&cookie2&cookie3
 ```
 
-账号密码模式用 `&` 分隔，每个账号内部用 `#` 分隔用户名和密码：
+账号密码模式，每个账号内部用 `#` 分隔用户名和密码：
 
 ```text
 WHOSTV_ACCOUNT=user1@mail.com#pass1&user2@mail.com#pass2
@@ -293,3 +342,13 @@ WHOSTV_ACCOUNT=user1@mail.com#pass1&user2@mail.com#pass2
 
 > 多账号共用同一浏览器实例，切换账号时会清空业务 Cookie 但保留
 > `cf_clearance`（与浏览器指纹绑定，清掉会重新触发挑战）。
+> 若某个账号签到途中 `cf_clearance` 失效，脚本会自动补过一轮挑战再重试该账号。
+
+### 怎么跑本地测试？
+
+纯函数单测（不启动浏览器、不访问站点）：
+
+```bash
+pip install pytest
+python -m pytest tests -q
+```
