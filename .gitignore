@@ -24,6 +24,9 @@ cookies/
 *_log.txt
 replied_posts.json
 
+# 运行锁（防并发/重复消耗站点登录配额，运行期自动生成）
+pt-checkin/*.lock
+
 # 账号清单（含明文密码，严禁提交）与单元测试临时产物
 *_accounts.txt
 .test_tmp/
@@ -33,6 +36,12 @@ _ikuuu_debug/
 
 # 点选验证码解法器调试产物（合成图 + 模型原始回复）
 _vlm_debug/
+
+# 采蘑菇回帖脚本调试截屏（CAIMOGU_DEBUG=true 产出）
+_caimogu_debug_*.png
+
+# ZodGame 签到调试产物（ZODGAME_DEBUG=true 产出，含完整响应报文）
+_zodgame_debug/
 
 # IDE
 .vscode/
