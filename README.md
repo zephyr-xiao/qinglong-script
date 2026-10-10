@@ -7,21 +7,21 @@
 | 脚本 | 说明 | 文档 | 青龙任务命令 |
 |---|---|---|---|
 | E-Hentai 自动签到 | E-Hentai 每日签到领 Exp/Credits，Cookie 认证，TLS 1.2 回退 + Cookie 过期预警 | [AkiyaKiko_EhentaiAutoSignIn/autosignin.py](AkiyaKiko_EhentaiAutoSignIn/autosignin.py) | `task AkiyaKiko_EhentaiAutoSignIn/autosignin.py` |
-| 老王FIP签到（浏览器版） | Discuz + tncode 滑块 + 前端 JS 签名，使用 Playwright + OpenCV 自动登录签到 | [laowangfip_browser_checkin/README.md](laowangfip_browser_checkin/README.md) | `task laowangfip_browser_checkin/laowangfip_browser_checkin.py` |
-| New API 站点自动签到 | 多站点 API/Discuz 签到，内置 Liminality 贝之/可萌/哈基米/DZZI.AI 等站点并支持 `QZD_CUSTOM` 自定义站点，凭证 token/Cookie 缓存复用 | [newapi_checkin/README.md](newapi_checkin/README.md) | `task newapi_checkin/newapi_checkin.py` |
-| whos.tv 签到 | Cookie 签到，带接口探测和代理支持 | [whos_tv_checkin/README.md](whos_tv_checkin/README.md) | `task whos_tv_checkin/whos_tv_checkin.py` |
+| 老王FIP签到 | Discuz + tncode 滑块（XOR + FNV-1a 签名本地复现），requests + OpenCV 自动登录签到 | [laowangfip_checkin/README.md](laowangfip_checkin/README.md) | `task laowangfip_checkin/laowangfip_checkin.py` |
+| New API 站点自动签到 | 多站点 API/Discuz 签到，内置可萌/哈基米/DZZI.AI 等站点并支持 `QZD_CUSTOM` 自定义站点，凭证 token/Cookie 缓存复用 | [newapi_checkin/README.md](newapi_checkin/README.md) | `task newapi_checkin/newapi_checkin.py` |
+| whos.tv 签到 | Patchright 驱动真实浏览器过 Cloudflare 托管挑战，Cookie / 账号密码双认证，多账号 + 运行锁防并发 + 挑战失效自愈 | [whos_tv_checkin/README.md](whos_tv_checkin/README.md) | `xvfb-run -a task whos_tv_checkin/whos_tv_checkin.py` |
 | SophNet 签到 | www.sophnet.com 福利中心签到，refreshToken 换 accessToken，纯 API 免验证码 | [sophnet_checkin/README.md](sophnet_checkin/README.md) | `task sophnet_checkin/sophnet_checkin.py` |
 | iKuuu 签到（Node.js） | ikuuu 机场签到，账号密码自动登录（Geetest 点选验证码由视觉大模型解法器过码，支持备用模型/备用解法器链）+ Cookie 缓存续期 + cookie 直填双模式 + 动态域名 + 多账号 + 失败延迟重试 | [wuang-wu_Ikuuu/README.md](wuang-wu_Ikuuu/README.md) | `task wuang-wu_Ikuuu/ikuuu.js` |
-| gpt.qt.cool 签到 | gpt.qt.cool 签到，Playwright + OpenCV 滑动验证码自动识别，登录态 storage_state 缓存复用 | [gptqtcool_checkin/README.md](gptqtcool_checkin/README.md) | `task gptqtcool_checkin/gptqtcool_checkin.py` |
-| 司机社签到 | xsijishe 司机社签到，Cookie 直签或邮箱 + 本地 ddddocr OCR 登录，Cookie 缓存复用 | [xsijishe_checkin/README.md](xsijishe_checkin/README.md) | `task xsijishe_checkin/xsijishe_checkin.py` |
+| gpt.qt.cool 签到 | gpt.qt.cool 签到，Playwright + OpenCV 滑动验证码自动识别（高亮/模板/边缘多候选缺口定位），登录态 storage_state 缓存复用 + 401 自愈，整轮重试可配，支持 `--check` 自检 | [gptqtcool_checkin/README.md](gptqtcool_checkin/README.md) | `task gptqtcool_checkin/gptqtcool_checkin.py` |
+| 司机社签到 | 司机社（sjs96 / dlsjs / xsijishe 等多镜像）Discuz 签到，Cookie 直签或邮箱密码登录（ddddocr 仅作验证码防御路径），内置实测可用域名 + 失败自动切换 + 运行时域名排序学习 + 连续登录失败熔断，Cookie 缓存复用 | [xsijishe_checkin/README.md](xsijishe_checkin/README.md) | `task xsijishe_checkin/xsijishe_checkin.py` |
 | 采蘑菇论坛回帖签到 | caimogu.cc 自动回帖刷活跃度，Playwright 驱动 + AI/模板双模式评论生成（反套话词库、REPLY/SKIP 判定、防重复回帖） | [caimogu_checkin/README.md](caimogu_checkin/README.md) | `task caimogu_checkin/caimogu_checkin.py` |
 | 雨云自动签到 | 雨云服务器签到 + 自动续费，多账号 + 验证码识别，专为青龙面板优化 | [Rainyun/README.md](Rainyun/README.md) | `task Rainyun/main.py` |
 | 天翼云盘签到 | cloud189-sdk 登录签到，多账号 + 个人/家庭容量统计，复用 sendNotify.js 全通道推送 | [Cloud189Checkin/README.md](Cloud189Checkin/README.md) | `task Cloud189Checkin/src/app.js` |
-| PT 签到（Node.js） | NovaHD / HDArea / BTSchool 三站签到，Cookie 失效自动登录兜底（视觉模型识别验证码），登录限次保护防封 IP | [pt-checkin/README.md](pt-checkin/README.md) | `task pt-checkin/pt_checkin.js` |
+| PT 签到（Node.js） | NovaHD / HDArea / BTSchool / CrabPT 四站签到，Cookie 失效自动登录兜底（视觉模型识别验证码），正向证据制判定 + 登录限次保护 + 运行锁防并发/重复消耗配额 | [pt-checkin/README.md](pt-checkin/README.md) | `task pt-checkin/pt_checkin.js` |
 | TG签到（tg-signer） | Telegram 群/机器人自动签到，基于 tg-signer 封装，扫码登录多账号，支持发消息+点按钮+定时撤回 | [tg-signer-ql/README.md](tg-signer-ql/README.md) | `task tg-signer-ql/tg_signer_ql.py` |
-| ZodGame 签到 | zodgame.xyz 每日签到 + BUX 广告任务（每个 +2 点币），Cookie 认证，幂等跳过，Cookie 失效推送告警 | [zodgame_checkin/README.md](zodgame_checkin/README.md) | `task zodgame_checkin/zodgame_checkin.py` |
+| ZodGame 签到 | zodgame.xyz 每日签到 + BUX 广告任务，Cookie 认证，广告任务按 `do=check` 接口判定成败（动态倒计时），Cookie 失效/CF 拦截/网络异常/疑似改版四类分开告警，代理回退，`--check` 自检，退出码三档 | [zodgame_checkin/README.md](zodgame_checkin/README.md) | `task zodgame_checkin/zodgame_checkin.py` |
 | 嘉立创签到 | m.jlc.com 每日签到领金豆，第七天自动领 8 金豆券，AccessToken 认证，幂等跳过，Token 失效告警 | [jlc_checkin/README.md](jlc_checkin/README.md) | `task jlc_checkin/jlc_checkin.py` |
-| 纸鸢下载签到 | mybt.kiteyuan.info 每日签到 + 访问任务，Casdoor 账号密码自动登录换 JWT，JWT 缓存复用（401 才重登），多账号 + 网络重试，幂等跳过 | [mybt-checkin-ql/README.md](mybt-checkin-ql/README.md) | `task mybt-checkin-ql/mybt_checkin.py` |
+| 纸鸢下载签到 | mybt.kiteyuan.info 每日签到 + 访问任务，Casdoor 账号密码自动登录换 JWT，JWT 缓存原子复用（401/403 才重登），多账号 + 网络重试，分层判定 + 未确认档位 | [mybt-checkin-ql/README.md](mybt-checkin-ql/README.md) | `task mybt-checkin-ql/mybt_checkin.py` |
 | 福利吧预注册签到 | wnflb2023.com「游客预注册签到」插件，连续签到 30 天转正，Cookie 直签或账号密码登录（验证码 ddddocr 自动识别 + Cookie 缓存），幂等跳过 + 进度统计 | [wnflb_checkin/README.md](wnflb_checkin/README.md) | `task wnflb_checkin/wnflb_checkin.py` |
 | 尚香书苑签到 | sxsy45.com Discuz k_misign 签到，登录图片验证码 ddddocr 自动识别 + 算术验证自动计算，Cookie 直签或账密登录（Cookie 缓存复用），幂等跳过 + 签到统计 | [sxsy45_checkin/README.md](sxsy45_checkin/README.md) | `task sxsy45_checkin/sxsy45_checkin.py` |
 | 维咔VikACG签到 | www.vikacg.cc 钱包签到领积分，账密登录换 JWT 双 token（30 天）+ refreshToken 静默续期 + 设备指纹持久化，完整浏览器头模拟免验证码，401 三级降级链，409 已签到幂等，代理支持 | [vikacg_checkin/README.md](vikacg_checkin/README.md) | `task vikacg_checkin/vikacg_checkin.py` |
@@ -58,7 +58,7 @@
 例如：
 
 ```text
-task laowangfip_browser_checkin/laowangfip_browser_checkin.py
+task laowangfip_checkin/laowangfip_checkin.py
 task newapi_checkin/newapi_checkin.py
 task whos_tv_checkin/whos_tv_checkin.py
 ```
