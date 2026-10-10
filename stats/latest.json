@@ -1,13 +1,13 @@
 {
-  "fetched_at": "2026-10-09T07:16:00+00:00",
+  "fetched_at": "2026-10-10T06:52:58+00:00",
   "repo": "zephyr-xiao/qinglong-script",
   "views_14d": {
-    "count": 94,
-    "uniques": 24
+    "count": 130,
+    "uniques": 28
   },
   "clones_14d": {
-    "count": 207,
-    "uniques": 101
+    "count": 218,
+    "uniques": 103
   },
   "stars": 2,
   "forks": 1,
@@ -15,8 +15,8 @@
   "referrers": [
     {
       "referrer": "github.com",
-      "views": 32,
-      "uniques": 17
+      "views": 45,
+      "uniques": 21
     },
     {
       "referrer": "Bing",
@@ -27,8 +27,13 @@
   "popular_paths": [
     {
       "path": "/zephyr-xiao/qinglong-script",
-      "views": 37,
-      "uniques": 20
+      "views": 49,
+      "uniques": 24
+    },
+    {
+      "path": "/zephyr-xiao/qinglong-script/tree/main/wuang-wu_Ikuuu",
+      "views": 9,
+      "uniques": 4
     },
     {
       "path": "/zephyr-xiao/qinglong-script/tree/main/laowangfip_browser_checkin",
@@ -36,9 +41,9 @@
       "uniques": 4
     },
     {
-      "path": "/zephyr-xiao/qinglong-script/tree/main/wuang-wu_Ikuuu",
-      "views": 6,
-      "uniques": 4
+      "path": "/zephyr-xiao/qinglong-script/blob/main/wuang-wu_Ikuuu/ikuuu.js",
+      "views": 4,
+      "uniques": 3
     },
     {
       "path": "/zephyr-xiao/qinglong-script/blob/main/jlc_checkin/README.md",
@@ -56,22 +61,17 @@
       "uniques": 3
     },
     {
-      "path": "/zephyr-xiao/qinglong-script/blob/main/jlc_checkin/jlc_checkin.py",
-      "views": 2,
+      "path": "/zephyr-xiao/qinglong-script/blob/main/stats/README.md",
+      "views": 3,
       "uniques": 2
     },
     {
-      "path": "/zephyr-xiao/qinglong-script/blob/main/quan_zidong_zhushou/README.md",
-      "views": 2,
-      "uniques": 2
+      "path": "/zephyr-xiao/qinglong-script/commits/main",
+      "views": 3,
+      "uniques": 1
     },
     {
-      "path": "/zephyr-xiao/qinglong-script/tree/main/Rainyun",
-      "views": 2,
-      "uniques": 2
-    },
-    {
-      "path": "/zephyr-xiao/qinglong-script/tree/main/caimogu_checkin",
+      "path": "/zephyr-xiao/qinglong-script/blob/main/Cloud189Checkin/README.md",
       "views": 2,
       "uniques": 2
     }
