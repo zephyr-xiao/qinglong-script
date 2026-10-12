@@ -1,13 +1,13 @@
 {
-  "fetched_at": "2026-10-11T06:57:27+00:00",
+  "fetched_at": "2026-10-12T07:10:14+00:00",
   "repo": "zephyr-xiao/qinglong-script",
   "views_14d": {
-    "count": 130,
-    "uniques": 28
+    "count": 125,
+    "uniques": 29
   },
   "clones_14d": {
-    "count": 218,
-    "uniques": 103
+    "count": 272,
+    "uniques": 120
   },
   "stars": 3,
   "forks": 1,
@@ -15,7 +15,7 @@
   "referrers": [
     {
       "referrer": "github.com",
-      "views": 45,
+      "views": 43,
       "uniques": 21
     },
     {
@@ -28,7 +28,7 @@
     {
       "path": "/zephyr-xiao/qinglong-script",
       "views": 49,
-      "uniques": 24
+      "uniques": 25
     },
     {
       "path": "/zephyr-xiao/qinglong-script/tree/main/wuang-wu_Ikuuu",
@@ -41,22 +41,12 @@
       "uniques": 4
     },
     {
-      "path": "/zephyr-xiao/qinglong-script/blob/main/wuang-wu_Ikuuu/ikuuu.js",
+      "path": "/zephyr-xiao/qinglong-script/commits/main",
       "views": 4,
-      "uniques": 3
-    },
-    {
-      "path": "/zephyr-xiao/qinglong-script/blob/main/jlc_checkin/README.md",
-      "views": 4,
-      "uniques": 2
+      "uniques": 1
     },
     {
       "path": "/zephyr-xiao/qinglong-script/blob/main/AkiyaKiko_EhentaiAutoSignIn/autosignin.py",
-      "views": 3,
-      "uniques": 3
-    },
-    {
-      "path": "/zephyr-xiao/qinglong-script/blob/main/wuang-wu_Ikuuu/README.md",
       "views": 3,
       "uniques": 3
     },
@@ -66,12 +56,22 @@
       "uniques": 2
     },
     {
-      "path": "/zephyr-xiao/qinglong-script/commits/main",
+      "path": "/zephyr-xiao/qinglong-script/blob/main/wuang-wu_Ikuuu/ikuuu.js",
       "views": 3,
-      "uniques": 1
+      "uniques": 2
     },
     {
       "path": "/zephyr-xiao/qinglong-script/blob/main/Cloud189Checkin/README.md",
+      "views": 2,
+      "uniques": 2
+    },
+    {
+      "path": "/zephyr-xiao/qinglong-script/blob/main/quan_zidong_zhushou/README.md",
+      "views": 2,
+      "uniques": 2
+    },
+    {
+      "path": "/zephyr-xiao/qinglong-script/blob/main/wuang-wu_Ikuuu/README.md",
       "views": 2,
       "uniques": 2
     }
