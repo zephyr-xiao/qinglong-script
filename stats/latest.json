@@ -1,12 +1,12 @@
 {
-  "fetched_at": "2026-10-13T07:34:05+00:00",
+  "fetched_at": "2026-10-14T05:58:12+00:00",
   "repo": "zephyr-xiao/qinglong-script",
   "views_14d": {
-    "count": 126,
+    "count": 125,
     "uniques": 28
   },
   "clones_14d": {
-    "count": 275,
+    "count": 280,
     "uniques": 120
   },
   "stars": 3,
@@ -15,20 +15,20 @@
   "referrers": [
     {
       "referrer": "github.com",
-      "views": 46,
-      "uniques": 21
+      "views": 45,
+      "uniques": 20
     },
     {
       "referrer": "Bing",
-      "views": 5,
+      "views": 4,
       "uniques": 3
     }
   ],
   "popular_paths": [
     {
       "path": "/zephyr-xiao/qinglong-script",
-      "views": 51,
-      "uniques": 24
+      "views": 50,
+      "uniques": 23
     },
     {
       "path": "/zephyr-xiao/qinglong-script/tree/main/wuang-wu_Ikuuu",
@@ -37,7 +37,7 @@
     },
     {
       "path": "/zephyr-xiao/qinglong-script/tree/main/laowangfip_browser_checkin",
-      "views": 6,
+      "views": 5,
       "uniques": 4
     },
     {
@@ -47,6 +47,11 @@
     },
     {
       "path": "/zephyr-xiao/qinglong-script/blob/main/AkiyaKiko_EhentaiAutoSignIn/autosignin.py",
+      "views": 3,
+      "uniques": 3
+    },
+    {
+      "path": "/zephyr-xiao/qinglong-script/tree/main/Rainyun",
       "views": 3,
       "uniques": 3
     },
@@ -67,11 +72,6 @@
     },
     {
       "path": "/zephyr-xiao/qinglong-script/blob/main/quan_zidong_zhushou/README.md",
-      "views": 2,
-      "uniques": 2
-    },
-    {
-      "path": "/zephyr-xiao/qinglong-script/blob/main/wuang-wu_Ikuuu/README.md",
       "views": 2,
       "uniques": 2
     }
