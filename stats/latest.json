@@ -1,13 +1,13 @@
 {
-  "fetched_at": "2026-10-17T05:26:30+00:00",
+  "fetched_at": "2026-10-18T05:37:56+00:00",
   "repo": "zephyr-xiao/qinglong-script",
   "views_14d": {
-    "count": 125,
-    "uniques": 29
+    "count": 111,
+    "uniques": 30
   },
   "clones_14d": {
-    "count": 286,
-    "uniques": 122
+    "count": 302,
+    "uniques": 130
   },
   "stars": 3,
   "forks": 1,
@@ -16,7 +16,7 @@
     {
       "referrer": "github.com",
       "views": 46,
-      "uniques": 21
+      "uniques": 22
     },
     {
       "referrer": "Bing",
@@ -28,11 +28,11 @@
     {
       "path": "/zephyr-xiao/qinglong-script",
       "views": 51,
-      "uniques": 24
+      "uniques": 25
     },
     {
       "path": "/zephyr-xiao/qinglong-script/tree/main/wuang-wu_Ikuuu",
-      "views": 9,
+      "views": 8,
       "uniques": 4
     },
     {
@@ -41,7 +41,7 @@
       "uniques": 1
     },
     {
-      "path": "/zephyr-xiao/qinglong-script/tree/main/Rainyun",
+      "path": "/zephyr-xiao/qinglong-script/blob/main/Cloud189Checkin/README.md",
       "views": 3,
       "uniques": 3
     },
@@ -71,7 +71,7 @@
       "uniques": 2
     },
     {
-      "path": "/zephyr-xiao/qinglong-script/blob/main/Cloud189Checkin/README.md",
+      "path": "/zephyr-xiao/qinglong-script/blob/main/wuang-wu_Ikuuu/README.md",
       "views": 2,
       "uniques": 2
     }
