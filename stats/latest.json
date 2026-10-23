@@ -1,13 +1,13 @@
 {
-  "fetched_at": "2026-10-21T05:51:35+00:00",
+  "fetched_at": "2026-10-23T05:52:19+00:00",
   "repo": "zephyr-xiao/qinglong-script",
   "views_14d": {
-    "count": 75,
-    "uniques": 28
+    "count": 68,
+    "uniques": 25
   },
   "clones_14d": {
-    "count": 159,
-    "uniques": 66
+    "count": 145,
+    "uniques": 60
   },
   "stars": 4,
   "forks": 1,
@@ -15,28 +15,23 @@
   "referrers": [
     {
       "referrer": "github.com",
-      "views": 33,
-      "uniques": 19
+      "views": 29,
+      "uniques": 18
     },
     {
       "referrer": "Bing",
-      "views": 2,
-      "uniques": 2
+      "views": 1,
+      "uniques": 1
     }
   ],
   "popular_paths": [
     {
       "path": "/zephyr-xiao/qinglong-script",
-      "views": 33,
-      "uniques": 21
+      "views": 30,
+      "uniques": 19
     },
     {
       "path": "/zephyr-xiao/qinglong-script/commits/main",
-      "views": 6,
-      "uniques": 2
-    },
-    {
-      "path": "/zephyr-xiao/qinglong-script/tree/main/wuang-wu_Ikuuu",
       "views": 6,
       "uniques": 2
     },
@@ -47,6 +42,11 @@
     },
     {
       "path": "/zephyr-xiao/qinglong-script/blob/main/wuang-wu_Ikuuu/ikuuu.js",
+      "views": 3,
+      "uniques": 2
+    },
+    {
+      "path": "/zephyr-xiao/qinglong-script/tree/main/wuang-wu_Ikuuu",
       "views": 3,
       "uniques": 2
     },
