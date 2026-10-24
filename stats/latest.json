@@ -1,21 +1,21 @@
 {
-  "fetched_at": "2026-10-23T05:52:19+00:00",
+  "fetched_at": "2026-10-24T05:35:54+00:00",
   "repo": "zephyr-xiao/qinglong-script",
   "views_14d": {
-    "count": 68,
+    "count": 49,
     "uniques": 25
   },
   "clones_14d": {
-    "count": 145,
-    "uniques": 60
+    "count": 156,
+    "uniques": 65
   },
   "stars": 4,
-  "forks": 1,
+  "forks": 2,
   "watchers": 0,
   "referrers": [
     {
       "referrer": "github.com",
-      "views": 29,
+      "views": 26,
       "uniques": 18
     },
     {
@@ -27,26 +27,16 @@
   "popular_paths": [
     {
       "path": "/zephyr-xiao/qinglong-script",
-      "views": 30,
+      "views": 28,
       "uniques": 19
     },
     {
       "path": "/zephyr-xiao/qinglong-script/commits/main",
-      "views": 6,
+      "views": 5,
       "uniques": 2
     },
     {
       "path": "/zephyr-xiao/qinglong-script/blob/main/Cloud189Checkin/README.md",
-      "views": 3,
-      "uniques": 2
-    },
-    {
-      "path": "/zephyr-xiao/qinglong-script/blob/main/wuang-wu_Ikuuu/ikuuu.js",
-      "views": 3,
-      "uniques": 2
-    },
-    {
-      "path": "/zephyr-xiao/qinglong-script/tree/main/wuang-wu_Ikuuu",
       "views": 3,
       "uniques": 2
     },
@@ -56,22 +46,32 @@
       "uniques": 2
     },
     {
-      "path": "/zephyr-xiao/qinglong-script/tree/main",
-      "views": 2,
-      "uniques": 2
-    },
-    {
-      "path": "/zephyr-xiao/qinglong-script/commit/481f1003fe60678c47d87ca40af10a70a1e1ee77",
-      "views": 2,
-      "uniques": 1
-    },
-    {
       "path": "/zephyr-xiao/qinglong-script/commit/f7e2620f63433dff4ad6ff513e5736fc43261e55",
       "views": 2,
       "uniques": 1
     },
     {
-      "path": "/zephyr-xiao/qinglong-script/blob/4552bcdc0e4cf1fe6bf0e3818f92c5b5a691d61d/tg-signer-ql/tg_signer_ql.py",
+      "path": "/zephyr-xiao/qinglong-script/blob/main/Rainyun/README.md",
+      "views": 1,
+      "uniques": 1
+    },
+    {
+      "path": "/zephyr-xiao/qinglong-script/blob/main/jlc_checkin/jlc_checkin.py",
+      "views": 1,
+      "uniques": 1
+    },
+    {
+      "path": "/zephyr-xiao/qinglong-script/commit/0d4c67b47fe85cf60be78d93f139737fc5a4818d",
+      "views": 1,
+      "uniques": 1
+    },
+    {
+      "path": "/zephyr-xiao/qinglong-script/commit/b276b71c33e813706696cd91b30d4c27dacd7888",
+      "views": 1,
+      "uniques": 1
+    },
+    {
+      "path": "/zephyr-xiao/qinglong-script/commit/f27e0317e52557f749429bc0abe2b565f2eafc41",
       "views": 1,
       "uniques": 1
     }
