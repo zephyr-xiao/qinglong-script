@@ -6,7 +6,8 @@
 
 - 站点为 Nuxt 3 SSR 应用（Moonlight 主题），同源 API：`https://www.vikacg.cc/api/vikacg/v1/*`
 - 登录即发 JWT 双 token（**有效期 30 天**），`Authorization: Bearer <token>` 鉴权
-- 签到端点 `userMission` 幂等友好：未签返回 200 + 签到数据；已签返回 **HTTP 409「用户今天已签到」**（按成功处理）
+- 签到端点 `userMission` 幂等友好：未签返回 200 + 签到数据；已签返回 **HTTP 409「用户今天已签到」**（按成功处理）。
+  幂等判定为**双门槛**（HTTP 409 且命中已签关键词），关键词不做全局匹配，避免未来成功文案含「已签」时误判；200+success 一律按成功解析，文案自带已签语义时如实输出「已签到」
 - **服务端校验浏览器特征头**（`Sec-Fetch-*`、`Sec-Ch-Ua*`、`X-Client-Name: VikACG Moonlight`、`Architecture: AixPot`、`X-Device-Code`、`X-Client-Code` 等），缺失直接报「非法的客户端，请下载官方版本」——脚本已内置完整头模拟，勿删改 `BASE_HEADERS`
 - 设备指纹（`X-Device-Code` / `X-Client-Code`，UUIDv4）与 token 绑定，随缓存持久化复用，避免每次运行换设备触发风控
 
@@ -39,13 +40,19 @@ VIKACG_ACCOUNTS=user1@example.com#pass1&user2@example.com#pass2
 
 ## 凭证缓存与降级链
 
-登录态缓存在脚本同目录 `vikacg_token.json`（**只存 token / refreshToken / 设备指纹，绝不存密码**），按账号隔离：
+登录态缓存在脚本同目录 `vikacg_token.json`（**只存 token / refreshToken / 设备指纹，绝不存密码**），按账号隔离，**原子写**（先落 `.tmp` 再 `os.replace`）+ 权限收紧 **0600**（青龙 Linux 下生效）：
 
-1. 缓存 token 有效（JWT exp 剩余 > 12h）→ 直接签到
+1. 缓存 token 有效（JWT exp 剩余 > 12h，且设备指纹完整）→ 直接签到
 2. 过期 → 先 `POST /refreshToken` 静默续期（不触碰登录流程，对风控友好）
 3. 续期失败 → 才重新账密登录并覆盖缓存
 
 签到时遇 401 同样走「续期 → 重登」降级链，且**只重试一次**，防死循环。
+缓存条目缺设备指纹（手工编辑/老版本缓存）视为无效，自动走重登链补齐。
+
+## 网络重试与报错分类
+
+连接类网络异常（连接/响应超时、连接失败、代理失败、TLS 失败）自动重试 **2 次**（间隔 3s、6s），业务响应（4xx/5xx）不重试；重试耗尽后按异常类型分类报错，直连被掐会明确提示配置 `VIKACG_PROXY`。续期遇网络不可达时快速失败，不再白跑一轮登录重试。
+非 JSON 响应（如 Cloudflare 挑战页/网关错误页）会去除 HTML 标签后截断进日志，并标注「疑似 CF/网关拦截页」，不会把 HTML 原文带进推送。
 
 ## 常见问题
 

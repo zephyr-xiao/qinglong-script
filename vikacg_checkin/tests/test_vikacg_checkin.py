@@ -12,6 +12,8 @@ import time
 import unittest
 from unittest import mock
 
+import requests
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import vikacg_checkin as vc  # noqa: E402
@@ -136,7 +138,8 @@ class TestTokenCache(unittest.TestCase):
     def test_usable_by_jwt_exp(self):
         exp = int(time.time()) + 24 * 3600  # 24h 后过期，> 12h 余量
         token = TestJwtExp._make_jwt({"exp": exp})
-        self.assertTrue(vc.cached_token_usable({"token": token}))
+        self.assertTrue(vc.cached_token_usable(
+            {"token": token, "deviceCode": "d", "clientCode": "c"}))
 
     def test_expired_by_jwt_exp(self):
         exp = int(time.time()) + 1 * 3600  # 1h 后过期，< 12h 余量 → 视为不可用
@@ -152,17 +155,22 @@ class TestTokenCache(unittest.TestCase):
         fresh = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d %H:%M:%S")
         stale = (datetime.now() - timedelta(days=20)).strftime("%Y-%m-%d %H:%M:%S")
         self.assertTrue(vc.cached_token_usable(
-            {"token": "plain-token", "update_time": fresh}))
+            {"token": "plain-token", "update_time": fresh,
+             "deviceCode": "d", "clientCode": "c"}))
         self.assertFalse(vc.cached_token_usable(
-            {"token": "plain-token", "update_time": stale}))
+            {"token": "plain-token", "update_time": stale,
+             "deviceCode": "d", "clientCode": "c"}))
         # update_time 缺失/损坏 → 不可用
-        self.assertFalse(vc.cached_token_usable({"token": "plain-token"}))
+        self.assertFalse(vc.cached_token_usable(
+            {"token": "plain-token", "deviceCode": "d", "clientCode": "c"}))
 
     def test_jwt_without_exp_falls_back_to_ttl(self):
         from datetime import datetime, timedelta
         fresh = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d %H:%M:%S")
         token = TestJwtExp._make_jwt({"uid": 1})  # 合法 JWT 但无 exp 字段
-        self.assertTrue(vc.cached_token_usable({"token": token, "update_time": fresh}))
+        self.assertTrue(vc.cached_token_usable(
+            {"token": token, "update_time": fresh,
+             "deviceCode": "d", "clientCode": "c"}))
 
 
 class TestRunOneTask(unittest.TestCase):
@@ -328,6 +336,257 @@ class TestEnsureToken(unittest.TestCase):
              mock.patch.object(vc, "write_token_cache"):
             auth = vc.ensure_token(mock.MagicMock(), "a@x.com", "pw", 30)
         self.assertIn("error", auth)
+
+
+class TestCachedTokenUsableExtra(unittest.TestCase):
+    """设备指纹完整性：缺任一字段的缓存判无效，走续期/重登链补齐。"""
+
+    def test_missing_device_code(self):
+        exp = int(time.time()) + 24 * 3600
+        token = TestJwtExp._make_jwt({"exp": exp})
+        self.assertFalse(vc.cached_token_usable({"token": token, "clientCode": "c"}))
+
+    def test_missing_client_code(self):
+        exp = int(time.time()) + 24 * 3600
+        token = TestJwtExp._make_jwt({"exp": exp})
+        self.assertFalse(vc.cached_token_usable({"token": token, "deviceCode": "d"}))
+
+    def test_complete_entry_ok(self):
+        exp = int(time.time()) + 24 * 3600
+        token = TestJwtExp._make_jwt({"exp": exp})
+        self.assertTrue(vc.cached_token_usable(
+            {"token": token, "deviceCode": "d", "clientCode": "c"}))
+
+
+class TestWriteTokenCacheAtomic(unittest.TestCase):
+    """原子写：落盘后无 .tmp 残留；写坏旧缓存也能自愈重建。"""
+
+    def setUp(self):
+        self._orig_file = vc.TOKEN_CACHE_FILE
+        import tempfile
+        fd, path = tempfile.mkstemp(suffix=".json")
+        os.close(fd)
+        self._tmp_path = path
+        vc.TOKEN_CACHE_FILE = vc.Path(path)
+
+    def tearDown(self):
+        vc.TOKEN_CACHE_FILE = self._orig_file
+        for p in (self._tmp_path, self._tmp_path + ".tmp"):
+            if os.path.exists(p):
+                os.remove(p)
+
+    def test_no_tmp_leftover(self):
+        vc.write_token_cache("a@x.com", {"token": "t", "refreshToken": "r",
+                                         "deviceCode": "d", "clientCode": "c"})
+        self.assertFalse(os.path.exists(self._tmp_path + ".tmp"))
+        self.assertTrue(os.path.exists(self._tmp_path))
+
+    def test_corrupted_old_cache_rebuilt(self):
+        with open(self._tmp_path, "w", encoding="utf-8") as f:
+            f.write("{corrupted json!!")
+        vc.write_token_cache("a@x.com", {"token": "t", "refreshToken": "r",
+                                         "deviceCode": "d", "clientCode": "c"})
+        cache = vc.read_token_cache()
+        self.assertEqual(cache["a@x.com"]["token"], "t")
+
+
+class TestNetworkErrorHelpers(unittest.TestCase):
+    """网络异常分类与重试耗尽异常。"""
+
+    def test_describe_hierarchy_order(self):
+        # ConnectTimeout/ProxyError/SSLError 都是 ConnectionError 子类，必须先特判
+        self.assertEqual(vc.describe_network_error(
+            requests.exceptions.ConnectTimeout("x")), "连接超时")
+        self.assertEqual(vc.describe_network_error(
+            requests.exceptions.ReadTimeout("x")), "响应超时")
+        self.assertIn("代理", vc.describe_network_error(
+            requests.exceptions.ProxyError("x")))
+        self.assertIn("TLS", vc.describe_network_error(
+            requests.exceptions.SSLError("x")))
+        self.assertIn("VIKACG_PROXY", vc.describe_network_error(
+            requests.exceptions.ConnectionError("x")))
+
+    def test_describe_fallback(self):
+        self.assertEqual(vc.describe_network_error(ValueError("boom")), "boom")
+        self.assertEqual(vc.describe_network_error(ValueError()), "ValueError")
+
+    def test_is_runtime_error(self):
+        self.assertTrue(issubclass(vc.NetworkError, RuntimeError))
+
+
+class TestApiPostRetry(unittest.TestCase):
+    """api_post 网络重试：连接类异常重试 2 次，业务响应不重试。"""
+
+    def setUp(self):
+        self.session = mock.MagicMock()
+
+    def test_retry_then_success(self):
+        resp = mock.MagicMock()
+        resp.status_code = 200
+        resp.json.return_value = {"status": "success"}
+        self.session.post.side_effect = [
+            requests.exceptions.ConnectionError("reset"),
+            requests.exceptions.Timeout("t"), resp]
+        with mock.patch.object(vc.time, "sleep") as ms:
+            r = vc.api_post(self.session, "/userMission", {}, "d", "c", token="t")
+        self.assertEqual(r["http_code"], 200)
+        self.assertEqual(self.session.post.call_count, 3)
+        self.assertEqual(ms.call_count, 2)  # 两次失败各 sleep 一次（3s、6s）
+
+    def test_exhausted_raises_network_error(self):
+        self.session.post.side_effect = requests.exceptions.ConnectionError("reset")
+        with mock.patch.object(vc.time, "sleep"):
+            with self.assertRaises(vc.NetworkError) as cm:
+                vc.api_post(self.session, "/userMission", {}, "d", "c", token="t")
+        self.assertIn("VIKACG_PROXY", str(cm.exception))
+        self.assertEqual(self.session.post.call_count, 3)  # 首次 + 2 次重试
+
+    def test_business_response_not_retried(self):
+        resp = mock.MagicMock()
+        resp.status_code = 500
+        resp.json.return_value = {"status": "fail", "message": "server error"}
+        self.session.post.return_value = resp
+        r = vc.api_post(self.session, "/userMission", {}, "d", "c", token="t")
+        self.assertEqual(r["http_code"], 500)
+        self.assertEqual(self.session.post.call_count, 1)
+
+
+class TestErrorTextCleaning(unittest.TestCase):
+    """非 JSON 响应清洗与拦截页检测。"""
+
+    def test_clean_strips_tags_and_whitespace(self):
+        raw = "<html>  <body>   Access\n denied\t </body></html>"
+        self.assertEqual(vc.clean_error_text(raw), "Access denied")
+
+    def test_clean_truncates(self):
+        self.assertEqual(len(vc.clean_error_text("a" * 500)), 201)  # 200 + 省略号
+        self.assertTrue(vc.clean_error_text("a" * 500).endswith("…"))
+
+    def test_clean_empty(self):
+        self.assertEqual(vc.clean_error_text(""), "")
+        self.assertEqual(vc.clean_error_text(None), "")
+
+    def test_intercept_page_detected(self):
+        self.assertTrue(vc.looks_like_intercept_page(
+            "<html><title>Just a moment...</title></html>"))
+        self.assertTrue(vc.looks_like_intercept_page("502 Bad Gateway"))
+        self.assertTrue(vc.looks_like_intercept_page(
+            "Attention Required! | Cloudflare"))
+
+    def test_normal_payload_not_flagged(self):
+        self.assertFalse(vc.looks_like_intercept_page('{"status":"success"}'))
+        self.assertFalse(vc.looks_like_intercept_page("user today signed"))
+        self.assertFalse(vc.looks_like_intercept_page(""))
+
+    def test_api_post_non_json_cleaned(self):
+        """非 JSON 响应进 message 前必须清洗，不能把 HTML 原文带进推送。"""
+        session = mock.MagicMock()
+        resp = mock.MagicMock()
+        resp.status_code = 403
+        resp.text = "<html><title>Just a moment...</title>\n  <p>checking</p></html>"
+        resp.json.side_effect = ValueError("no json")
+        session.post.return_value = resp
+        r = vc.api_post(session, "/userMission", {}, "d", "c", token="t")
+        msg = r["json"]["message"]
+        self.assertNotIn("<", msg)
+        self.assertIn("疑似 CF/网关拦截页", msg)
+        self.assertIn("checking", msg)
+
+
+class TestRunOneTaskHardened(unittest.TestCase):
+    """加固后的判定分支：幂等双门槛 + 网络异常收口。"""
+
+    def _make_auth(self):
+        return {"token": "tok", "refreshToken": "r", "deviceCode": "d",
+                "clientCode": "c", "nickname": "tester", "from": "cache"}
+
+    @staticmethod
+    def _api_result(code, payload):
+        return {"http_code": code, "json": payload}
+
+    def test_success_message_with_signed_keyword(self):
+        # 200+success 且文案含「已签」→ 按成功解析并如实输出「今日已签到」，不丢余额
+        auth = self._make_auth()
+        resp = self._api_result(200, {"status": "success",
+                                      "message": "今日已签到，明天再来",
+                                      "data": {"count": 591, "sign_days": 3}})
+        with mock.patch.object(vc, "ensure_token", return_value=auth), \
+             mock.patch.object(vc, "api_post", return_value=resp):
+            result = vc.run_one_task(mock.MagicMock(), "a@x.com", "pw", 30, False)
+        self.assertTrue(result["success"])
+        self.assertIn("今日已签到", result["message"])
+        self.assertIn("积分余额 591", result["message"])
+
+    def test_fail_with_signed_keyword_is_not_idempotent(self):
+        # 非 409 的失败响应即使文案含「已签」也不冒领已签（双门槛）
+        auth = self._make_auth()
+        resp = self._api_result(400, {"status": "fail", "message": "您已签到过活动"})
+        with mock.patch.object(vc, "ensure_token", return_value=auth), \
+             mock.patch.object(vc, "api_post", return_value=resp):
+            result = vc.run_one_task(mock.MagicMock(), "a@x.com", "pw", 30, False)
+        self.assertFalse(result["success"])
+
+    def test_409_without_keyword_not_idempotent(self):
+        # 409 但文案不含已签关键词 → 不算已签，按失败报原文
+        auth = self._make_auth()
+        resp = self._api_result(409, {"status": "fail", "message": "冲突"})
+        with mock.patch.object(vc, "ensure_token", return_value=auth), \
+             mock.patch.object(vc, "api_post", return_value=resp):
+            result = vc.run_one_task(mock.MagicMock(), "a@x.com", "pw", 30, False)
+        self.assertFalse(result["success"])
+        self.assertIn("409", result["error"])
+
+    def test_network_error_returns_classified_failure(self):
+        auth = self._make_auth()
+        err = vc.NetworkError("网络请求失败：连接失败（请配置 VIKACG_PROXY）")
+        with mock.patch.object(vc, "ensure_token", return_value=auth), \
+             mock.patch.object(vc, "api_post", side_effect=err):
+            result = vc.run_one_task(mock.MagicMock(), "a@x.com", "pw", 30, False)
+        self.assertFalse(result["success"])
+        self.assertIn("VIKACG_PROXY", result["error"])
+
+    def test_401_refresh_network_error_stops(self):
+        # 401 后续期遇网络耗尽 → 直接失败收口，不再重登白跑
+        auth = self._make_auth()
+        resp_401 = self._api_result(401, {"status": "fail", "message": "未登录"})
+        err = vc.NetworkError("网络请求失败：连接超时")
+        with mock.patch.object(vc, "ensure_token", return_value=auth), \
+             mock.patch.object(vc, "api_post", return_value=resp_401), \
+             mock.patch.object(vc, "do_refresh", side_effect=err), \
+             mock.patch.object(vc, "do_login") as ml:
+            result = vc.run_one_task(mock.MagicMock(), "a@x.com", "pw", 30, False)
+        self.assertFalse(result["success"])
+        self.assertIn("连接超时", result["error"])
+        ml.assert_not_called()
+
+
+class TestEnsureTokenNetworkFastFail(unittest.TestCase):
+    """续期遇网络耗尽 → 快速失败，不再走重登白跑一轮重试。"""
+
+    def setUp(self):
+        self._orig_file = vc.TOKEN_CACHE_FILE
+        import tempfile
+        fd, path = tempfile.mkstemp(suffix=".json")
+        os.close(fd)
+        self._tmp_path = path
+        vc.TOKEN_CACHE_FILE = vc.Path(path)
+
+    def tearDown(self):
+        vc.TOKEN_CACHE_FILE = self._orig_file
+        if os.path.exists(self._tmp_path):
+            os.remove(self._tmp_path)
+
+    def test_refresh_network_error_skips_relogin(self):
+        token = TestJwtExp._make_jwt({"exp": int(time.time()) + 3600})
+        vc.write_token_cache("a@x.com", {"token": token, "refreshToken": "r",
+                                         "deviceCode": "d", "clientCode": "c"})
+        with mock.patch.object(vc, "do_refresh",
+                               side_effect=vc.NetworkError("网络请求失败：连接超时")), \
+             mock.patch.object(vc, "do_login") as ml:
+            auth = vc.ensure_token(mock.MagicMock(), "a@x.com", "pw", 30)
+        self.assertIn("error", auth)
+        self.assertIn("连接超时", auth["error"])
+        ml.assert_not_called()
 
 
 if __name__ == "__main__":

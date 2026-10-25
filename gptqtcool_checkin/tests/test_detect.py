@@ -2,8 +2,11 @@
 """缺口检测单测：合成图验证高亮定位、多候选排序，以及"带限漏检→全图补位"回归。"""
 import asyncio
 
-import cv2
-import numpy as np
+import pytest
+
+# 本文件与 core.detect 都依赖 cv2/numpy；缺失时整文件跳过，不能让收集阶段直接崩
+cv2 = pytest.importorskip("cv2", reason="core.detect 依赖 opencv")
+np = pytest.importorskip("numpy", reason="core.detect 依赖 numpy")
 
 from core.detect import (
     CAPTCHA_FAILURE_HINTS,

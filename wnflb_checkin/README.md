@@ -15,6 +15,8 @@
 - Cookie 失效自动检测，推送告警提醒重新抓取
 - 网络抖动自动重试，`formhash` 过期自动重取重试一次
 - 复用青龙 `notify.py` 推送
+- 默认校验 TLS 证书（证书异常自动降级不校验并提示一次）；代理只认 `WNFLB_PROXY` 与青龙全局代理 env，**Windows 注册表系统代理不会被静默采用**
+- 只对网络类异常自动重试；认证失败绝不重试
 
 ## 认证方式怎么选
 
@@ -110,7 +112,9 @@ ddddocr
 `WNFLB_COOKIE` 与 `WNFLB_ACCOUNTS` 至少配一个，两个都配会各自独立跑一遍。
 
 代理优先级：`WNFLB_PROXY` > 青龙全局代理（`HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY` 等）> 直连。
-青龙 `config.sh` 里的 `ProxyUrl` 对脚本无效。
+脚本已关闭 requests 的 `trust_env`：青龙 `config.sh` 里的 `ProxyUrl` 对脚本无效，
+Windows **注册表系统代理**（Clash/V2Ray 等）也不会被静默采用——本机调试时若发现
+「浏览器能开、脚本超时」，先检查是不是系统代理把该站路由到了不通的节点。
 
 ### 3. 准备凭证
 
@@ -194,6 +198,14 @@ Cookie 模式：
 ```
 
 ## 常见问题
+
+### Q: 本机调试时全部请求 ReadTimeout，但浏览器能正常打开站点？
+
+A: 大概率是 **Windows 系统代理**（Clash/V2Ray 等）在作怪：python-requests 默认信任注册表里的系统代理，而 curl/浏览器不走同一条路。本脚本已关闭 `trust_env`、只认 `WNFLB_PROXY` 与环境变量代理，脚本本体不受影响；如果你在别的自写脚本里遇到同样现象，给 Session 设 `session.trust_env = False` 即可绕开。
+
+### Q: 日志出现「TLS 证书校验失败,已自动降级为不校验继续」？
+
+A: 站点某次连接的证书校验没过（CDN 边缘节点异常或本机时间不对），脚本会自动降级为不校验并继续完成签到，属可用性兜底而非安全告警。若频繁出现，建议核查本机系统时间与站点证书链。
 
 ### Q: 提示「Cookie 已失效」？
 

@@ -12,11 +12,13 @@
    ```bash
    docker exec -it qinglong bash
    cd /ql/data/scripts/wuang-wu_Ikuuu
-   npm i && npx playwright install chromium
+   npm i && ./node_modules/.bin/playwright install chromium
    ```
 
+   > 必须用目录内的 `./node_modules/.bin/playwright`。写成 `npx playwright install chromium` 时，npx 会临时下载**最新版** Playwright 来执行安装，装出的浏览器 revision 与项目锁定的版本对不上，脚本照样报 `Executable doesn't exist`（详见「依赖安装」）。
+
 2. **放文件**：把本目录整个传进青龙的 `/ql/data/scripts/wuang-wu_Ikuuu/`
-   （至少要有 `ikuuu.js`、`sendNotify.js`、`package.json`；要用视觉解法器再加 `solver_vlm.js`）
+   （至少要有 `ikuuu.js`、`sendNotify.js`、`chromium_path.js`、`package.json`；要用视觉解法器再加 `solver_vlm.js`）
 
 3. **配环境变量**（青龙「环境变量」）——最小可用集：
 
@@ -50,6 +52,7 @@
 | 文件 | 说明 |
 |---|---|
 | `ikuuu.js` | 签到主脚本（含浏览器自动登录） |
+| `chromium_path.js` | 浏览器路径解析：环境变量 → 持久目录 → 默认缓存目录，不绑定 Playwright revision |
 | `solver_vlm.js` | 点选验证码解法器 · 视觉大模型版（可选，见「点选验证码与解法器」路线 A′）；支持 `--check` 自检 |
 | `ikuuu.test.js` | 单元测试，`node --test ikuuu.test.js` |
 | `sendNotify.js` | 青龙官方 Notify（推送通道），勿删 |
@@ -74,7 +77,7 @@ task wuang-wu_Ikuuu/ikuuu.js
 | `IKUUU_SOLVER_CMD` | | **点选验证码外部解法器**（见下文「点选验证码与解法器」），如 `node solver_vlm.js`。脚本自身不做图形识别，站点下发点选验证码时靠它提供点击坐标 |
 | `IKUUU_SOLVER_CMD_FALLBACK` | | 备用解法器命令：主解法器"不可用"（key 失效 / 网关不通 / 超时）时自动改用（例如以后接打码平台） |
 | `IKUUU_RETRY_TIMES` | | 失败账号延迟重试次数，默认 `0`（关）。建议 `1~2`：限流/网关抖动这类几分钟就恢复的故障靠它兜底 |
-| `IKUUU_RETRY_DELAY` | | 每次重试前等待秒数，默认 `300` |
+| `IKUUU_RETRY_DELAY` | | 每次重试前等待秒数，默认 `300`（最小 `10`，配小了会被抬到 10） |
 | `IKUUU_VLM_API_KEY` | 用视觉解法器时必填 | API Key（OpenAI 兼容网关的 `sk-...`） |
 | `IKUUU_VLM_BASE_URL` | 用视觉解法器时必填 | 网关地址，如 `http://<网关>:3000/v1`。**脚本内不内置任何网关地址**，不填直接报错 |
 | `IKUUU_VLM_MODEL` | 用视觉解法器时必填 | 视觉模型名（**脚本内不内置模型名**）。可用逗号给多个：前一个"不可用"时自动改用下一个（备用模型不必很准，投票+服务端校验会把错答案挡掉） |
@@ -84,13 +87,13 @@ task wuang-wu_Ikuuu/ikuuu.js
 | `IKUUU_VLM_MAX_TOKENS` | | 单次回复上限，默认 `50000`（推理型模型的**思考也占 token**，偶尔会思考过长被截断：脚本会先从思考内容里捞答案，捞不到再按**双倍上限 + "别长篇推理直接出 JSON"** 重试一次，仍不行才当"这题没解出来"换题重抽）。放大时会夹在 `60000` 以内（新 API 类网关上限 `65536`，超了会被判非法请求） |
 | `IKUUU_VLM_DEBUG` | | `1` = 把合成图与模型原始回复（含思考过程）写到脚本目录 `_vlm_debug/`，排查识别问题时用 |
 | `IKUUU_VLM_MODEL_ERROR_HINT` | | 网关报错里出现哪些字样就判定为"模型/渠道级故障、直接换下一个模型"，默认 `model_not_found,No available channel,invalid_request_error`。换网关措辞不同可覆盖，置空关闭该判定 |
-| `IKUUU_SOLVER_TIMEOUT` | | 解法器超时秒数，默认 `180`（视觉大模型解法器建议 ≥180；纯 HTTP 打码平台可调小） |
+| `IKUUU_SOLVER_TIMEOUT` | | 解法器超时秒数。**留空时自动推导**：`票数 × (IKUUU_VLM_TIMEOUT + 4s) × 模型数 + 30s`，夹在 `[180, 600]` 内（默认 2 票单模型 = `300`）。视觉解法器一票撞超时后重试成功、再跑第二票很容易超过 180s，固定值会让主流程先放弃、把已经算出来的坐标丢掉；纯 HTTP 打码平台可显式调小 |
 | `IKUUU_CAPTCHA_ROUNDS` | | 点选验证码最多刷新重抽次数，默认 `6`。验证形式每次刷新都会重新随机抽取 |
 | `HOST` | | 强制锁定签到域名（锁定时不轮换），留空则从发布页自动抓取 + 兜底 `ikuuu.top` / `ikuuu.pw` |
 | `IKUUU_PUBLISH_URL` | | 发布页地址，默认 `https://ikuuu.win/`。发布页整体迁移域名时改这里，不必改代码 |
 | `IKUUU_PROXY` | | HTTP 代理（ikuuu 被墙，建议配置），如 `http://172.17.0.1:7890`；留空时自动回退青龙全局代理。HTTP 签到与浏览器登录**都会走该代理** |
 | `IKUUU_HEADFUL` | | `1` = 登录用有头浏览器（仅本地调试，容器内勿开） |
-| `IKUUU_CHROMIUM_PATH` | | 系统 Chromium 路径，如 `/usr/bin/chromium`（青龙容器装系统包后推荐此项） |
+| `IKUUU_CHROMIUM_PATH` | | Chromium 可执行文件路径，如 `/usr/bin/chromium`。**留空时自动探测** `../../.cache/ms-playwright/chromium-*/chrome-linux64/chrome`（青龙持久卷）与 `~/.cache/ms-playwright`，取 revision 最大的一个，因此不受 Playwright 版本号限制 |
 | `IKUUU_NOTIFY_ONLY_FAIL` | | `1` = 仅失败时推送，留空/`0` = 全部推送 |
 | `IKUUU_DEBUG` | | `1` = 详细调试信息 + 登录过程截屏到 `_ikuuu_debug/` |
 
@@ -129,6 +132,7 @@ ikuuu 的登录是**分阶段流程**（`POST /auth/login`，`phase=password`）
 
 1. 平时签到走**纯 HTTP**（快、省资源），会话 Cookie 缓存在 `.token/` 下按邮箱隔离；
 2. ikuuu 会话有效期 **24 小时**（cookie 里 `expire_in` 字段），缓存余量不足 30 分钟或签到被 302 弹回登录页时，自动开 Playwright 浏览器：填表 → 过验证码 → 提交 → 抓取会话 Cookie → 回写缓存 → 重试签到（仅重试一次，防死循环）；
+   - 登录前先探测候选域名哪个登录页可达（8s 超时逐个试），主域名被墙时自动改用备用域名登录，登录成功后签到也从该域名开始；
 3. 缓存文件只存 Cookie 与到期时间，**不存密码**；密码只活在青龙环境变量里。
 
 ## 点选验证码与解法器
@@ -224,7 +228,7 @@ node solver_vlm.js --check'
 [solver-vlm] 自检模式：只检查配置与连通性，不会发起点选解题
 [solver-vlm] ✅ 环境变量齐全：BASE_URL=... MODEL=... API_KEY=已配置(NN 字符)
 [solver-vlm] ✅ playwright 可加载
-[solver-vlm] ✅ chromium 已安装：/root/.cache/ms-playwright/chromium-XXXX/chrome-linux/chrome
+[solver-vlm] ✅ chromium 可用：/ql/data/.cache/ms-playwright/chromium-1248/chrome-linux64/chrome
 [solver-vlm] ✅ 模型 <模型> 视觉通道可用（测试图应答："红色"）
 [solver-vlm] 检查通过，可以把本脚本作为 IKUUU_SOLVER_CMD 使用
 ```
@@ -260,13 +264,14 @@ node solver_vlm.js --check'
 
 三层都没有接上（没备用模型、没备用解法器）时，就只能靠 ③+④；两层都只覆盖"过一会儿就好"的故障。真正独立于模型的自动兜底是**打码平台**——把它包成几十行的 `IKUUU_SOLVER_CMD_FALLBACK` 即可，主脚本不用改。
 
-### 解法器不可用时会发生什么（2026-10-09 实测）
+### 解法器不可用时会发生什么（2026-10-09 实测，2026-10-21 补超时口径）
 
 - **只有"需要重新登录"时才会用到解法器**：会话 Cookie 还在 24h 有效期内时，签到走纯 HTTP，模型/解法器完全不参与；站点若改回 `ai` 一键通过也不需要它。
-- **解法器本身不可用**（没配 key / key 失效 / 网关不通 / 模型名写错 / 超时）：脚本**立刻停止换题重抽**（换题解决不了这类问题），任务判失败、推送里写明原因、退出码 1（青龙标红）。实测三种场景各 45~61 秒结束，不会空转几百秒：
+- **解法器本身不可用**（没配 key / key 失效 / 网关不通 / 模型名写错 / 超时）：脚本**立刻停止换题重抽**（换题解决不了这类问题），任务判失败、推送里写明原因、退出码 1（青龙标红）。快速失败场景实测各 45~61 秒结束：
   - 401 `Invalid token`（key 失效）→ 45s
   - `fetch failed`（网关不通）→ 60s
   - 503 `model_not_found`（模型名写错）→ 61s
+- **超时是最慢的一种**：慢请求会一直等到 `IKUUU_VLM_TIMEOUT`（默认 120s）才放弃，再退避重试、再跑第二票。2026-10-21 实机事故：第 1 票撞满 120s 后重试成功，第 2 票跑完时已到 230s，旧的固定 180s 超时先把结果丢了——所以 `IKUUU_SOLVER_TIMEOUT` 现在留空会自动按票数推导（默认 300s）。超时后解法器进程树会被整体终止，日志里不会再出现"任务已结束、解法器还在输出"的错位。
 - **题目本身没解出来**（投票分歧 / 思考被 token 截断 / 输出无法解析）：这类才换一题重抽，最多 `IKUUU_CAPTCHA_ROUNDS`（默认 6）次。
 - 解法器失败时**不会提交任何点击**（服务端失败计数不受影响）；只有"点错并被服务端判错"才会计入那一题的 `fail_count`，重抽即换新题、从 0 开始。
 - 手工兜底：模型长期不可用时，用 `IKUUU_COOKIE` 粘一个浏览器登录后的 cookie（24h 有效）即可继续签到，验证码与模型都不需要。
@@ -281,17 +286,55 @@ node solver_vlm.js --check'
 
 ## 依赖安装（青龙容器）
 
-Node ≥ 18（青龙面板自带版本满足）；依赖：`undici`（`package.json` 已含，需在容器内 `npm i`）+ `playwright`（自动登录用；视觉解法器 `solver_vlm.js` 也复用它渲染合成图）：
+Node ≥ 18（青龙面板自带版本满足）；依赖：`undici`（`package.json` 已含，需在容器内 `npm i`）+ `playwright`（自动登录用；视觉解法器 `solver_vlm.js` 也复用它渲染合成图）。
+
+### 浏览器为什么要求“特定版本”
+
+Playwright 把每个浏览器的**精确构建号**写死在 `playwright-core/browsers.json` 里，`chromium.executablePath()` 直接拼出类似 `/home/qinglong/.cache/ms-playwright/chromium-1234/chrome-linux64/chrome` 的路径，找不到就报 `Executable doesn't exist`。所以下面两个操作会互相打架：
+
+```bash
+npm i                                      # 装到项目锁定的 Playwright（如 1.62.1 → revision 1234）
+npx playwright install chromium            # npx 临时拉最新版执行 → 装出 revision 1248
+```
+
+结果就是“浏览器明明装好了，脚本却找不到”。**正确做法是用项目内的二进制装**（也可指定系统 Chromium，见下）：
 
 ```bash
 docker exec -it qinglong bash
 cd /ql/data/scripts/wuang-wu_Ikuuu
 npm i
-npx playwright install chromium        # 或用系统 chromium（下一条）
-apt update && apt install -y chromium  # 可选：系统包方式
+./node_modules/.bin/playwright install chromium
 ```
 
-用系统 chromium 时设置环境变量 `IKUUU_CHROMIUM_PATH=/usr/bin/chromium`。浏览器未就绪时签到照常可跑（cookie 未失效期间无需浏览器），登录环节会报引导性错误。
+### 不绑版本：`IKUUU_CHROMIUM_PATH` + 持久目录
+
+`ikuuu.js` 与 `solver_vlm.js` 都会先调用 `chromium_path.js` 解析浏览器路径，顺序为：
+
+1. 环境变量 `IKUUU_CHROMIUM_PATH`（可以指向任意 Chromium，比如 `apt install chromium` 后的 `/usr/bin/chromium`）；
+2. `<青龙数据根>/.cache/ms-playwright/chromium-*/chrome-linux64/chrome`（**持久卷**，取 revision 最大）；
+3. `~/.cache/ms-playwright`（Playwright 默认位置）。
+
+只要命中前两项，Playwright 就不再校验 revision，升级 Playwright 或换浏览器版本都不会再报路径错误。建议把浏览器放在持久卷：
+
+```bash
+# 青龙唯一持久挂载是 /ql/data，容器重建后 ~/.cache 会丢
+mkdir -p /ql/data/.cache/ms-playwright
+mv /home/qinglong/.cache/ms-playwright/chromium-* /ql/data/.cache/ms-playwright/
+```
+
+### 容器重建后的系统依赖
+
+qinglong 镜像**不自带** Chromium、运行库和中文字体（验证码合成图需要中文字体，否则是方块）。浏览器本体放持久卷后，这些系统包仍需在容器启动时补装。把下面这段追加到 `data/config/extra.sh`（青龙启动时会执行）：
+
+```bash
+if [ ! -e /usr/lib/x86_64-linux-gnu/libnss3.so ] || [ ! -e /usr/share/fonts/truetype/wqy/wqy-zenhei.ttc ]; then
+  timeout 600 apt-get update -qq
+  timeout 600 apt-get install -y -qq --no-install-recommends chromium fonts-wqy-zenhei
+  ldconfig
+fi
+```
+
+也可以手动执行同样的命令。浏览器未就绪时签到照常可跑（cookie 未失效期间无需浏览器），登录环节会报引导性错误。
 
 ## 推送通道
 
@@ -310,6 +353,12 @@ apt update && apt install -y chromium  # 可选：系统包方式
 - **账号密码自动登录**：Geetest V4 验证码自动处理——`ai` 一键通过时脚本点一下即过；下发点选类（word/icon/nine）时交给 `IKUUU_SOLVER_CMD` 外部解法器，并自动刷新重抽（验证形式每次刷新重新随机）。
 - **验证码自动过**：本目录自带视觉大模型解法器 `solver_vlm.js`（见「路线 A′」），配好网关即可全自动；另有 `IKUUU_VLM_MODEL` 多模型兜底、`IKUUU_SOLVER_CMD_FALLBACK` 备用解法器链。
 - **失败重试**：`IKUUU_RETRY_TIMES` / `IKUUU_RETRY_DELAY` 可让失败的账号隔一会儿自动重跑（限流、网关抖动这类瞬时故障靠它兜底）。
+- **登录前域名探测**：首次登录先轻量探测哪个候选域名的登录页可达（逐个 8s 超时），主域名被墙时自动落到备用域名——签到环节的域名轮换帮不到登录，登录失败没有"换下一个域名"的机会；登录成功后签到也从该域名开始。
+- **成功判定收紧（2026-10-11 体检）**：成功只认结构化字段（`ret=1` / `success=true`），已签只认已签语义（英文用组合词）；兜不住的文案进 `parse_err` ⚠️ 黄档——宁可保守不冒领成功。
+- **推送重试**：`sendNotify` 失败自动重试 3 次，最终失败醒目提示（本次结果只存在于任务日志）。
+- **单账号容错**：单账号内部异常只记该账号失败，不影响其他账号与推送。
+- **Cookie 缓存两段写**：`.part` + rename 原子写、0600 权限（Linux 生效），进程中断不留半截缓存。
+- **数值环境变量防呆**：`IKUUU_RETRY_TIMES` 等数值变量填错（非数字）回落默认值，不会静默把功能变 NaN 关掉；`IKUUU_PROXY` 格式错降级为无代理并给出引导。
 - **Cookie 缓存复用**：24h 会话内不重复登录；到期时间直接取服务端 `expire_in`。
 - **动态域名**：自动从发布页 `https://ikuuu.win/`（2026-09 起由 `ikuuu.eu` 迁到这里，可用 `IKUUU_PUBLISH_URL` 覆盖）抓取当前可用主域名。抓取多通道：配了代理则优先代理直连发布页，否则公共 CORS 代理逐个试（allorigins → cors.lol → whateverorigin）。
   - **发布页域名永不作为签到目标**：`ikuuu.win` / `ikuuu.eu` 是 nginx 静态发布页，`POST /user/checkin` 只会返回 405，进候选必定失败，脚本会显式过滤掉。
@@ -333,17 +382,19 @@ apt update && apt install -y chromium  # 可选：系统包方式
 
 | 日志现象 | 排查方向 |
 |---|---|
+| `❌ 推送最终失败：本次签到结果只存在于任务日志中` | 已自动重试 3 次仍失败。检查推送通道环境变量（`DD_BOT_TOKEN` 等）与网络；签到本身可能已成功，进任务日志看明细 |
+| `❌ 代理地址无效: ... 本次已降级为无代理继续` | `IKUUU_PROXY` / 全局代理变量不是完整 URL（漏了 `http://`）。修正后重跑；发布页抓取会自动走公共 CORS 通道兜底 |
 | `[解法器] [solver-vlm] 第 N/2 次: [[x,y],...]` / `最终坐标: ...（各次最大偏差 NNpx）` | 这是解法器自己的日志（主脚本原样转发）。**排错先看这几行**：两次投票偏差大 → 该次不会提交、自动重抽；`改用 xxx` → 换模型/换解法器了 |
 | `模型无正文输出（finish_reason=length，可能 token 不足）` | 推理模型这次"想太久"，token 全花在思考上、正文为空。**不是致命错误**：脚本会自动（1）从思考内容里捞答案 →（2）双倍 token 上限 + 强制指令重试一次 →（3）仍不行则换题重抽。默认上限已是 `50000`，偶发无需处理 |
 | `HTTP 400 ... MaxTokens invalid, should be in [1, 65536]` | `IKUUU_VLM_MAX_TOKENS` 超过网关上限。调小到报错区间内即可（脚本默认 50000、放大时夹 60000，正常不会触发；手改过才可能遇到） |
-| `未安装 playwright（自动登录需要）` | 按上面「依赖安装」在容器内 `npm i && npx playwright install chromium`，或配 `IKUUU_CHROMIUM_PATH` |
+| `未安装 playwright（自动登录需要）` / `Executable doesn't exist ...chromium-XXXX...` | 按「依赖安装」在容器内 `npm i && ./node_modules/.bin/playwright install chromium`（不要用 `npx`）；或设 `IKUUU_CHROMIUM_PATH` 指向任意 Chromium，或把浏览器放进持久目录 `/ql/data/.cache/ms-playwright` |
 | `未配置 IKUUU_VLM_BASE_URL / IKUUU_VLM_API_KEY / IKUUU_VLM_MODEL` | 视觉解法器的必填变量没配。按「快速上手」第 3 步补齐，或先跑 `node solver_vlm.js --check` 看缺哪一项 |
 | `站点已启用点选类验证码（文字点选(word)），脚本自身不做图形识别` | 站点把验证形式改成了点选类，但没配 `IKUUU_SOLVER_CMD`。按「快速上手」第 3 步配视觉解法器，或改用 `IKUUU_COOKIE` 直填 cookie |
 | `解法器未解决验证码: 不支持 icon` | 解法器只支持部分形式。脚本会刷新重抽 `IKUUU_CAPTCHA_ROUNDS` 次；命中概率低时可调大次数，或让解法器支持更多形式 |
 | `解法器给出的 N 个点击未被通过` | 解法器坐标不准或点击顺序不对。真值顺序是 `tplPaths` 数组顺序；坐标是挑战图像素坐标 |
 | `⛔ 解法器不可用（非题目本身问题），停止重抽` | 解法器侧故障（key/网关/模型名/超时），换题无用故立刻失败；按后面的错误原文修（`Invalid token` → 查 `IKUUU_VLM_API_KEY`；`model_not_found` → 查 `IKUUU_VLM_MODEL`；`fetch failed` → 查容器到网关的连通性） |
 | `Cannot find module ...'.../wuang-wu_Ikuuu/wuang-wu_Ikuuu/solver.js'` | `IKUUU_SOLVER_CMD` 的文件名/路径写错。正确值是 `node solver_vlm.js`（青龙的工作目录已是脚本目录，不要再带 `wuang-wu_Ikuuu/` 前缀），或用绝对路径 |
-| `解法器超时` / `解法器输出无法解析` | 调大 `IKUUU_SOLVER_TIMEOUT`（默认 180s）；确认 stdout 里有且只有一个 JSON 对象 |
+| `解法器超时` / `解法器输出无法解析` | 先看日志里最后一次 `[解法器]` 行：如果已经打出 `第 N/M 次` 或 `最终坐标`，说明**解法器算出来了但太慢**——调大 `IKUUU_SOLVER_TIMEOUT`，或调小 `IKUUU_VLM_TIMEOUT` / `IKUUU_VLM_VOTES`。超时后脚本会**整棵进程树终止**（POSIX 进程组 / Windows `taskkill /T`），不会让解法器继续在后台跑 |
 | `密码阶段被拒: 邮箱或密码错误` | 核对 `ACCOUNTS` 里的 email/password；注意密码里含特殊字符时推荐用 JSON 格式 |
 | `账号开启了两步验证(2FA)` / `要求邮箱验证码登录` / `反向邮件验证` | 站点要求额外交互，脚本无法代填，需人工处理（关闭 2FA 或调整账号安全设置） |
 | `[域名加载] ⚠️ 发布页抓取失败（各通道均不可用）` | 发布页被墙或 DNS 污染。兜底 `ikuuu.top` / `ikuuu.pw` 仍可用；建议配 `IKUUU_PROXY` 或 `HOST` 锁定 |
@@ -390,7 +441,7 @@ echo '{"type":"word","imagePath":"…/bg.jpg","tplPaths":["…/tpl1.png","…/tp
 node --test ikuuu.test.js
 ```
 
-覆盖（38 项）：发布页域名提取（字符串拼接还原、发布页域名过滤）、签到响应分类、登录响应 phase 分类、账号解析（邮箱#密码 单/多账号与非法输入）、Cookie 缓存读写与余量判定、Cookie 串拼装过滤、邮箱脱敏，以及点选验证码配套（`/load` JSONP 解析、验证形式中文名、PNG/JPEG 尺寸解析、解法器 stdout JSON 提取与坐标校验、失败类型分类与提示生成）。
+覆盖（61 项）：发布页域名提取（字符串拼接还原、发布页域名过滤）、签到响应分类（含收紧后的否定式/频控文案负样本）、登录响应 phase 分类、账号解析（邮箱#密码 单/多账号与非法输入）、Cookie 缓存读写与余量判定（含两段写不留 `.part`）、Cookie 串拼装过滤、邮箱脱敏，点选验证码配套（`/load` JSONP 解析、验证形式中文名、PNG/JPEG 尺寸解析、解法器 stdout JSON 提取与坐标校验、失败类型分类与提示生成），以及加固轮新增（main 编排层早退/退出码、登录域名探测回落、单账号容错、推送重试、数值环境变量安全解析、调试目录轮转、解法器投票中位数与坐标过滤），另有浏览器路径解析（多 revision 取最大、跳过空壳目录、环境变量优先）。
 
 ## 接口备忘（2026-10 实测）
 

@@ -24,8 +24,6 @@
  *   PT_NOTIFY_ONLY_FAIL       【可选】1 = 仅失败时推送
  *   PT_DEBUG                  【可选】1 = 打印详细调试信息（含页面片段，注意勿泄露）
  *   PT_TIMEOUT                【可选】HTTP 超时秒数，默认 20
- *   PT_RUN_COOLDOWN           【可选】运行冷却窗口分钟数，默认 10；距上次运行结束不足该时长则跳过
- *                                      （防青龙自动重试/并发叠加消耗站点登录配额），设为 0 关闭
  *
  * 登录限次保护（防止连续失败封 IP）：
  *   - BTSchool 允许连续失败 20 次，NovaHD 仅 10 次；脚本每次运行前解析登录页「你还有 [N] 次尝试机会」
@@ -1136,48 +1134,52 @@ function resultText(result) {
 }
 
 // ==========================================
-// 11.5 运行锁（防并发 / 青龙自动重试叠加消耗站点登录配额）
+// 11.5 运行锁（防并发：青龙自动重试 / 手动重跑同时拉起会叠加消耗站点登录配额）
 // ==========================================
 const LOCK_FILE = path.join(__dirname, 'pt_checkin.lock');
-// 冷却窗口：距上次运行结束不足该时长则跳过（分钟；PT_RUN_COOLDOWN=0 关闭）
-const COOLDOWN_MS = Math.max(0, Number(process.env.PT_RUN_COOLDOWN) || 10) * 60 * 1000;
 // 进程崩溃遗留的死锁：锁文件超过该时长仍未标记结束即视为失效
 const LOCK_STALE_MS = 30 * 60 * 1000;
 
-function readLock() {
-  try { return JSON.parse(fs.readFileSync(LOCK_FILE, 'utf8')); } catch (e) { return null; }
+function readLock(file = LOCK_FILE) {
+  try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch (e) { return null; }
 }
 
-function writeLock(data) {
-  try { fs.writeFileSync(LOCK_FILE, JSON.stringify(data)); } catch (e) { console.log(`⚠️ 运行锁写入失败: ${e.message}`); }
+function writeLock(data, file = LOCK_FILE) {
+  try { fs.writeFileSync(file, JSON.stringify(data)); } catch (e) { console.log(`⚠️ 运行锁写入失败: ${e.message}`); }
 }
 
-// 取锁；返回 { skip, reason }，skip=true 时主流程直接退出（退出码 0，非失败）
-function acquireLock() {
-  const now = Date.now();
-  const lock = readLock();
-  if (lock) {
-    if (lock.finishedAt) {
-      const since = now - lock.finishedAt;
-      if (COOLDOWN_MS > 0 && since < COOLDOWN_MS) {
-        return {
-          skip: true,
-          reason: `距上次运行结束仅 ${Math.round(since / 60000)} 分钟（冷却窗口 ${COOLDOWN_MS / 60000} 分钟），`
-            + '跳过本次防重复消耗登录配额（可设 PT_RUN_COOLDOWN=0 关闭）',
-        };
-      }
-    } else if (now - (lock.startedAt || 0) < LOCK_STALE_MS) {
-      return { skip: true, reason: `检测到上一次运行仍在进行（pid ${lock.pid || '未知'}），跳过本次防并发` };
-    }
+// 取锁；返回 { skip, reason }，skip=true 时主流程直接退出（退出码 0，非失败）。
+// now/file/staleMs 参数注入仅为单测服务。
+function acquireLock(now = Date.now(), file = LOCK_FILE, staleMs = LOCK_STALE_MS) {
+  const lock = readLock(file);
+  // 仅当锁未标记结束（上一次运行仍在进行）且未超时失效时才跳过；已结束的锁允许直接接管
+  if (lock && !lock.finishedAt && now - (lock.startedAt || 0) < staleMs) {
+    return { skip: true, reason: `检测到上一次运行仍在进行（pid ${lock.pid || '未知'}），跳过本次防并发` };
   }
-  writeLock({ startedAt: now, pid: process.pid, finishedAt: null });
+  // 已结束/陈旧的旧锁清掉后用 'wx' 独占创建：并发实例只有一个能落锁，
+  // 抢输的一侧按并发跳过（宁可少跑一次，不可重叠消耗登录配额）。
+  // 读-判-写不是原子的，两个实例同时走到 writeLock 会双双认为自己拿到了锁。
+  if (lock) {
+    try { fs.unlinkSync(file); } catch (e) { /* 抢输没关系，下一步按 EEXIST 处理 */ }
+  }
+  try {
+    const fd = fs.openSync(file, 'wx');
+    fs.writeSync(fd, JSON.stringify({ startedAt: now, pid: process.pid, finishedAt: null }));
+    fs.closeSync(fd);
+  } catch (e) {
+    if (e.code === 'EEXIST') {
+      return { skip: true, reason: '检测到上一次运行仍在进行，跳过本次防并发' };
+    }
+    // 锁只是防重叠，目录不可写等问题不应阻断签到
+    console.log(`⚠️ 运行锁创建失败(继续执行): ${e.message}`);
+  }
   return { skip: false };
 }
 
-// 标记本次运行结束（保留 startedAt，写入 finishedAt 供冷却窗口判定）
-function releaseLock() {
-  const lock = readLock() || {};
-  writeLock({ ...lock, finishedAt: Date.now() });
+// 标记本次运行结束（写入 finishedAt，供下次运行区分「已结束」与「崩溃残留」）
+function releaseLock(file = LOCK_FILE) {
+  const lock = readLock(file) || {};
+  writeLock({ ...lock, finishedAt: Date.now() }, file);
 }
 
 // ==========================================
@@ -1313,6 +1315,8 @@ module.exports = {
   saveCookie,
   resolveCookie,
   credentialFingerprint,
+  acquireLock,
+  releaseLock,
 };
 
 if (require.main === module) {

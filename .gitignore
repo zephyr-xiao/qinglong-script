@@ -16,16 +16,25 @@ cookie_*.json
 cookies.json
 cookies/
 *.log
+# log4js 轮转备份（.log.1.gz 等）不受上面 *.log 匹配
+*.log.*
+# HAR 抓包文件含完整 Cookie
+*.har
+# E-Hentai 等脚本的明文 Cookie 文本缓存
+*_cookie.txt
 .env
 
 # 运行期登录态与运行数据（个人账号信息，严禁提交）
 *_token.json
+# 芯幻签到原子写临时文件（中断时可能残留明文 token，必须一并忽略）
+xhcyv_checkin/.xhcyv_token.*
 *_state.json
 *_log.txt
 replied_posts.json
 
 # 运行锁（防并发/重复消耗站点登录配额，运行期自动生成）
 pt-checkin/*.lock
+wnflb_fx_checkin/*.lock
 
 # 账号清单（含明文密码，严禁提交）与单元测试临时产物
 *_accounts.txt
@@ -47,3 +56,6 @@ _zodgame_debug/
 .vscode/
 .idea/
 *.swp
+# 两段写残留的临时文件（可能含明文 Cookie/token，崩溃时残留）
+*.part
+*.json.tmp

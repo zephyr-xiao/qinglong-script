@@ -206,6 +206,40 @@ DEFAULT_UA = (
 )
 
 
+def _new_session() -> requests.Session:
+    """构建会话：默认 UA / 代理 / TLS 校验 / 请求包装统一收口在此。
+
+    trust_env 关闭：requests 不再静默读系统环境/注册表代理（Windows 上会击穿
+    QZD_PROXY > 青龙全局代理 > 直连的优先级链）；TLS 默认校验证书，
+    仅当确系 SSL 握手失败时降级为不校验并告警一次（站点边缘证书异常的兜底）。"""
+    session = requests.Session()
+    session.trust_env = False
+    session.verify = True
+    session.headers.update({"User-Agent": DEFAULT_UA})
+    if PROXY_URL:
+        session.proxies.update({"http": PROXY_URL, "https": PROXY_URL})
+    _orig_request = session.request
+    state = {"downgraded": False}
+
+    def _request(method, url, **kwargs):
+        try:
+            return _orig_request(method, url, **kwargs)
+        except requests.exceptions.SSLError:
+            if not state["downgraded"]:
+                state["downgraded"] = True
+                session.verify = False
+                print("⚠️ TLS 证书校验失败，已自动降级为不校验继续（如非预期请核查站点证书/代理）")
+                try:
+                    import urllib3
+                    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+                except Exception:
+                    pass
+            return _orig_request(method, url, **kwargs)
+
+    session.request = _request
+    return session
+
+
 # ====================== 凭证缓存（token / cookie 落盘复用） ======================
 
 # 缓存目录：脚本同目录 .token/，青龙数据卷持久化；文件名用站点 + 账号 hash 防敏感信息泄漏
@@ -434,11 +468,7 @@ def execute_signin(site_key: str, api_config: dict, username: str, password: str
       5. 401 时清缓存重新登录后重试一次
     """
     config = api_config or {}
-    session = requests.Session()
-    session.verify = False
-    session.headers.update({"User-Agent": DEFAULT_UA})
-    if PROXY_URL:
-        session.proxies.update({"http": PROXY_URL, "https": PROXY_URL})
+    session = _new_session()
 
     cache_path = token_cache_path(site_key, username)
 
@@ -745,11 +775,7 @@ def discuz_sign_in(site_key: str, api_config: dict, username: str, password: str
     questionid = str(config.get("login_questionid", "0"))
     answer = config.get("login_answer", "")
 
-    session = requests.Session()
-    session.verify = False
-    session.headers.update({"User-Agent": DEFAULT_UA})
-    if PROXY_URL:
-        session.proxies.update({"http": PROXY_URL, "https": PROXY_URL})
+    session = _new_session()
 
     cache_path = token_cache_path(site_key, username)
 

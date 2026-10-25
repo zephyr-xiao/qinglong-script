@@ -314,7 +314,11 @@ def write_config(chats: list):
         pass
     cfg_file = WORKDIR / "signs" / TASK_NAME / "config.json"
     cfg_file.parent.mkdir(parents=True, exist_ok=True)
-    cfg_file.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+    # 两段写 + os.replace：写一半崩溃不会留下半截 config.json
+    # （tg-signer 对配置做模型校验，损坏文件会让后续 run-once 全部失败）
+    tmp = cfg_file.with_name(cfg_file.name + ".part")
+    tmp.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(tmp, cfg_file)
     return None
 
 

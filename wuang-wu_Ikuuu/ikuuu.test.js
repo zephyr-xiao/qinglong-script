@@ -30,6 +30,7 @@ const {
   accountLabel,
   maskName,
   maskEmail,
+  maskProxy,
   extractExpireAt,
   cacheFileFor,
   readCookieCache,
@@ -40,9 +41,18 @@ const {
   getLatestHosts,
   PUBLISH_HOSTS,
   FALLBACK_HOSTS,
+  safeNum,
+  deriveSolverTimeoutSec,
+  killProcessTree,
+  runSolver,
+  pickLoginHost,
+  runAccountSafe,
+  sendNotifyWithRetry,
+  rotateDebugDir,
+  main,
 } = require('./ikuuu');
 // 视觉解法器的纯函数（脚本被 require 时不会跑主流程）
-const { parseModelReply, wantedCount, buildPrompt, computeMaxTokens } = require('./solver_vlm');
+const { parseModelReply, wantedCount, buildPrompt, computeMaxTokens, vote, pickClicks } = require('./solver_vlm');
 
 // 模拟发布页：域名被拆成多段字符串字面量后拼接（取自 ikuuu.win 真实页面结构）
 const OBFUSCATED_PAGE = [
@@ -206,6 +216,12 @@ test('maskEmail / accountLabel: 邮箱脱敏与账号标识', () => {
   assert.match(accountLabel({ cookie: 'uid=1234567; key=k' }), /^Cookie\(1\*{5}7\)$/);
   assert.strictEqual(accountLabel({ cookie: 'ip=x; key=k' }), 'Cookie(未命名)');
   assert.strictEqual(accountLabel({}), '未知账号');
+});
+
+test('maskProxy: 日志里剥掉代理账号密码', () => {
+  assert.strictEqual(maskProxy('http://user:pass@127.0.0.1:7890'), 'http://***@127.0.0.1:7890');
+  assert.strictEqual(maskProxy('http://127.0.0.1:7890'), 'http://127.0.0.1:7890');
+  assert.strictEqual(maskProxy(''), '');
 });
 
 test('parseCookieAccounts: 单条与换行多条', () => {
@@ -486,4 +502,243 @@ test('buildPrompt: 按形式与提示语生成提示词', () => {
 
   const icon = buildPrompt('icon', 3, { w: 300, h: 200 }, '');
   assert.match(icon, /线条图形/);                 // icon 形状描述
+});
+
+// ==========================================
+// 加固轮用例：判据收紧 / 运行锁 / 单账号容错 / 推送重试 / 解法器投票
+// ==========================================
+
+test('classify 收紧: 否定式/频控文案不得冒领 success/already', () => {
+  // "未成功" 含"成功"二字 —— 旧的 /成功/ 兜底会把它判成假成功
+  assert.strictEqual(classify('{"ret":0,"msg":"签到未成功，请重试"}', 200).status, 'parse_err');
+  // 裸 "signed" 命中 —— 英文否定句被误判成已签
+  assert.strictEqual(classify('{"ret":0,"msg":"you have not signed in today"}', 200).status, 'parse_err');
+  // "重复" 命中 —— 频控拒绝被误判成已签
+  assert.strictEqual(classify('{"ret":0,"msg":"操作过于频繁，请不要重复提交"}', 200).status, 'parse_err');
+  // "signed in successfully" 类成功文案（无结构化字段时）也不得进 already（仓库惯例：英文用组合词）
+  assert.strictEqual(classify('{"ret":0,"msg":"you have signed in successfully"}', 200).status, 'parse_err');
+});
+
+test('classify 收紧后: 结构化字段与组合词仍正确（真实契约行为不变）', () => {
+  assert.strictEqual(classify('{"ret":1,"msg":"你获得了 475 MB流量"}', 200).status, 'success');
+  assert.strictEqual(classify('{"success":true,"msg":"ok"}', 200).status, 'success');
+  assert.strictEqual(classify('{"ret":0,"msg":"you have already signed today"}', 200).status, 'already');
+});
+
+test('safeNum: 数值环境变量非法值回落默认值', () => {
+  assert.strictEqual(safeNum(undefined, 300, 10), 300);     // 未配置 → 默认
+  assert.strictEqual(safeNum('', 300, 10), 300);            // 空串 → 默认
+  assert.strictEqual(safeNum('abc', 300, 10), 300);         // 非数字 → 默认（旧行为是 NaN）
+  assert.strictEqual(safeNum('5', 300, 10), 10);            // 低于下限抬到下限
+  assert.strictEqual(safeNum('600', 300, 10), 600);         // 正常值
+  assert.strictEqual(safeNum('-3', 0), 0);                  // 负数夹到下限
+  assert.strictEqual(safeNum(' 42 ', 0), 42);               // 带空白
+});
+
+test('deriveSolverTimeoutSec: 超时预算与解法器自身耗时对齐', () => {
+  // 显式配置优先（打码平台可自行收紧/放宽）
+  assert.strictEqual(deriveSolverTimeoutSec({ IKUUU_SOLVER_TIMEOUT: '90' }), 90);
+  // 默认视觉解法器：2 票 × (120 + 4s 退避) + 30s 启动余量 = 278 → 向上取整到 300
+  assert.strictEqual(deriveSolverTimeoutSec({}), 300);
+  // 单票 + 短超时：1×(60+4)+30 = 94 → 保持 180 下限
+  assert.strictEqual(deriveSolverTimeoutSec({ IKUUU_VLM_TIMEOUT: '60', IKUUU_VLM_VOTES: '1' }), 180);
+  // 双模型兜底：2×124×2+30 = 526 → 540
+  assert.strictEqual(deriveSolverTimeoutSec({ IKUUU_VLM_MODEL: 'm1,m2' }), 540);
+  // 极端配置撞上限 600
+  assert.strictEqual(deriveSolverTimeoutSec({ IKUUU_VLM_TIMEOUT: '300', IKUUU_VLM_VOTES: '5', IKUUU_VLM_MODEL: 'a,b,c' }), 600);
+  // 非法值回落默认
+  assert.strictEqual(deriveSolverTimeoutSec({ IKUUU_VLM_TIMEOUT: 'abc' }), 300);
+  // 空白串等同于未配置
+  assert.strictEqual(deriveSolverTimeoutSec({ IKUUU_SOLVER_TIMEOUT: '  ' }), 300);
+});
+
+test('killProcessTree: 超时后真正结束子进程（含 shell 包装）', async () => {
+  const child = require('node:child_process').spawn('node -e "setTimeout(()=>{}, 60000)"', {
+    shell: true, windowsHide: true, detached: process.platform !== 'win32',
+  });
+  await new Promise((r) => setTimeout(r, 300));
+  assert.strictEqual(child.exitCode, null, '子进程应仍在运行');
+  const closed = new Promise((resolve) => child.on('close', resolve));
+  killProcessTree(child);
+  const result = await Promise.race([
+    closed,
+    new Promise((resolve) => setTimeout(() => resolve('TIMEOUT'), 5000)),
+  ]);
+  assert.notStrictEqual(result, 'TIMEOUT', '子进程应在 5 秒内被终止');
+});
+
+test('runSolver: 超时后杀掉解法器进程并返回失败（2026-10-21 事故回归）', async () => {
+  const dir = fs.mkdtempSync(nodePath.join(__dirname, '.test_tmp', 'solver-'));
+  const slow = nodePath.join(dir, 'slow_solver.js');
+  // 模拟"算得出但太慢"的解法器：30 秒后才输出坐标
+  fs.writeFileSync(slow,
+    "setTimeout(() => process.stdout.write(JSON.stringify({ ok: true, clicks: [[1, 1]] })), 30000);", 'utf8');
+  const t0 = Date.now();
+  const r = await runSolver(`node "${slow}"`, { type: 'word' }, 1200);
+  const elapsed = Date.now() - t0;
+  assert.strictEqual(r.ok, false);
+  assert.match(r.msg, /解法器超时/);
+  assert.ok(elapsed < 10000, `应在超时后立即返回，实际 ${elapsed}ms`);
+  // 关键：返回后事件循环不被残留子进程吊住（本测试本身能结束即是证明）
+});
+
+test('pickLoginHost: 主域名不可达自动落到下一个，全挂回落首选', async () => {
+  const hosts = ['ikuuu.top', 'ikuuu.pw'];
+  // 首选不可达 → 落到备用
+  assert.strictEqual(await pickLoginHost(hosts, async (h) => h === 'ikuuu.pw'), 'ikuuu.pw');
+  // 全不可达 → 回落首选，让 browserLogin 报出真实错误
+  assert.strictEqual(await pickLoginHost(hosts, async () => false), 'ikuuu.top');
+  // 首选可达 → 不换
+  assert.strictEqual(await pickLoginHost(hosts, async () => true), 'ikuuu.top');
+});
+
+test('runAccountSafe: 单账号内部异常只记该账号失败', async () => {
+  const boom = async () => { throw new Error('unexpected boom'); };
+  const r = await runAccountSafe({ email: 'a@b.com' }, ['ikuuu.top'], boom);
+  assert.strictEqual(r.result.status, 'network_err');
+  assert.match(r.result.msg, /内部异常.*unexpected boom/);
+  assert.strictEqual(r.name, maskEmail('a@b.com'));
+
+  // 正常路径透传
+  const okRunner = async () => ({ name: 'x', result: { status: 'success', msg: 'ok' }, line: '✅ 成功：ok', usedHost: 'ikuuu.top' });
+  const ok = await runAccountSafe({ email: 'a@b.com' }, ['ikuuu.top'], okRunner);
+  assert.strictEqual(ok.result.status, 'success');
+});
+
+test('sendNotifyWithRetry: 失败重试后成功 / 最终失败返回 false', async () => {
+  let calls = 0;
+  const flaky = async () => { calls += 1; if (calls < 2) throw new Error('net down'); };
+  assert.strictEqual(await sendNotifyWithRetry('t', 'd', flaky, 3, 1), true);
+  assert.strictEqual(calls, 2);
+
+  let calls2 = 0;
+  const alwaysFail = async () => { calls2 += 1; throw new Error('down'); };
+  assert.strictEqual(await sendNotifyWithRetry('t', 'd', alwaysFail, 3, 1), false);
+  assert.strictEqual(calls2, 3);
+});
+
+test('vote: 中位数投票与分歧阈值', () => {
+  // 奇数票取中间值
+  const v3 = vote([[[10, 20]], [[14, 22]], [[12, 24]]]);
+  assert.strictEqual(v3.ok, true);
+  assert.deepStrictEqual(v3.clicks, [[12, 22]]);
+  // 偶数票取中间两数均值
+  const v2 = vote([[[10, 20]], [[12, 24]]]);
+  assert.deepStrictEqual(v2.clicks, [[11, 22]]);
+  // 点数不一致直接拒绝（不会提交任何点击）
+  assert.strictEqual(vote([[[1, 2]], [[1, 2], [3, 4]]]).ok, false);
+  // 分歧阈值按"各次到中位数的最大偏差"计：35px 恰好放行、36px 拒绝
+  assert.strictEqual(vote([[[0, 0]], [[0, 0]], [[35, 0]]]).ok, true);
+  assert.strictEqual(vote([[[0, 0]], [[0, 0]], [[36, 0]]]).ok, false);
+});
+
+test('pickClicks: 坐标越界过滤与全非法返回 null', () => {
+  const size = { w: 300, h: 200 };
+  assert.deepStrictEqual(pickClicks({ clicks: [[10, 20], [301, 50], [-5, 3]] }, size), [[10, 20]]);
+  assert.deepStrictEqual(pickClicks({ clicks: [[0, 0], [300, 200]] }, size), [[0, 0], [300, 200]]);  // 边界含端点
+  assert.strictEqual(pickClicks({ clicks: [[999, 999]] }, size), null);
+  assert.strictEqual(pickClicks({}, size), null);
+  assert.strictEqual(pickClicks({ clicks: 'x' }, size), null);
+});
+
+test('rotateDebugDir: 只保留最近 N 个调试产物', () => {
+  const dir = fs.mkdtempSync(nodePath.join(__dirname, '.test_tmp', 'rot-'));
+  for (let i = 0; i < 5; i++) {
+    const f = nodePath.join(dir, `${i}.png`);
+    fs.writeFileSync(f, 'x');
+    // 手动错开 mtime，保证"最近"排序确定
+    fs.utimesSync(f, new Date(1_700_000_000_000 + i * 1000), new Date(1_700_000_000_000 + i * 1000));
+  }
+  rotateDebugDir(dir, 2);
+  assert.deepStrictEqual(fs.readdirSync(dir).sort(), ['3.png', '4.png']);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('cookie 缓存: 两段写不留 .part 残留', () => {
+  const dir = makeCacheDir();
+  saveCookieCache('p@b.com', 'uid=1; expire_in=1991347708', 'ikuuu.top', dir);
+  assert.strictEqual(fs.readdirSync(dir).filter((f) => f.endsWith('.part')).length, 0);
+  assert.ok(fs.existsSync(cacheFileFor('p@b.com', dir)));
+  clearCookieCache('p@b.com', dir);
+});
+
+// ==========================================
+// main 编排层流程测试（不碰网络：三个场景都在域名抓取/签到请求发生之前返回）
+// ==========================================
+
+// 保存/恢复 process.exitCode 与相关环境变量（main 会改它们）
+function withMainEnv(fn) {
+  return async () => {
+    const savedExit = process.exitCode;
+    const savedAccounts = process.env.ACCOUNTS;
+    const savedCookie = process.env.IKUUU_COOKIE;
+    process.exitCode = 0;
+    try {
+      await fn();
+    } finally {
+      if (savedAccounts === undefined) delete process.env.ACCOUNTS; else process.env.ACCOUNTS = savedAccounts;
+      if (savedCookie === undefined) delete process.env.IKUUU_COOKIE; else process.env.IKUUU_COOKIE = savedCookie;
+      // process.exitCode 的 descriptor 是 configurable:false，不能用 delete 复原
+      process.exitCode = savedExit;
+    }
+  };
+}
+
+test('main 编排: ACCOUNTS 解析失败 → exitCode=1', withMainEnv(async () => {
+  process.env.ACCOUNTS = 'no-hash-value'; // 无 # → normalizeAccounts 报错
+  delete process.env.IKUUU_COOKIE;
+  await main();
+  assert.strictEqual(process.exitCode, 1);
+}));
+
+test('main 编排: 未配置任何账号 → exitCode=1', withMainEnv(async () => {
+  delete process.env.ACCOUNTS;
+  delete process.env.IKUUU_COOKIE;
+  await main();
+  assert.strictEqual(process.exitCode, 1);
+}));
+
+// ==========================================
+// chromium_path: 浏览器路径解析（版本解耦的核心）
+// ==========================================
+const os = require('node:os');
+const { findInRoot, resolveChromiumPath } = require('./chromium_path');
+
+function makeChromiumTree(root, revisions) {
+  for (const rev of revisions) {
+    const exe = nodePath.join(root, `chromium-${rev}`, 'chrome-linux64', 'chrome');
+    fs.mkdirSync(nodePath.dirname(exe), { recursive: true });
+    fs.writeFileSync(exe, '');
+  }
+}
+
+test('findInRoot: 多个 revision 时优先最大的', () => {
+  const dir = fs.mkdtempSync(nodePath.join(os.tmpdir(), 'pw-'));
+  makeChromiumTree(dir, [100, 200, 150]);
+  assert.strictEqual(findInRoot(dir), nodePath.join(dir, 'chromium-200', 'chrome-linux64', 'chrome'));
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('findInRoot: 缺 chrome 可执行文件的目录被跳过', () => {
+  const dir = fs.mkdtempSync(nodePath.join(os.tmpdir(), 'pw-'));
+  makeChromiumTree(dir, [100]);
+  // 300 只有空壳目录，不能被选中
+  fs.mkdirSync(nodePath.join(dir, 'chromium-300', 'chrome-linux64'), { recursive: true });
+  assert.strictEqual(findInRoot(dir), nodePath.join(dir, 'chromium-100', 'chrome-linux64', 'chrome'));
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('findInRoot: 目录不存在返回空串', () => {
+  assert.strictEqual(findInRoot(nodePath.join(os.tmpdir(), `not-exist-${Date.now()}`)), '');
+});
+
+test('resolveChromiumPath: 环境变量优先于自动探测', () => {
+  const saved = process.env.IKUUU_CHROMIUM_PATH;
+  process.env.IKUUU_CHROMIUM_PATH = '/opt/custom/chrome';
+  try {
+    assert.strictEqual(resolveChromiumPath(), '/opt/custom/chrome');
+  } finally {
+    if (saved === undefined) delete process.env.IKUUU_CHROMIUM_PATH;
+    else process.env.IKUUU_CHROMIUM_PATH = saved;
+  }
 });

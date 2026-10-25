@@ -22,7 +22,7 @@
  *                              key 失效 / 网关不通 / 超时）时自动改用它。
  *   IKUUU_RETRY_TIMES        【可选】失败账号延迟重试次数，默认 0（不重试）。
  *                              限流、网关抖动这类"过一会儿就好"的故障靠它兜底。
- *   IKUUU_RETRY_DELAY        【可选】每次重试前等待秒数，默认 300。
+ *   IKUUU_RETRY_DELAY        【可选】每次重试前等待秒数，默认 300（最小 10）。
  *   HOST                     【可选】强制锁定签到域名，留空则自动从发布页抓取
  *   IKUUU_PUBLISH_URL        【可选】发布页地址，默认 https://ikuuu.win/
  *                                      ikuuu 的"最新域名"发布页会整体迁移域名，
@@ -32,7 +32,9 @@
  *                                      HTTP_PROXY / ALL_PROXY / GLOBAL_AGENT_*）
  *                                      登录用浏览器同样走该代理
  *   IKUUU_HEADFUL            【可选】1 = 登录用有头浏览器（本地调试用，容器内勿开）
- *   IKUUU_CHROMIUM_PATH      【可选】系统 Chromium 路径（青龙容器装系统包后填 /usr/bin/chromium）
+ *   IKUUU_CHROMIUM_PATH      【可选】Chromium 可执行文件路径；留空时自动探测持久目录
+ *                                      （<青龙数据根>/.cache/ms-playwright）与 Playwright
+ *                                      默认缓存，取最大的 revision，不受版本号限制
  *   IKUUU_NOTIFY_ONLY_FAIL   【可选】1 = 仅失败时推送，0/留空 = 全部推送
  *   IKUUU_DEBUG              【可选】1 = 打印详细调试信息（域名抓取/响应原文/登录截屏等）
  *
@@ -46,8 +48,9 @@ const crypto = require('crypto');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const { spawn } = require('child_process');
+const { spawn, spawnSync } = require('child_process');
 const { sendNotify } = require(path.join(__dirname, 'sendNotify'));
+const { resolveChromiumPath } = require(path.join(__dirname, 'chromium_path'));
 // undici（sendNotify.js 已依赖）用于代理支持：ikuuu 被墙，青龙容器需走代理
 const { fetch: undiciFetch, ProxyAgent } = require('undici');
 
@@ -57,7 +60,10 @@ const UA =
 const DEBUG = process.env.IKUUU_DEBUG === '1';
 const NOTIFY_ONLY_FAIL = process.env.IKUUU_NOTIFY_ONLY_FAIL === '1';
 const HEADFUL = process.env.IKUUU_HEADFUL === '1';
-const CHROMIUM_PATH = (process.env.IKUUU_CHROMIUM_PATH || '').trim();
+// 显式配置优先，其次自动探测持久目录里的任意 revision，避免被 Playwright 版本号卡住
+const CHROMIUM_PATH = resolveChromiumPath();
+// 解法器是子进程，继承环境变量；把探测结果写回去，让它用同一个浏览器
+if (CHROMIUM_PATH && !process.env.IKUUU_CHROMIUM_PATH) process.env.IKUUU_CHROMIUM_PATH = CHROMIUM_PATH;
 const TIMEOUT_MS = 15000;
 
 // 点选验证码解法器（外部命令插件）：见 README「点选验证码与解法器」
@@ -66,14 +72,41 @@ const SOLVER_CMDS = [
   (process.env.IKUUU_SOLVER_CMD || '').trim(),
   (process.env.IKUUU_SOLVER_CMD_FALLBACK || '').trim(),
 ].filter(Boolean);
+// 数值环境变量安全解析：非法值（非数字/空）回落默认值。
+// 直接 Number + Math.max 的写法遇到 "abc" 会得到 NaN —— for 循环 `i <= NaN` 零次迭代，
+// 重试/轮次被静默关闭，配置错误被吞掉
+function safeNum(raw, fallback, min = 0) {
+  const s = raw === undefined || raw === null ? '' : String(raw).trim();
+  if (!s) return fallback;
+  const n = Number(s);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.max(min, n);
+}
+
 // 失败后延迟重试：对限流、短暂抖动这类"过一会儿就好"的故障最有效（0 = 不重试）
-const RETRY_TIMES = Math.max(0, Number(process.env.IKUUU_RETRY_TIMES || 0));
-const RETRY_DELAY_MS = Math.max(10, Number(process.env.IKUUU_RETRY_DELAY || 300)) * 1000;
-// 解法器超时（秒）：默认按"视觉大模型解法器"的耗时给（多次调用+重试），
-// 轻量解法器（纯 HTTP 打码平台）可调小
-const SOLVER_TIMEOUT_MS = Math.max(10, Number(process.env.IKUUU_SOLVER_TIMEOUT || 180)) * 1000;
+const RETRY_TIMES = safeNum(process.env.IKUUU_RETRY_TIMES, 0);
+const RETRY_DELAY_MS = safeNum(process.env.IKUUU_RETRY_DELAY, 300, 10) * 1000;
+// 解法器超时（秒）：显式配置优先；未配置时按内置视觉解法器的最坏耗时推导。
+// 固定 180s 会与解法器自身预算脱节——解法器默认 2 票、单次请求超时 120s，
+// 一票撞超时后重试成功、再跑第二票就要 200s 以上，主流程先放弃，算出来的坐标被丢弃。
+// 推导口径：每票 = 单次请求超时 + 一次退避等待；多模型兜底会让最坏耗时再乘模型数。
+// 结果夹在 [180, 600] 秒：下限保持轻量解法器的原有行为，上限避免整轮登录被拖太久。
+function deriveSolverTimeoutSec(env = process.env) {
+  const raw = env.IKUUU_SOLVER_TIMEOUT;
+  const explicit = raw === undefined || raw === null ? '' : String(raw).trim();
+  if (explicit) return safeNum(explicit, 180, 10);
+  const vlmTimeout = safeNum(env.IKUUU_VLM_TIMEOUT, 120, 10);
+  const votes = safeNum(env.IKUUU_VLM_VOTES, 2, 1);
+  const models = Math.min(3, Math.max(1,
+    String(env.IKUUU_VLM_MODEL || '').split(',').map((s) => s.trim()).filter(Boolean).length || 1));
+  const RETRY_WAIT_SEC = 4; // solver_vlm.js 首次超时后的退避（[4000, 12000] 的第一档）
+  const STARTUP_MARGIN_SEC = 30; // 进程启动 + 挑战图合成
+  const budget = votes * (vlmTimeout + RETRY_WAIT_SEC) * models + STARTUP_MARGIN_SEC;
+  return Math.min(600, Math.max(180, Math.ceil(budget / 30) * 30));
+}
+const SOLVER_TIMEOUT_MS = deriveSolverTimeoutSec() * 1000;
 // 点选挑战最多整页重来几次（每次刷新会重新抽取验证形式）
-const MAX_CAPTCHA_ROUNDS = Math.max(1, Number(process.env.IKUUU_CAPTCHA_ROUNDS || 6));
+const MAX_CAPTCHA_ROUNDS = safeNum(process.env.IKUUU_CAPTCHA_ROUNDS, 6, 1);
 
 // 登录会话 Cookie 缓存：脚本目录 .token/（.gitignore 已覆盖），按账号邮箱隔离
 // ikuuu 会话有效期 24h（expire_in），留 30 分钟余量；cron 每天一次时约每天重登一次
@@ -99,8 +132,22 @@ function resolveProxy(specificKeys = []) {
   return { url: '', source: '' };
 }
 
-const { url: PROXY, source: PROXY_SOURCE } = resolveProxy(['IKUUU_PROXY']);
-const proxyAgent = PROXY ? new ProxyAgent(PROXY) : null;
+const { url: PROXY_RAW, source: PROXY_SOURCE } = resolveProxy(['IKUUU_PROXY']);
+// 代理 URL 格式错（如漏写 http://）会让 ProxyAgent 在模块顶层抛 Invalid URL，
+// 脚本在打印任何提示前就崩掉、推送全无 —— 这里降级为无代理并给出引导，
+// 发布页抓取还有公共 CORS 通道兜底
+let PROXY = PROXY_RAW;
+let proxyAgent = null;
+if (PROXY_RAW) {
+  try {
+    proxyAgent = new ProxyAgent(PROXY_RAW);
+  } catch (e) {
+    console.log(`❌ 代理地址无效: ${maskProxy(PROXY_RAW)}（${e.message}）`);
+    console.log('   需要完整 URL，如 http://172.17.0.1:7890；本次已降级为无代理继续');
+    PROXY = '';
+    proxyAgent = null;
+  }
+}
 const FETCH_OPTIONS = proxyAgent ? { dispatcher: proxyAgent } : {};
 
 // 统一带代理的 fetch（代理与超时在此注入，调用处保持简洁）
@@ -128,6 +175,24 @@ function dbg(...args) {
   if (DEBUG) console.log('[DEBUG]', ...args);
 }
 
+// 调试产物轮转：目录里只保留最近 keep 个文件（DEBUG 开着无人值守跑，目录只增不减会逐年膨胀）
+function rotateDebugDir(dir, keep = 50) {
+  try {
+    const files = fs.readdirSync(dir)
+      .map((name) => {
+        const full = path.join(dir, name);
+        let st;
+        try { st = fs.statSync(full); } catch (e) { return null; }
+        return st.isFile() ? { full, mtime: st.mtimeMs } : null;
+      })
+      .filter(Boolean)
+      .sort((a, b) => b.mtime - a.mtime);
+    for (const f of files.slice(Math.max(0, keep))) {
+      try { fs.unlinkSync(f.full); } catch (e) { /* 并发写时被删走属正常 */ }
+    }
+  } catch (e) { /* 目录不存在属正常 */ }
+}
+
 // ==========================================
 // 1. 账号解析：ACCOUNTS = 邮箱#密码，多账号用 & 或换行分隔（青龙通用惯例）
 // ==========================================
@@ -138,6 +203,12 @@ function maskEmail(email) {
   const head = email.slice(0, at);
   const visible = head.slice(0, 2);
   return `${visible}${'*'.repeat(Math.max(1, head.length - 2))}${email.slice(at)}`;
+}
+
+// 代理 URL 可能带 user:pass@，日志里剥掉 userinfo，只保留协议与主机端口
+function maskProxy(url) {
+  if (!url) return '';
+  return String(url).replace(/\/\/[^/@]*@/, '//***@');
 }
 
 // 推送/日志里的账号标识：账密账号用脱敏邮箱；cookie 账号用 uid 脱敏
@@ -225,7 +296,13 @@ function saveCookieCache(email, cookie, host, dir = COOKIE_CACHE_DIR) {
   try {
     fs.mkdirSync(dir, { recursive: true });
     const expireAt = extractExpireAt(cookie) || Date.now() + 24 * 3600 * 1000;
-    fs.writeFileSync(cacheFileFor(email, dir), JSON.stringify({ cookie, host, expireAt, savedAt: Date.now() }));
+    const file = cacheFileFor(email, dir);
+    // 两段写（.part + rename）：进程中断/并发运行不会留下半截 JSON 被下次读到；
+    // 0600 收紧权限（Windows 无 POSIX 权限位，chmod 静默无效，真机 Linux 生效）
+    const partFile = `${file}.part`;
+    fs.writeFileSync(partFile, JSON.stringify({ cookie, host, expireAt, savedAt: Date.now() }));
+    try { fs.chmodSync(partFile, 0o600); } catch (e) { /* 非 POSIX 文件系统忽略 */ }
+    fs.renameSync(partFile, file);
     const until = new Date(expireAt).toLocaleString('zh-CN', { hour12: false });
     console.log(`  📦 已缓存登录 Cookie（服务端到期 ${until}）`);
   } catch (e) {
@@ -427,11 +504,11 @@ async function waitClickChallenge(page, timeoutMs = 10000) {
   return last || { visible: false, imageUrl: null, tplUrls: [], rect: null, natural: null };
 }
 
-// 下载到本地文件（给外部解法器读）
-async function downloadToFile(url, file) {
+// 下载到本地文件（给外部解法器读）；Referer 跟随实际登录域名
+async function downloadToFile(url, file, referer) {
   const resp = await fetchWithProxy(url, {
     method: 'GET',
-    headers: { 'User-Agent': UA, Referer: 'https://ikuuu.top/' },
+    headers: { 'User-Agent': UA, Referer: referer || 'https://ikuuu.top/' },
     signal: AbortSignal.timeout(TIMEOUT_MS),
   });
   if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
@@ -439,12 +516,39 @@ async function downloadToFile(url, file) {
   return file;
 }
 
+// 终止整个进程树。解法器用 shell 启动（支持 "node solver_vlm.js" 这类写法），
+// 此时 kill(child.pid) 只杀掉中间那层 sh，真正干活的 node 会变孤儿继续跑：
+// 实测超时后仍在打日志、继续消耗视觉模型额度，还吊着父进程的事件循环不退出。
+// POSIX 让子进程自成进程组（spawn 时 detached），对负 pid 发信号即可整组终止；
+// Windows 没有进程组，交给 taskkill /T 递归结束。
+function killProcessTree(child) {
+  if (!child || child.exitCode !== null || child.signalCode) return;
+  if (process.platform === 'win32') {
+    try {
+      const r = spawnSync('taskkill', ['/pid', String(child.pid), '/T', '/F'], { windowsHide: true, stdio: 'ignore' });
+      if (r && r.status === 0) return;
+    } catch (e) {
+      // 落到下面的兜底
+    }
+  } else {
+    try {
+      process.kill(-child.pid, 'SIGKILL');
+      return;
+    } catch (e) {
+      // 进程组不存在（子进程已退出或未 detached）时退回单进程
+    }
+  }
+  try { child.kill('SIGKILL'); } catch (e) { /* 已退出 */ }
+}
+
 // 调单个外部解法器：stdin 传 JSON，stdout 收 JSON
-function runSolver(cmd, payload) {
+// timeoutMs 可注入：生产用 SOLVER_TIMEOUT_MS，单测用小值验证超时终止路径
+function runSolver(cmd, payload, timeoutMs = SOLVER_TIMEOUT_MS) {
   return new Promise((resolve) => {
     let child;
     try {
-      child = spawn(cmd, { shell: true, windowsHide: true });
+      // POSIX 下 detached 让解法器自成进程组，超时才能整组杀掉（见 killProcessTree）
+      child = spawn(cmd, { shell: true, windowsHide: true, detached: process.platform !== 'win32' });
     } catch (e) {
       return resolve({ ok: false, msg: `解法器无法启动: ${e.message}` });
     }
@@ -458,9 +562,17 @@ function runSolver(cmd, payload) {
       resolve(r);
     };
     const timer = setTimeout(() => {
-      try { child.kill('SIGKILL'); } catch (e) { /* 已退出 */ }
-      finish({ ok: false, msg: `解法器超时（${SOLVER_TIMEOUT_MS / 1000}s）` });
-    }, SOLVER_TIMEOUT_MS);
+      killProcessTree(child);
+      // 兜底：即使进程树没杀干净，也不能让它继续吊住主流程（管道保持事件循环活跃）
+      try { child.stdout.destroy(); } catch (e) { /* 已关闭 */ }
+      try { child.stderr.destroy(); } catch (e) { /* 已关闭 */ }
+      try { child.unref(); } catch (e) { /* 已退出 */ }
+      finish({
+        ok: false,
+        msg: `解法器超时（${timeoutMs / 1000}s）`
+          + '（提示：调大 IKUUU_SOLVER_TIMEOUT，或调小 IKUUU_VLM_TIMEOUT / IKUUU_VLM_VOTES）',
+      });
+    }, timeoutMs);
     child.stdout.on('data', (d) => { out += d; });
     child.stderr.on('data', (d) => {
       err += d;
@@ -482,21 +594,23 @@ function runSolver(cmd, payload) {
       if (parsed.ok === false) return finish({ ok: false, msg: parsed.msg || '解法器返回失败' });
       finish({ ok: true, clicks: parsed.clicks || [] });
     });
+    child.stdin.on('error', () => { /* 解法器提前退出时写入会 EPIPE，结果由 close 事件统一判定 */ });
     child.stdin.end(JSON.stringify(payload));
   });
 }
 
 // 准备挑战图片并调用解法器，返回 { ok, clicks }（clicks 为图片自然坐标）
-async function solveChallenge(challenge, type) {
+async function solveChallenge(challenge, type, loginHost) {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ikuuu-captcha-'));
   try {
+    const referer = loginHost ? `https://${loginHost}/` : undefined;
     const ext = (challenge.imageUrl.match(/\.(jpe?g|png)(\?|$)/i) || [null, 'jpg'])[1];
     const imagePath = path.join(tmpDir, `challenge.${ext}`);
-    await downloadToFile(challenge.imageUrl, imagePath);
+    await downloadToFile(challenge.imageUrl, imagePath, referer);
     const tplPaths = [];
     for (let i = 0; i < challenge.tplUrls.length; i++) {
       const p = path.join(tmpDir, `tpl${i + 1}.png`);
-      await downloadToFile(challenge.tplUrls[i], p);
+      await downloadToFile(challenge.tplUrls[i], p, referer);
       tplPaths.push(p);
     }
     const size = imageSize(fs.readFileSync(imagePath)) || challenge.natural;
@@ -672,6 +786,7 @@ async function browserLogin({ host, email, password }) {
     try {
       fs.mkdirSync(debugDir, { recursive: true });
       await page.screenshot({ path: path.join(debugDir, `${Date.now()}_${name}.png`) });
+      rotateDebugDir(debugDir);
     } catch (e) {
       dbg('截屏失败:', e.message);
     }
@@ -797,7 +912,7 @@ async function browserLogin({ host, email, password }) {
           + '请配置 IKUUU_SOLVER_CMD 外部解法器，或在青龙里用 IKUUU_COOKIE 直填 cookie（见 README）';
         break;
       }
-      const solved = await solveChallenge(challenge, captchaType);
+      const solved = await solveChallenge(challenge, captchaType, host);
       if (!solved.ok) {
         failMsg = `解法器未解决验证码: ${solved.msg}`;
         console.log(`  ⚠️ ${failMsg}`);
@@ -858,7 +973,7 @@ async function browserLogin({ host, email, password }) {
     return { ok: true, cookie: cookieStr };
   } catch (err) {
     const hint = /Executable doesn't exist/.test(err.message)
-      ? '。浏览器未安装：容器内执行 `npx playwright install chromium`，或设 IKUUU_CHROMIUM_PATH=/usr/bin/chromium'
+      ? '。浏览器不可用：设 IKUUU_CHROMIUM_PATH 指向 chrome，或把浏览器放到持久目录 /ql/data/.cache/ms-playwright'
       : '';
     return { ok: false, msg: `浏览器登录异常: ${String(err.message || err).substring(0, 200)}${hint}` };
   } finally {
@@ -1074,15 +1189,17 @@ function classify(text, httpStatus, location) {
 
   const raw = (data.msg || data.message || '').toString();
 
-  // 已签到的常见文案 → 幂等成功
-  // （"已经签到" 与 "已签到" 是两种常见写法，SSPanel 默认文案为前者的变体，两种都要认）
-  if (/已(经)?签到|重复|already|signed|今日已|明天再来/.test(raw)) {
+  // 已签到（幂等成功）：只认已签语义。裸 "signed"/"重复" 会把 "not signed"/
+  // "请勿重复提交" 类文案误判成已签 —— 英文关键词必须用组合词（仓库正向证据制惯例）。
+  // （实测文案「您似乎已经签到过了」由 已(经)?签到 覆盖，行为不受收紧影响）
+  if (/已(经)?签到|今日已签|already signed/.test(raw)) {
     return { status: 'already', msg: raw || '今日已签到' };
   }
 
-  // 业务返回 ret=1 或 success=true 视为成功
-  // （兼容 ret 为字符串 "1"；"获得/奖励" 会误伤 "未获得任何奖励" 类失败文案，不可用作成功特征）
-  if (Number(data.ret) === 1 || data.success === true || /成功/.test(raw)) {
+  // 成功只认结构化字段（ikuuu 契约实测 ret=1；兼容字符串 "1"）。
+  // 不再用 /成功/ 文案兜底 —— "签到未成功" 这类否定式文案会被误判成假成功；
+  // 兜不住的进 parse_err（⚠️ 黄档不染红），宁可保守也不冒领成功
+  if (Number(data.ret) === 1 || data.success === true) {
     return { status: 'success', msg: raw || '签到成功' };
   }
 
@@ -1136,6 +1253,37 @@ async function checkIn(cookieStr, host) {
 }
 
 // ==========================================
+// 3.5 登录前域名可达性探测
+//   签到环节的域名轮换帮不到登录：browserLogin 失败没有"换下一个域名"的机会
+//   （浏览器启动代价大），主域名被墙时账密账号会整体卡死在登录这一步。
+//   先用轻量 GET 选出第一个登录页可达的域名。
+// ==========================================
+// 登录页可达性探测（任何 HTTP 响应都算可达 —— 页面打不开/超时才是失败）
+async function probeLoginHost(host) {
+  try {
+    const resp = await fetchWithProxy(`https://${host}/auth/login`, {
+      method: 'GET',
+      headers: { 'User-Agent': UA },
+      redirect: 'manual',
+      signal: AbortSignal.timeout(8000),
+    });
+    return resp.status > 0;
+  } catch (e) {
+    return false;
+  }
+}
+
+// 从候选域名里选第一个登录页可达的；全不可达时回落首选域名，
+// 让 browserLogin 报出真实错误（而不是探测层把原因吞掉）。probe 参数注入仅为单测服务
+async function pickLoginHost(targetHosts, probe = probeLoginHost) {
+  for (const host of targetHosts) {
+    if (await probe(host)) return host;
+    console.log(`  ↪ ${host} 登录页不可达（8s 超时），尝试下一个域名...`);
+  }
+  return targetHosts[0];
+}
+
+// ==========================================
 // 4. 状态 → 标记 / 通知文案
 // ==========================================
 const STATUS_FLAG = {
@@ -1175,6 +1323,7 @@ async function runAccount(acc, targetHosts) {
 
   // ---- 第一步：确定认证 Cookie —— cookie 型直接用；账密型缓存优先，没有则先登录 ----
   let cookie = acc.cookie || null;
+  let loginHost = null;
   if (!cookie && acc.email) {
     const cached = readCookieCache(acc.email);
     if (cached) {
@@ -1185,9 +1334,12 @@ async function runAccount(acc, targetHosts) {
   }
   if (!cookie && acc.email && acc.password) {
     console.log('  🔐 无可用 Cookie 缓存，先走浏览器自动登录...');
-    const login = await browserLogin({ host: targetHosts[0], email: acc.email, password: acc.password });
+    // 先探测哪个域名的登录页可达（登录环节没有轮换机会，主域名被墙时自动落到备用域名）
+    loginHost = await pickLoginHost(targetHosts);
+    if (loginHost !== targetHosts[0]) console.log(`  🌐 首选域名登录页不可达，改用 ${loginHost} 登录`);
+    const login = await browserLogin({ host: loginHost, email: acc.email, password: acc.password });
     if (login.ok) {
-      saveCookieCache(acc.email, login.cookie, targetHosts[0]);
+      saveCookieCache(acc.email, login.cookie, loginHost);
       cookie = login.cookie;
     } else {
       console.log(`  ❌ 自动登录失败: ${login.msg}`);
@@ -1202,9 +1354,13 @@ async function runAccount(acc, targetHosts) {
   }
 
   // ---- 第二步：依次尝试候选域名签到；仅域名/网络类问题才轮换 ----
+  // 首登发生在 loginHost 上时，签到也从它开始（探测已知可达，省去在死域名上白等一轮超时）
+  const checkinHosts = loginHost && loginHost !== targetHosts[0]
+    ? [loginHost, ...targetHosts.filter((h) => h !== loginHost)]
+    : targetHosts;
   let result = null;
   let resultHost = null;
-  for (const host of targetHosts) {
+  for (const host of checkinHosts) {
     const r = await checkIn(cookie, host);
     if (r.status === 'domain_block' || r.status === 'network_err') {
       console.log(`  ↪ ${host} 返回 ${r.status}（${r.msg}），尝试下一个域名...`);
@@ -1238,9 +1394,41 @@ async function runAccount(acc, targetHosts) {
   return { name: label, result, line, usedHost };
 }
 
+// 单账号容错：runAccount 内部各环节均有兜底，但仍可能有未预期异常；
+// 让它只记为该账号失败，保住"其他账号照常跑 + 推送一定发出"。
+// runner 参数注入仅为单测服务
+async function runAccountSafe(acc, targetHosts, runner = runAccount) {
+  try {
+    return await runner(acc, targetHosts);
+  } catch (err) {
+    const msg = `账号流程内部异常: ${String((err && err.message) || err).substring(0, 160)}`;
+    console.log(`  ❌ ${msg}（不影响其他账号）`);
+    const r = { status: 'network_err', msg };
+    return { name: accountLabel(acc), result: r, line: resultText(r), usedHost: targetHosts[0] };
+  }
+}
+
 // 值得隔一会儿重跑的状态：登录失败（解法器/网关抖动）与网络异常，都可能"过一会儿就好"
 function isRetryableStatus(status) {
   return status === 'login_fail' || status === 'network_err';
+}
+
+// 推送重试封装（对齐仓库 Node 路线惯例：sendNotify 内部已有通道级容错，外层兜网络抖动）。
+// 推送失败不能静默 —— 无人值守场景用户全靠推送感知结果，最终失败时必须醒目提示。
+// send/maxAttempts/retryDelayMs 参数注入仅为单测服务
+async function sendNotifyWithRetry(title, desp, send = sendNotify, maxAttempts = 3, retryDelayMs = 3000) {
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      await send(title, desp);
+      console.log('📨 已通过 sendNotify.js 推送');
+      return true;
+    } catch (e) {
+      console.log(`⚠️ 推送第 ${attempt}/${maxAttempts} 次失败: ${String((e && e.message) || e)}`);
+      if (attempt < maxAttempts) await sleep(retryDelayMs);
+    }
+  }
+  console.log('❌ 推送最终失败：本次签到结果只存在于任务日志中，请检查通知渠道配置');
+  return false;
 }
 
 async function main() {
@@ -1248,10 +1436,16 @@ async function main() {
 
   if (PROXY) {
     console.log(PROXY_SOURCE === 'IKUUU_PROXY'
-      ? `代理: ${PROXY}`
-      : `代理: ${PROXY}（来源: ${PROXY_SOURCE}）`);
+      ? `代理: ${maskProxy(PROXY)}`
+      : `代理: ${maskProxy(PROXY)}（来源: ${PROXY_SOURCE}）`);
   } else {
     console.log('代理: 未配置（发布页走公共 CORS 通道兜底）');
+  }
+
+  // 解法器超时值直接打出来：日志里出现"解法器超时"时，先看这个数对不对得上解法器的实际耗时
+  if (SOLVER_CMDS.length) {
+    const explicit = String(process.env.IKUUU_SOLVER_TIMEOUT || '').trim();
+    console.log(`🧩 解法器超时: ${SOLVER_TIMEOUT_MS / 1000}s（${explicit ? 'IKUUU_SOLVER_TIMEOUT 显式配置' : '按 IKUUU_VLM_* 自动推导'}）`);
   }
 
   // 两种账号来源可共存：ACCOUNTS（邮箱#密码，可自动重登）+ IKUUU_COOKIE（直填，失效需手工更新）
@@ -1261,7 +1455,8 @@ async function main() {
       accounts.push(...normalizeAccounts(process.env.ACCOUNTS));
     } catch (err) {
       console.error(`❌ ACCOUNTS 解析失败: ${err.message}`);
-      process.exit(1);
+      process.exitCode = 1;
+      return;
     }
   }
   if ((process.env.IKUUU_COOKIE || '').trim()) {
@@ -1269,12 +1464,14 @@ async function main() {
       accounts.push(...parseCookieAccounts(process.env.IKUUU_COOKIE));
     } catch (err) {
       console.error(`❌ IKUUU_COOKIE 解析失败: ${err.message}`);
-      process.exit(1);
+      process.exitCode = 1;
+      return;
     }
   }
   if (accounts.length === 0) {
     console.error('❌ 未配置账号：请设置 ACCOUNTS（邮箱#密码，推荐）或 IKUUU_COOKIE（cookie 直填）');
-    process.exit(1);
+    process.exitCode = 1;
+    return;
   }
   const pwdCount = accounts.filter((a) => a.email).length;
   console.log(`共解析到 ${accounts.length} 个账号（账密 ${pwdCount} / cookie ${accounts.length - pwdCount}），将串行签到\n`);
@@ -1288,7 +1485,8 @@ async function main() {
 
   for (let i = 0; i < accounts.length; i++) {
     console.log(`[${i + 1}/${accounts.length}] 账号 [${accountLabel(accounts[i])}] 签到中...`);
-    const r = await runAccount(accounts[i], targetHosts);
+    // runAccountSafe：单账号未预期异常只记该账号失败，不拖垮整批与推送
+    const r = await runAccountSafe(accounts[i], targetHosts);
     results.push({ name: r.name, result: r.result, line: r.line });
     if (r.usedHost) usedHost = r.usedHost;
 
@@ -1310,7 +1508,7 @@ async function main() {
     await sleep(RETRY_DELAY_MS);
     for (const i of retryIdx) {
       console.log(`[重试 ${attempt}] 账号 [${results[i].name}] 签到中...`);
-      const r = await runAccount(accounts[i], targetHosts);
+      const r = await runAccountSafe(accounts[i], targetHosts);
       results[i] = { name: r.name, result: r.result, line: r.line };
       if (r.usedHost) usedHost = r.usedHost;
     }
@@ -1341,16 +1539,11 @@ async function main() {
   console.log('=== 签到任务执行完毕 ===');
   console.log(`标题: ${title}`);
 
-  // 失败才推送 / 全部推送
+  // 失败才推送 / 全部推送（推送失败自动重试，最终失败醒目提示 —— 结果不能只活在日志里）
   if (NOTIFY_ONLY_FAIL && failCount === 0) {
     console.log('全部成功且已开启 IKUUU_NOTIFY_ONLY_FAIL, 跳过推送');
   } else {
-    try {
-      await sendNotify(title, desp);
-      dbg('推送完成');
-    } catch (err) {
-      console.log(`⚠️ 推送异常: ${err.message}`);
-    }
+    await sendNotifyWithRetry(title, desp);
   }
 
   // 全失败才以非0退出（青龙便于识别失败任务红色标记）
@@ -1381,6 +1574,7 @@ module.exports = {
   accountLabel,
   maskName,
   maskEmail,
+  maskProxy,
   extractExpireAt,
   cacheFileFor,
   readCookieCache,
@@ -1391,6 +1585,15 @@ module.exports = {
   getLatestHosts,
   PUBLISH_HOSTS,
   FALLBACK_HOSTS,
+  safeNum,
+  deriveSolverTimeoutSec,
+  killProcessTree,
+  runSolver,
+  pickLoginHost,
+  runAccountSafe,
+  sendNotifyWithRetry,
+  rotateDebugDir,
+  main,
 };
 
 if (require.main === module) {

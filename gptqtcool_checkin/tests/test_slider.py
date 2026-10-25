@@ -2,6 +2,10 @@
 """拟人化轨迹生成单测。"""
 import pytest
 
+# core.slider 依赖 cv2/numpy；缺失时整文件跳过，不能让收集阶段直接崩
+pytest.importorskip("cv2", reason="core.slider 依赖 opencv")
+pytest.importorskip("numpy", reason="core.slider 依赖 numpy")
+
 from core.slider import generate_human_track
 
 

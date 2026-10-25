@@ -44,7 +44,6 @@ cd /ql/scripts/pt-checkin && npm install --production
 | `PT_NOTIFY_ONLY_FAIL` | | `1` = 仅失败时推送 |
 | `PT_DEBUG` | | `1` = 打印详细调试信息（含页面片段，注意勿泄露） |
 | `PT_TIMEOUT` | | HTTP 超时秒数，默认 20（OCR 识别固定 60s） |
-| `PT_RUN_COOLDOWN` | | 运行冷却窗口分钟数，默认 10；距上次运行结束不足该时长则跳过（防青龙自动重试/并发叠加消耗登录配额），`0` 关闭 |
 
 每个站点「Cookie」与「账密」二选一即可：只配 Cookie 则 Cookie 失效时推送提醒；配了账密 + OCR 则自动登录兜底。
 
@@ -95,14 +94,14 @@ POST /takelogin.php  (secret + response + username + password + two_step_code + 
 
 > 另有**运行锁**兜底（见下节），即使青龙开启失败自动重试或手动并发触发，也不会叠加消耗配额。
 
-## 运行锁（防并发 / 重复消耗配额）
+## 运行锁（防并发）
 
 脚本在目录内维护 `pt_checkin.lock`（运行期自动生成，已 gitignore）：
 
 - **并发保护**：检测到上一次运行仍在进行（进程未结束）→ 本次直接跳过（退出码 0，非失败）
-- **冷却窗口**：距上次运行结束不足 `PT_RUN_COOLDOWN` 分钟（默认 10）→ 跳过，防止青龙"失败自动重试"反复拉起
 - **死锁自愈**：进程崩溃遗留的锁（30 分钟未标记结束）自动失效，不会永久卡住
-- 确需立即重跑：删除 `pt_checkin.lock`，或设 `PT_RUN_COOLDOWN=0`
+- 上次运行正常结束后锁立即失效，下一次可随时重跑（无冷却等待）
+- 确需立即重跑而上一实例仍在运行：确认无残留进程后删除 `pt_checkin.lock`
 
 ## Cookie 生命周期
 
@@ -148,7 +147,6 @@ POST /takelogin.php  (secret + response + username + password + two_step_code + 
 | `OCR 接口 HTTP xxx` | 检查 `PT_OCR_API_URL`/`PT_OCR_API_KEY`/`PT_OCR_MODEL` 是否正确、模型是否支持图片输入 |
 | `自动登录后仍判定未登录` | 账号可能被禁用或需要两步验证（`two_step_code`，当前脚本未支持） |
 | `签到请求已发出但未能确认结果` | 开 `PT_DEBUG=1` 看页面原文，多为站点改版导致解析规则失效 |
-| `距上次运行结束仅 N 分钟…跳过本次` | 冷却窗口命中（默认 10 分钟）。确需立即重跑：删除 `pt_checkin.lock`，或设 `PT_RUN_COOLDOWN=0` |
 | `检测到上一次运行仍在进行…跳过本次` | 上一实例未正常结束；确认无残留进程后删除 `pt_checkin.lock`（崩溃死锁 30 分钟后自动失效） |
 | `未解析到「剩余尝试次数」，保守起见本轮仅尝试 1 次` | 站点登录页改版导致限次文案解析失败；本轮只试一次，频繁出现需更新 `parseLoginPage` 正则 |
 | `首页无签到入口且未识别到正常首页标志` | BTSchool 首页疑似加载异常/维护页，脚本不冒报已签；先确认站点状态 |
