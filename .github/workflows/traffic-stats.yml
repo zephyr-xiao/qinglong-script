@@ -8,9 +8,10 @@ on:
     - cron: "0 1 * * *"
   workflow_dispatch: # 也支持在 Actions 页面手动点运行
 
-# 需要写权限才能把快照提交回仓库
+# 需要写权限才能把快照提交回仓库；issues:write 用于失败时自动开告警
 permissions:
   contents: write
+  issues: write
 
 # 避免两次运行同时提交造成冲突
 concurrency:
@@ -20,6 +21,8 @@ concurrency:
 jobs:
   snapshot:
     runs-on: ubuntu-latest
+    # 卡死的任务会占住 concurrency 组，默认最长 6 小时，足以让第二天的数据断档
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
 
@@ -45,3 +48,34 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           python stats/fetch_traffic.py
+
+      # 恢复后自动关掉遗留告警，避免 issue 一直挂着没人管
+      - name: 恢复后关闭告警
+        if: success()
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          issue=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open \
+            --search '"流量快照任务失败" in:title' --json number --jq '.[0].number // empty')
+          if [ -n "$issue" ]; then
+            gh issue close "$issue" --repo "$GITHUB_REPOSITORY" \
+              --comment "本次流量快照运行成功，自动关闭。"
+          fi
+
+      # PAT 过期或接口变更时，失败必须能被人看到，否则 14 天窗口一过数据就永久丢了
+      - name: 失败告警
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          title="流量快照任务失败"
+          run_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          body=$(printf '流量快照任务失败。\n\n运行记录：%s\n\n常见原因：\n- TRAFFIC_TOKEN 过期或被撤销\n- GitHub API 限流\n- 流量接口临时不可用\n\n处理后可到运行记录页点 Re-run。' "$run_url")
+          issue=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open \
+            --search "\"$title\" in:title" --json number --jq '.[0].number // empty')
+          if [ -n "$issue" ]; then
+            gh issue comment "$issue" --repo "$GITHUB_REPOSITORY" --body "$body"
+          else
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --body "$body"
+          fi
