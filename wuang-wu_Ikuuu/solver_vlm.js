@@ -19,11 +19,17 @@
  *   IKUUU_VLM_TIMEOUT   单次请求超时秒数，默认 120
  *   IKUUU_VLM_VOTES     投票次数，默认 2（1 = 不投票）
  *   IKUUU_VLM_ZOOM      合成图放大倍数，默认 3
- *   IKUUU_VLM_MAX_TOKENS 单次回复上限，默认 8000
+ *   IKUUU_VLM_MAX_TOKENS 单次回复上限，默认 50000
  *   IKUUU_VLM_DEBUG     1 = 把合成图与模型原始回复写到本目录 _vlm_debug/
+ *   IKUUU_CHROMIUM_PATH 可选，Chromium 可执行文件路径；留空时自动探测持久目录
+ *                       与 Playwright 默认缓存（见 chromium_path.js）
  */
 const fs = require('fs');
 const path = require('path');
+const { resolveChromiumPath } = require(path.join(__dirname, 'chromium_path'));
+
+// 合成图渲染用的浏览器：与 ikuuu.js 共用同一套解析逻辑（不绑定 Playwright revision）
+const CHROMIUM_PATH = resolveChromiumPath();
 
 const BASE_URL = (process.env.IKUUU_VLM_BASE_URL || '').trim().replace(/\/+$/, '');
 const API_KEY = (process.env.IKUUU_VLM_API_KEY || '').trim();
@@ -33,9 +39,9 @@ const MODELS = (process.env.IKUUU_VLM_MODEL || '')
   .split(',')
   .map((s) => s.trim())
   .filter(Boolean);
-const TIMEOUT_MS = Math.max(10, Number(process.env.IKUUU_VLM_TIMEOUT || 120)) * 1000;
-const VOTES = Math.max(1, Number(process.env.IKUUU_VLM_VOTES || 2));
-const ZOOM = Math.min(6, Math.max(1, Number(process.env.IKUUU_VLM_ZOOM || 3)));
+const TIMEOUT_MS = safeNum(process.env.IKUUU_VLM_TIMEOUT, 120, 10) * 1000;
+const VOTES = safeNum(process.env.IKUUU_VLM_VOTES, 2, 1);
+const ZOOM = Math.min(6, safeNum(process.env.IKUUU_VLM_ZOOM, 3, 1));
 const DEBUG = process.env.IKUUU_VLM_DEBUG === '1';
 // 网关报错里出现这些字样时，说明是"模型/渠道级"问题：重试无用，直接换下一个模型。
 // 不同网关措辞不同，可用环境变量覆盖（逗号分隔）或置空关闭该判定。
@@ -50,6 +56,35 @@ const MODEL_ERROR_HINT = (process.env.IKUUU_VLM_MODEL_ERROR_HINT === undefined
 const log = (...a) => console.error('[solver-vlm]', ...a);
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// 数值环境变量安全解析：非法值（非数字/空）回落默认值。
+// Number('abc')→NaN 会让超时/票数变 NaN（AbortSignal.timeout(NaN) 直接抛、投票循环零次），
+// 配置错误被静默吞掉（与 ikuuu.js 同名同语义）
+function safeNum(raw, fallback, min = 0) {
+  const s = raw === undefined || raw === null ? '' : String(raw).trim();
+  if (!s) return fallback;
+  const n = Number(s);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.max(min, n);
+}
+
+// 调试产物轮转：目录里只保留最近 keep 个文件（解法器独立运行，不引用 ikuuu.js，此处保留副本）
+function rotateDebugDir(dir, keep = 50) {
+  try {
+    const files = fs.readdirSync(dir)
+      .map((name) => {
+        const full = path.join(dir, name);
+        let st;
+        try { st = fs.statSync(full); } catch (e) { return null; }
+        return st.isFile() ? { full, mtime: st.mtimeMs } : null;
+      })
+      .filter(Boolean)
+      .sort((a, b) => b.mtime - a.mtime);
+    for (const f of files.slice(Math.max(0, keep))) {
+      try { fs.unlinkSync(f.full); } catch (e) { /* 并发写时被删走属正常 */ }
+    }
+  } catch (e) { /* 目录不存在属正常 */ }
+}
 
 // 从模型回复里抠出 JSON（可能带 ```json 围栏或前后解释）
 function extractJson(text) {
@@ -138,6 +173,7 @@ async function composeImage({ type, imagePath, tplPaths, imageSize }) {
 
   const browser = await chromium.launch({
     headless: true,
+    ...(CHROMIUM_PATH ? { executablePath: CHROMIUM_PATH } : {}),
     args: ['--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu'],
   });
   try {
@@ -206,7 +242,7 @@ function parseModelReply(data) {
 // tokenFactor：token 上限倍数（思考被截断时上层会按双倍重试一次）
 // hardPrompt：附加在提示词末尾的强制指令（截断重试时用）
 async function callModelOnce(model, imageBuffer, prompt, attempt = 1, tokenFactor = 1, hardPrompt = '') {
-  const baseTokens = Math.max(1000, Number(process.env.IKUUU_VLM_MAX_TOKENS || 50000));
+  const baseTokens = safeNum(process.env.IKUUU_VLM_MAX_TOKENS, 50000, 1000);
   const body = {
     model,
     temperature: 0,
@@ -269,6 +305,7 @@ async function callModelOnce(model, imageBuffer, prompt, attempt = 1, tokenFacto
           `model=${model}\nmax_tokens=${body.max_tokens}\nfinish_reason=${finish}\n`
           + `verdict=${verdict.ok ? 'ok' : 'fail'}${verdict.salvaged ? '(从思考里捞回)' : ''}\n`
           + `content:\n${msg.content || ''}\n\nreasoning:\n${reasoning.substring(0, 4000)}`, 'utf8');
+        rotateDebugDir(dir);
       }
       if (verdict.ok) {
         if (verdict.salvaged) log(`模型 ${model} 正文为空（finish_reason=${finish}），已从思考内容里取回答案`);
@@ -392,13 +429,13 @@ async function runCheck() {
   try {
     const { chromium } = require('playwright');
     ok('playwright 可加载');
-    const exe = chromium.executablePath();
+    const exe = CHROMIUM_PATH || chromium.executablePath();
     if (exe && fs.existsSync(exe)) {
-      ok(`chromium 已安装：${exe}`);
+      ok(`chromium 可用：${exe}${CHROMIUM_PATH ? '' : '（Playwright 默认路径）'}`);
     } else {
       pass = false;
       bad(`chromium 未安装（期望路径：${exe || '未知'}）`);
-      hint('在脚本目录执行：npx playwright install chromium（或设 IKUUU_CHROMIUM_PATH 指向系统 chromium）');
+      hint('设 IKUUU_CHROMIUM_PATH 指向 chrome 可执行文件，或把浏览器放到持久目录 /ql/data/.cache/ms-playwright');
     }
   } catch (e) {
     pass = false;
@@ -498,6 +535,7 @@ async function main() {
         const dir = path.join(__dirname, '_vlm_debug');
         fs.mkdirSync(dir, { recursive: true });
         fs.writeFileSync(path.join(dir, `${Date.now()}_${req.type || 'unknown'}.png`), composed);
+        rotateDebugDir(dir);
       }
       const prompt = buildPrompt(req.type, Math.max(1, tplPaths.length), size, req.promptText);
       const results = [];
@@ -536,4 +574,7 @@ module.exports = {
   wantedCount,
   buildPrompt,
   computeMaxTokens,
+  // 投票与坐标过滤：决定"要不要把坐标交给服务端"的两道闸门
+  vote,
+  pickClicks,
 };

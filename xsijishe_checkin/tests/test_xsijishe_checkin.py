@@ -22,13 +22,26 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 try:
     import xsijishe_checkin as msc
 except SystemExit:
-    # 依赖缺失时打桩后重新加载（青龙外最小环境兜底）
+    # 依赖缺失时打桩后重新加载（青龙外最小环境兜底）。
+    # 属性只允许赋到本次新建的 stub 上：sys.modules 里已存在的真实模块
+    # （哪怕缺的是另一个依赖）一旦被改属性，会污染同进程后续所有测试模块，
+    # 全量跑时其他脚本的 requests.Session() 会拿到 object() 直接崩。
+    stubs = {}
     for name in ("requests", "bs4"):
         if name not in sys.modules:
-            sys.modules[name] = types.ModuleType(name)
-    sys.modules["requests"].Session = object
-    sys.modules["bs4"].BeautifulSoup = object
+            stubs[name] = types.ModuleType(name)
+            sys.modules[name] = stubs[name]
+    if "requests" in stubs:
+        stubs["requests"].Session = object
+    if "bs4" in stubs:
+        stubs["bs4"].BeautifulSoup = object
     import xsijishe_checkin as msc
+
+try:
+    import requests  # noqa: E402  真实库存在时才跑 SSL 降级用例
+    _HAS_REQUESTS = True
+except ImportError:
+    _HAS_REQUESTS = False
 
 
 @contextlib.contextmanager
@@ -387,6 +400,40 @@ class TestCookieCache(unittest.TestCase):
 
     def test_read_missing_file_returns_empty(self):
         self.assertEqual(msc.read_cookie_cache(), {})
+
+
+class TestNewSession(unittest.TestCase):
+    """会话构建：trust_env 关闭 + TLS 默认校验 + SSL 握手失败一次性降级。"""
+
+    def test_defaults(self):
+        s = msc._new_session("")
+        self.assertFalse(s.trust_env)
+        self.assertTrue(s.verify)
+
+    def test_proxy_applied(self):
+        s = msc._new_session("http://127.0.0.1:7890")
+        self.assertEqual(s.proxies["https"], "http://127.0.0.1:7890")
+
+    @unittest.skipUnless(_HAS_REQUESTS, "需要真实 requests 库")
+    def test_ssl_error_downgrades_once_and_retries(self):
+        fake_resp = mock.MagicMock(status_code=200)
+        ssl_err = requests.exceptions.SSLError("handshake failed")
+        with mock.patch.object(requests.Session, "request",
+                               side_effect=[ssl_err, fake_resp]) as m:
+            s = msc._new_session("")
+            resp = s.get("https://example.com/")
+        self.assertIs(resp, fake_resp)
+        self.assertFalse(s.verify)
+        self.assertEqual(m.call_count, 2)
+
+    @unittest.skipUnless(_HAS_REQUESTS, "需要真实 requests 库")
+    def test_persistent_ssl_error_still_raises(self):
+        ssl_err = requests.exceptions.SSLError("handshake failed")
+        with mock.patch.object(requests.Session, "request", side_effect=ssl_err):
+            s = msc._new_session("")
+            with self.assertRaises(requests.exceptions.SSLError):
+                s.get("https://example.com/")
+        self.assertFalse(s.verify)
 
 
 if __name__ == "__main__":

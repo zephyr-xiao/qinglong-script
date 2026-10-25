@@ -154,9 +154,12 @@ def _is_already_signed(msg: str) -> bool:
 # ============================ 执行层 ============================
 
 def _build_session(timeout: int):
-    """构造带默认 UA / 代理 / 超时的 session。"""
+    """构造带默认 UA / 代理 / 超时的 session。
+    trust_env 关闭：requests 不再读系统环境/注册表代理，代理只认 SOPHNET_PROXY
+    与青龙全局代理变量的显式解析链；TLS 默认校验证书。"""
     session = requests.Session()
-    session.verify = False
+    session.trust_env = False
+    session.verify = True
     session.headers.update({"User-Agent": DEFAULT_UA})
     proxy = (os.getenv("SOPHNET_PROXY") or "").strip()
     if proxy:
@@ -166,12 +169,26 @@ def _build_session(timeout: int):
 
 
 def _wrap_request(session, timeout):
-    """包装 session.request 注入默认 timeout，避免每个请求都写 timeout=。"""
+    """包装 session.request 注入默认 timeout；TLS 证书校验失败时降级重试一次。"""
     _orig = session.request
+    state = {"downgraded": False}
 
     def _request(method, url, **kwargs):
         kwargs.setdefault("timeout", timeout)
-        return _orig(method, url, **kwargs)
+        try:
+            return _orig(method, url, **kwargs)
+        except requests.exceptions.SSLError:
+            # 站点边缘节点证书异常的兜底：降级为不校验并告警，仅降一次
+            if not state["downgraded"]:
+                state["downgraded"] = True
+                session.verify = False
+                print("⚠️ TLS 证书校验失败，已自动降级为不校验继续（如非预期请核查站点证书/代理）")
+                try:
+                    import urllib3
+                    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+                except Exception:
+                    pass
+            return _orig(method, url, **kwargs)
 
     return _request
 

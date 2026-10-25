@@ -917,6 +917,39 @@ def _result(success: bool, reason: str, message: str, label: str, host: str) -> 
             "label": label, "host": host}
 
 
+def _new_session(proxy: str = "") -> requests.Session:
+    """构建会话：TLS 默认校验证书 + trust_env 关闭。
+
+    trust_env 关闭后 requests 不再静默读系统环境/注册表代理（Windows 上会击穿
+    XSJISHE_PROXY > 青龙全局代理 > 直连的优先级链）；仅当确系 SSL 握手失败时
+    降级为不校验并告警一次（站点边缘证书异常的兜底）。"""
+    session = requests.Session()
+    session.trust_env = False
+    session.verify = True
+    if proxy:
+        session.proxies.update({"http": proxy, "https": proxy})
+    _orig_request = session.request
+    state = {"downgraded": False}
+
+    def _request(method, url, **kwargs):
+        try:
+            return _orig_request(method, url, **kwargs)
+        except requests.exceptions.SSLError:
+            if not state["downgraded"]:
+                state["downgraded"] = True
+                session.verify = False
+                print("   ⚠️ TLS 证书校验失败，已自动降级为不校验继续"
+                      "（如非预期请核查站点证书/代理）")
+                try:
+                    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+                except Exception:
+                    pass
+            return _orig_request(method, url, **kwargs)
+
+    session.request = _request
+    return session
+
+
 def _try_signin_with_host(
     account: dict,
     host: str,
@@ -929,10 +962,7 @@ def _try_signin_with_host(
     """
     label = account["label"]
 
-    session = requests.Session()
-    session.verify = False
-    if proxy:
-        session.proxies.update({"http": proxy, "https": proxy})
+    session = _new_session(proxy)
 
     # ---- 方式 A：Cookie 模式 ----
     if account["type"] == "cookie":

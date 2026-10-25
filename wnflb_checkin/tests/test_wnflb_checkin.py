@@ -685,5 +685,171 @@ class TestCollectTasks(unittest.TestCase):
             self.assertEqual(w.collect_tasks(), [])
 
 
+# 已登录但今日未签到、且带着昨天的旧进度数字:用于验证 stats 不再回退旧页
+PAGE_NOT_SIGNED_WITH_STALE_STATS = (
+    '<div class="flp-bignum">3 <span>/ 30 天</span></div>'
+    '<div class="flp-sub">已连续签到 3 天，距离转正还差 <b>27</b> 天</div>'
+    '<input type="hidden" name="formhash" value="1e187fe5">'
+    '<button class="flp-btn flp-btn-primary">立即签到</button>'
+)
+
+
+class TestStatsFallbackFromDoneDays(unittest.TestCase):
+    """结果页拉不到时,进度只从 302 的 d= 拼,不回退到签到前页面的旧数字。"""
+
+    def _run(self, responses, page_html):
+        with mock.patch.object(w, "http_request", side_effect=responses) as m:
+            result = w.do_checkin(mock.MagicMock(), "www.wnflb2023.com", page_html)
+        return result, m
+
+    @unittest.skipUnless(HAS_REQUESTS, "需要真实 requests 模块")
+    def test_result_page_failed_uses_done_days(self):
+        net_err = w.requests.exceptions.ConnectionError("read failed")
+        result, _ = self._run(
+            [FakeResp(302, headers={"Location": LOC_DONE_SUCCESS.replace("d=4", "d=7")}),
+             net_err],
+            PAGE_NOT_SIGNED_WITH_STALE_STATS)
+        self.assertTrue(result["success"])
+        self.assertIn("已连续 7 天", result["message"])
+        self.assertEqual(result["stats"], "连续 7 天")
+
+    @unittest.skipUnless(HAS_REQUESTS, "需要真实 requests 模块")
+    def test_result_page_ok_prefers_page_stats(self):
+        result, _ = self._run(
+            [FakeResp(302, headers={"Location": LOC_DONE_SUCCESS.replace("d=4", "d=7")}),
+             FakeResp(200, text=PAGE_RESULT_SUCCESS)],
+            PAGE_NOT_SIGNED_WITH_STALE_STATS)
+        self.assertTrue(result["success"])
+        # 结果页正常时应展示结果页的最新进度,而不是 d= 的简版
+        self.assertEqual(result["stats"], "连续 4 天  │  进度 4/30  │  还差 26 天转正")
+
+
+class TestRelativeLocationFollow(unittest.TestCase):
+    """302 的 Location 是相对路径时必须 urljoin,否则 requests 抛 MissingSchema。"""
+
+    def test_relative_location_is_joined(self):
+        post_url = "https://www.wnflb2023.com/plugin.php?id=fuliba_prereg:checkin&ac=do"
+        with mock.patch.object(w, "http_request", side_effect=[
+                FakeResp(302, url=post_url,
+                         headers={"Location": "plugin.php?id=fuliba_prereg:checkin&done=1&d=5"}),
+                FakeResp(200, text=PAGE_RESULT_SUCCESS)]) as m:
+            result = w.do_checkin(mock.MagicMock(), "www.wnflb2023.com", PAGE_NOT_SIGNED)
+        self.assertTrue(result["success"])
+        self.assertEqual(m.call_args_list[1].args[2],
+                         "https://www.wnflb2023.com/plugin.php?id=fuliba_prereg:checkin&done=1&d=5")
+
+    def test_missing_location_is_conservative_failure(self):
+        """302 却没有 Location:拿不到结果码,按失败保守处理(结果页进度仍会带上)。"""
+        plugin_url = "https://www.wnflb2023.com/plugin.php?id=fuliba_prereg:checkin"
+        with mock.patch.object(w, "http_request", side_effect=[
+                FakeResp(302, url=plugin_url + "&ac=do", headers={}),
+                FakeResp(200, text=PAGE_RESULT_ALREADY)]) as m:
+            result = w.do_checkin(mock.MagicMock(), "www.wnflb2023.com", PAGE_NOT_SIGNED)
+        self.assertFalse(result["success"])
+        self.assertEqual(m.call_args_list[1].args[2], plugin_url)
+        # 提示文案优先取结果页 toast
+        self.assertIn("今日已签到", result["message"])
+
+
+@unittest.skipUnless(HAS_REQUESTS, "需要真实 requests 模块")
+class TestHttpRequestRetryPolicy(unittest.TestCase):
+    """只有网络类异常重试;确定性错误立即抛;SSLError 触发证书降级。"""
+
+    def _session(self):
+        session = mock.MagicMock()
+        session.verify = True
+        return session
+
+    def test_plain_valueerror_raises_immediately(self):
+        session = self._session()
+        session.request.side_effect = ValueError("bad url")
+        with self.assertRaises(ValueError):
+            w.http_request(session, "GET", "https://h/")
+        self.assertEqual(session.request.call_count, 1)
+
+    def test_too_many_redirects_not_retried(self):
+        session = self._session()
+        session.request.side_effect = w.requests.exceptions.TooManyRedirects("loop")
+        with self.assertRaises(w.requests.exceptions.TooManyRedirects):
+            w.http_request(session, "GET", "https://h/")
+        self.assertEqual(session.request.call_count, 1)
+
+    def test_connection_error_retried_three_times(self):
+        session = self._session()
+        session.request.side_effect = w.requests.exceptions.ConnectionError("down")
+        with mock.patch.object(w.time, "sleep"):
+            with self.assertRaises(w.requests.exceptions.ConnectionError):
+                w.http_request(session, "GET", "https://h/")
+        self.assertEqual(session.request.call_count, 3)
+
+    def test_timeout_retried_three_times(self):
+        session = self._session()
+        session.request.side_effect = w.requests.exceptions.Timeout("slow")
+        with mock.patch.object(w.time, "sleep"):
+            with self.assertRaises(w.requests.exceptions.Timeout):
+                w.http_request(session, "GET", "https://h/")
+        self.assertEqual(session.request.call_count, 3)
+
+    def test_ssl_error_downgrades_verify_then_succeeds(self):
+        session = self._session()
+        ok = FakeResp(200, text="ok")
+        session.request.side_effect = [w.requests.exceptions.SSLError("cert fail"), ok]
+        with mock.patch.object(w.time, "sleep"):
+            resp = w.http_request(session, "GET", "https://h/")
+        self.assertIs(resp, ok)
+        self.assertFalse(session.verify)
+        self.assertEqual(session.request.call_count, 2)
+
+    def test_ssl_error_while_already_insecure_just_retries(self):
+        session = self._session()
+        session.verify = False  # 已是不校验状态,不应重复降级提示
+        session.request.side_effect = w.requests.exceptions.SSLError("cert fail")
+        with mock.patch.object(w.time, "sleep"):
+            with self.assertRaises(w.requests.exceptions.SSLError):
+                w.http_request(session, "GET", "https://h/")
+        self.assertEqual(session.request.call_count, 3)
+
+
+@unittest.skipUnless(HAS_REQUESTS, "需要真实 requests 模块")
+class TestSessionDefaults(unittest.TestCase):
+    """新会话默认开 TLS 校验、关 trust_env(防 Windows 注册表系统代理静默劫持)。"""
+
+    def test_new_session_defaults(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            s = w.new_session("www.wnflb2023.com", "a=1; b=2")
+        self.assertTrue(s.verify)
+        self.assertFalse(s.trust_env)
+        self.assertEqual(s.cookies.get("a"), "1")
+
+
+class TestCookieCacheAtomicWrite(unittest.TestCase):
+    """缓存写入走 .part + os.replace:不留残片、坏文件可自愈。"""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self._orig = w.COOKIE_CACHE_FILE
+        w.COOKIE_CACHE_FILE = Path(self._tmp.name) / "wnflb_cookie.json"
+
+    def tearDown(self):
+        w.COOKIE_CACHE_FILE = self._orig
+        self._tmp.cleanup()
+
+    def test_write_roundtrip_and_no_part_left(self):
+        w.write_cookie_cache("alice", "S5r8_2132_auth=AAA")
+        self.assertEqual(w.read_cookie_cache()["alice"]["cookies"], "S5r8_2132_auth=AAA")
+        self.assertFalse(w.COOKIE_CACHE_FILE.with_name(w.COOKIE_CACHE_FILE.name + ".part").exists())
+
+    def test_corrupted_existing_file_recovers_on_write(self):
+        w.COOKIE_CACHE_FILE.write_text("{not json", encoding="utf-8")
+        w.write_cookie_cache("alice", "auth=NEW")
+        self.assertEqual(w.read_cookie_cache()["alice"]["cookies"], "auth=NEW")
+
+    @unittest.skipUnless(os.name == "posix", "仅 POSIX 有 0600 语义")
+    def test_cache_file_restricted_on_posix(self):
+        w.write_cookie_cache("alice", "auth=A")
+        mode = os.stat(w.COOKIE_CACHE_FILE).st_mode & 0o777
+        self.assertEqual(mode, 0o600)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

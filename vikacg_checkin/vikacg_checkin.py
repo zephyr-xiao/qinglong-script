@@ -6,12 +6,15 @@ cron: 23 8 * * *
 维咔VikACG（www.vikacg.cc，V站）每日钱包签到领积分，纯 API 免验证码。
 流程：账密登录换 JWT 双 token（30 天）→ 每日签到（userMission）→ 青龙 notify.py 推送。
 登录态（token + 设备指纹）按账号本地缓存复用：缓存有效直接签到；401 先用 refreshToken
-静默续期、失败才重新账密登录（缓存只存凭证不存密码）。设备指纹（X-Device-Code）与 token
-绑定且随缓存持久化，避免每次运行换设备触发风控。
+静默续期、失败才重新账密登录（缓存只存凭证不存密码，原子写 + 0600 收口）。设备指纹
+（X-Device-Code）与 token 绑定且随缓存持久化，避免每次运行换设备触发风控。
+连接类网络异常（超时/被掐/代理失败）自动重试 2 次并分类报错；业务 4xx/5xx 不重试。
 
 接口探测结论（2026-10-07，源自前端 Nuxt bundle 逆向 + 真机验证）：
   POST /api/vikacg/v1/login          {"account","password","platform":"web"} → data.token/refreshToken
   POST /api/vikacg/v1/userMission    {} + Bearer → 200 签到成功 / 409「用户今天已签到」（幂等）
+                                     幂等判定为双门槛：HTTP 409 且命中已签关键词才算已签，
+                                     避免未来成功文案含「已签」时被误判（关键词只做辅助证据）
   POST /api/vikacg/v1/refreshToken   {"refreshToken":...} → 换发新双 token
   服务端校验浏览器特征头（Sec-Fetch-* 等），缺失报「非法的客户端，请下载官方版本」——
   因此请求头必须完整模拟浏览器（含 Sec-Fetch-Site/Mode/Dest、Sec-Ch-Ua*、X-Client-Name 等）。
@@ -194,6 +197,53 @@ def jwt_exp(token: str) -> int:
 
 # ============ 请求层 ============
 
+class NetworkError(RuntimeError):
+    """网络请求重试耗尽后的失败，message 已含分类与排查指引。"""
+
+
+NETWORK_RETRY_DELAYS = (3, 6)  # 连接类异常重试间隔（秒）；拿到 HTTP 响应（含 4xx/5xx）不重试
+
+
+def describe_network_error(e: Exception) -> str:
+    """把 requests 异常翻译成可排查的人话。判断顺序必须从特殊到一般：
+    ConnectTimeout/ProxyError/SSLError 都是 ConnectionError 的子类，反着判会被吞。"""
+    if isinstance(e, requests.exceptions.ConnectTimeout):
+        return "连接超时"
+    if isinstance(e, requests.exceptions.ReadTimeout):
+        return "响应超时"
+    if isinstance(e, requests.exceptions.ProxyError):
+        return "代理连接失败（检查 VIKACG_PROXY 是否可用）"
+    if isinstance(e, requests.exceptions.SSLError):
+        return "TLS 握手失败（直连被掐断或代理异常）"
+    if isinstance(e, requests.exceptions.ConnectionError):
+        return "连接失败（站点在 Cloudflare 后，大陆直连常被掐断，请配置 VIKACG_PROXY）"
+    return str(e) or type(e).__name__
+
+
+def clean_error_text(text: str, limit: int = 200) -> str:
+    """非 JSON 响应的错误文本清洗：去标签、压空白、截断，避免拦截页 HTML 原文进推送。"""
+    if not text:
+        return ""
+    no_tags = re.sub(r"<[^>]+>", " ", text)
+    collapsed = re.sub(r"\s+", " ", no_tags).strip()
+    if len(collapsed) > limit:
+        collapsed = collapsed[:limit] + "…"
+    return collapsed
+
+
+def looks_like_intercept_page(text: str) -> bool:
+    """检测 Cloudflare 挑战页 / 网关错误页特征，命中时给用户明确提示而非一坨 HTML。"""
+    if not text:
+        return False
+    head = text[:2000].lower()
+    markers = (
+        "just a moment", "cloudflare", "cf-browser-verification", "cf_chl",
+        "attention required", "checking your browser",
+        "bad gateway", "gateway timeout", "service temporarily unavailable",
+    )
+    return any(m in head for m in markers)
+
+
 # 服务端校验浏览器特征头（Sec-Fetch-* 等），缺失报「非法的客户端」，
 # 因此必须完整模拟 Chrome 浏览器请求；X-Client-Name/Architecture 来自前端 bundle 硬编码。
 BASE_HEADERS = {
@@ -223,17 +273,36 @@ def build_headers(device_code: str, client_code: str, token: str = "") -> dict:
 
 def api_post(session: "requests.Session", path: str, payload: dict, device_code: str,
              client_code: str, token: str = "", timeout: int = 30) -> dict:
-    """POST JSON 并返回 {http_code, json}。网络异常上抛由调用方处理。"""
-    resp = session.post(
-        API_BASE + path,
-        json=payload,
-        headers=build_headers(device_code, client_code, token),
-        timeout=timeout,
-    )
+    """POST JSON 并返回 {http_code, json}。
+
+    连接类网络异常按 NETWORK_RETRY_DELAYS 重试，耗尽后抛 NetworkError；
+    拿到 HTTP 响应（含 4xx/5xx）不算网络异常，交由调用方按业务语义处理。
+    """
+    last_error = None
+    for attempt in range(1 + len(NETWORK_RETRY_DELAYS)):
+        try:
+            resp = session.post(
+                API_BASE + path,
+                json=payload,
+                headers=build_headers(device_code, client_code, token),
+                timeout=timeout,
+            )
+            break
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+            last_error = e
+            if attempt < len(NETWORK_RETRY_DELAYS):
+                delay = NETWORK_RETRY_DELAYS[attempt]
+                print(f"           ⚠️ 网络异常（{describe_network_error(e)}），"
+                      f"{delay}s 后重试（{attempt + 1}/{len(NETWORK_RETRY_DELAYS)}）")
+                time.sleep(delay)
+    else:
+        raise NetworkError(f"网络请求失败：{describe_network_error(last_error)}")
     try:
         data = resp.json()
     except Exception:
-        data = {"status": "fail", "message": resp.text[:200]}
+        raw = resp.text or ""
+        hint = "疑似 CF/网关拦截页" if looks_like_intercept_page(raw) else "非 JSON 响应"
+        data = {"status": "fail", "message": f"[{hint}] {clean_error_text(raw)}"}
     return {"http_code": resp.status_code, "json": data if isinstance(data, dict) else {}}
 
 
@@ -250,7 +319,11 @@ def read_token_cache() -> dict:
 
 
 def write_token_cache(account: str, entry: dict):
-    """写入/更新指定账号的凭证缓存。entry 需含 token/refreshToken/deviceCode/clientCode。"""
+    """写入/更新指定账号的凭证缓存。entry 需含 token/refreshToken/deviceCode/clientCode。
+
+    原子写：先落 .tmp 再 os.replace，写一半崩溃不会留下一份损坏缓存；
+    权限收紧到 0600（token 是 30 天有效凭证）。
+    """
     data = {"accounts": {}}
     if TOKEN_CACHE_FILE.exists():
         try:
@@ -260,14 +333,25 @@ def write_token_cache(account: str, entry: dict):
     accounts = data.setdefault("accounts", {})
     entry["update_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     accounts[account] = entry
-    TOKEN_CACHE_FILE.write_text(
+    tmp_file = TOKEN_CACHE_FILE.with_suffix(".json.tmp")
+    tmp_file.write_text(
         json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    try:
+        os.chmod(tmp_file, 0o600)
+    except Exception:
+        pass  # Windows 上 chmod 语义不同，青龙（Linux）下才真正生效
+    os.replace(tmp_file, TOKEN_CACHE_FILE)
 
 
 def cached_token_usable(entry: dict) -> bool:
-    """缓存 token 是否可直接复用：优先 JWT exp（留 12h 余量），解不出按 14 天 TTL 兜底。"""
+    """缓存 token 是否可直接复用：设备指纹必须完整，优先 JWT exp（留 12h 余量），
+    解不出按 14 天 TTL 兜底。"""
     token = entry.get("token") or ""
     if not token:
+        return False
+    # 缺设备指纹的缓存带空 X-Device-Code 请求必吃 403「非法的客户端」，
+    # 直接判无效，走续期/重登链补齐
+    if not entry.get("deviceCode") or not entry.get("clientCode"):
         return False
     exp = jwt_exp(token)
     if exp > 0:
@@ -288,11 +372,14 @@ def new_device_identity() -> tuple:
 
 
 def do_login(session, account: str, password: str, timeout: int) -> dict:
-    """账密登录。成功返回缓存 entry，失败返回 {"error": ...}。"""
+    """账密登录。成功返回缓存 entry，失败返回 {"error": ...}（含网络重试耗尽）。"""
     device_code, client_code = new_device_identity()
-    r = api_post(session, "/login",
-                 {"account": account, "password": password, "platform": "web"},
-                 device_code, client_code, timeout=timeout)
+    try:
+        r = api_post(session, "/login",
+                     {"account": account, "password": password, "platform": "web"},
+                     device_code, client_code, timeout=timeout)
+    except NetworkError as e:
+        return {"error": str(e)}  # e 的 message 已含「网络请求失败：」前缀，别再叠加
     data = r["json"]
     if r["http_code"] == 200 and data.get("status") == "success" and (data.get("data") or {}).get("token"):
         d = data["data"]
@@ -308,15 +395,21 @@ def do_login(session, account: str, password: str, timeout: int) -> dict:
 
 
 def do_refresh(session, entry: dict, timeout: int) -> dict:
-    """用 refreshToken 静默续期。成功返回更新后的 entry，失败返回 None。"""
+    """用 refreshToken 静默续期。成功返回更新后的 entry，业务失败返回 None。
+
+    网络重试耗尽的 NetworkError 上抛：同一 session 同一站点，网络不可达时
+    重登也必然失败，让调用方快速失败而不是再白跑一轮登录重试。
+    """
     refresh_token = entry.get("refreshToken") or ""
     device_code = entry.get("deviceCode") or ""
     client_code = entry.get("clientCode") or ""
-    if not refresh_token or not device_code:
-        return None
+    if not refresh_token or not device_code or not client_code:
+        return None  # 指纹任一缺失都会带空头吃 403，直接短路走重登
     try:
         r = api_post(session, "/refreshToken", {"refreshToken": refresh_token},
                      device_code, client_code, timeout=timeout)
+    except NetworkError:
+        raise
     except Exception:
         return None
     data = r["json"]
@@ -335,9 +428,13 @@ def ensure_token(session, account: str, password: str, timeout: int) -> dict:
     if cached_token_usable(entry):
         return {**entry, "from": "cache"}
 
-    # 缓存过期 → 先尝试 refreshToken 静默续期（不触碰登录流程，对风控友好）
+    # 缓存过期 → 先尝试 refreshToken 静默续期（不触碰登录流程，对风控友好）；
+    # 网络不可达时直接快速失败，不再走重登白跑一轮重试
     if entry.get("refreshToken"):
-        refreshed = do_refresh(session, entry, timeout)
+        try:
+            refreshed = do_refresh(session, entry, timeout)
+        except NetworkError as e:
+            return {"error": str(e)}
         if refreshed:
             refreshed.pop("from", None)
             write_token_cache(account, refreshed)
@@ -354,7 +451,12 @@ def ensure_token(session, account: str, password: str, timeout: int) -> dict:
 # ============ 签到执行 ============
 
 def run_one_task(session, account: str, password: str, timeout: int, debug: bool) -> dict:
-    """单账号签到：取 token → userMission（401 续期/重登后仅重试一次）→ 解析结果。"""
+    """单账号签到：取 token → userMission（401 续期/重登后仅重试一次）→ 解析结果。
+
+    幂等判定为双门槛（HTTP 409 且命中关键词），关键词不做全局匹配：
+    实测站点契约为 409+「用户今天已签到」，全局关键词匹配会在未来成功文案
+    含「已签」字样时误判成已签、丢失余额等数据。
+    """
     auth = ensure_token(session, account, password, timeout)
     if auth.get("error"):
         return {"success": False, "error": auth["error"]}
@@ -366,14 +468,20 @@ def run_one_task(session, account: str, password: str, timeout: int, debug: bool
                         auth.get("deviceCode") or "", auth.get("clientCode") or "",
                         token=token, timeout=timeout)
 
-    result = do_mission(auth["token"])
+    try:
+        result = do_mission(auth["token"])
+    except NetworkError as e:
+        return {"success": False, "error": str(e)}
     data = result["json"]
 
     # token 失效 → 走续期/重登链路后重试一次（防 401 死循环，只重试一次）
     # 注意：403 不进降级链——它通常是「非法的客户端」这类头校验拒绝，重登必然同样失败
     if result["http_code"] == 401:
         print("           🔄 登录态失效，尝试续期/重新登录...")
-        refreshed = do_refresh(session, auth, timeout)
+        try:
+            refreshed = do_refresh(session, auth, timeout)
+        except NetworkError as e:
+            return {"success": False, "error": str(e)}
         if refreshed:
             refreshed.pop("from", None)
             write_token_cache(account, refreshed)
@@ -383,14 +491,17 @@ def run_one_task(session, account: str, password: str, timeout: int, debug: bool
             if auth.get("error"):
                 return {"success": False, "error": "续期失败且重登失败: " + auth["error"]}
             write_token_cache(account, auth)
-        result = do_mission(auth["token"])
+        try:
+            result = do_mission(auth["token"])
+        except NetworkError as e:
+            return {"success": False, "error": str(e)}
         data = result["json"]
 
     http_code = result["http_code"]
     message = data.get("message") or data.get("statusMessage") or ""
 
-    # 幂等判定优先于成败解析（服务端语义：HTTP 409 + 「用户今天已签到」）
-    if _is_already_signed_in(message):
+    # 幂等双门槛：HTTP 409 且命中已签关键词（见函数 docstring）
+    if http_code == 409 and _is_already_signed_in(message):
         return {"success": True, "message": f"今日已签到（{message}）"}
 
     if http_code == 200 and data.get("status") == "success":
@@ -408,7 +519,9 @@ def run_one_task(session, account: str, password: str, timeout: int, debug: bool
         nickname = auth.get("nickname") or ""
         summary = "，".join(parts) if parts else ""
         who = f"（{nickname}）" if nickname else ""
-        return {"success": True, "message": "签到成功" + who + ("：" + summary if summary else "")}
+        # 成功文案自带已签语义时（如「今日已签到，连续 3 天」）如实呈现，不冒充首次成功
+        verdict = "今日已签到" if _is_already_signed_in(message) else "签到成功"
+        return {"success": True, "message": verdict + who + ("：" + summary if summary else "")}
 
     if http_code == 401:
         return {"success": False, "error": "未登录或登录已过期 (HTTP 401)"}

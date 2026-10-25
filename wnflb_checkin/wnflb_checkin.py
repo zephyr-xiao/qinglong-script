@@ -19,6 +19,12 @@ Cookie 失效时推送告警,提醒重新抓取。
      formhash 失配时返回 200 提示页「请通过签到页上的按钮提交本操作」,重取页面重试一次
      Cookie 失效时返回 200 提示页「您尚未登录」
 
+传输与代理:
+  - 默认校验 TLS 证书(实测站点证书正常);遇证书错误自动降级为不校验并提示一次
+  - 代理只认 WNFLB_PROXY 与青龙全局代理 env;requests 的 trust_env 已关闭,
+    Windows 注册表系统代理不会被静默采用(实测系统代理会把该站路由到超时)
+  - 只对网络类异常重试;认证失败是业务结果,绝不自动重试
+
 认证方式(二选一,也可同时配置,各自独立跑):
   A. Cookie 模式    :WNFLB_COOKIE,浏览器抓的完整 Cookie,多账号换行分隔
   B. 账号密码模式   :WNFLB_ACCOUNTS,格式 用户名#密码,多账号换行分隔
@@ -57,6 +63,7 @@ import time
 import traceback
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import urljoin
 
 # UTF-8 强制重配(解决 Windows GBK / 部分容器 locale 问题)
 try:
@@ -219,10 +226,17 @@ def mask(s: str) -> str:
 
 
 def _is_network_error(e: Exception) -> bool:
-    """网络层错误需向上抛由外层重试,业务异常就地消化。"""
+    """
+    只有网络层错误值得重试;MissingSchema/TooManyRedirects 这类确定性错误
+    重试只是白等,应立即抛出。SSLError 继承 ConnectionError,天然覆盖。
+    """
+    if isinstance(e, (requests.exceptions.Timeout, requests.exceptions.ConnectionError,
+                      requests.exceptions.ChunkedEncodingError)):
+        return True
+    # 非 requests 封装的异常按消息关键字兜底(关键字统一按小写比对)
     msg = str(e).lower()
     keywords = ("timeout", "connection", "ssl", "proxy", "max retries", "eof")
-    return any(k in msg for k in keywords) or isinstance(e, requests.RequestException)
+    return any(k in msg for k in keywords)
 
 
 def rand_sleep(min_s: float, max_s: float):
@@ -231,7 +245,11 @@ def rand_sleep(min_s: float, max_s: float):
 
 
 def http_request(session: requests.Session, method: str, url: str, **kwargs) -> requests.Response:
-    """带重试的请求。站点有偶发 SSL EOF 抖动,必须重试兜底。"""
+    """
+    带重试的请求。站点有偶发 SSL EOF 抖动,必须重试兜底。
+    只对网络类异常重试;SSLError 首次出现时把会话降级为不校验证书再试
+    (站点边缘节点证书异常时的兜底,正常情况下永远走不到)。
+    """
     last_exc = None
     for attempt in range(1, MAX_RETRIES + 1):
         try:
@@ -240,6 +258,11 @@ def http_request(session: requests.Session, method: str, url: str, **kwargs) -> 
                 print(f"   🔍 {method} {url[:78]} → {resp.status_code} ({len(resp.content)}B)")
             return resp
         except Exception as e:
+            if not _is_network_error(e):
+                raise
+            if isinstance(e, requests.exceptions.SSLError) and session.verify:
+                session.verify = False
+                print("   ⚠️ TLS 证书校验失败,已自动降级为不校验继续(如非预期请核查站点证书)")
             last_exc = e
             if attempt < MAX_RETRIES:
                 delay = RETRY_BASE_DELAY * attempt
@@ -248,60 +271,60 @@ def http_request(session: requests.Session, method: str, url: str, **kwargs) -> 
     raise last_exc
 
 
-def html_to_text(html: str) -> str:
+def html_to_text(page: str) -> str:
     """粗略提取页面可见文本,用于提示文案与排错输出。"""
-    body = re.sub(r"<script.*?</script>|<style.*?</style>", "", html, flags=re.S)
+    body = re.sub(r"<script.*?</script>|<style.*?</style>", "", page, flags=re.S)
     return " ".join(re.sub(r"<[^>]+>", " ", body).split())
 
 
 # ============================ 页面解析 ============================
 
-def is_guest_page(html: str) -> bool:
+def is_guest_page(page: str) -> bool:
     """游客访问会渲染预注册表单(含确认密码字段),据此判定 Cookie 失效。"""
-    return any(marker in html for marker in GUEST_MARKERS)
+    return any(marker in page for marker in GUEST_MARKERS)
 
 
-def extract_formhash(html: str) -> str:
+def extract_formhash(page: str) -> str:
     """提取 formhash。Discuz 页面里是 <input type="hidden" name="formhash" value="xxx">。"""
     for pattern in (
         r'name="formhash"\s+value="([^"]+)"',
         r'value="([^"]+)"\s+name="formhash"',
         r'formhash=([a-z0-9]{6,})',
     ):
-        m = re.search(pattern, html, re.I)
+        m = re.search(pattern, page, re.I)
         if m:
             return m.group(1)
     return ""
 
 
-def extract_toast(html: str) -> str:
+def extract_toast(page: str) -> str:
     """提取插件结果提示 div.flp-toast 的文案。"""
-    m = re.search(r'class="flp-toast"[^>]*>(.*?)</div>', html, re.S)
+    m = re.search(r'class="flp-toast"[^>]*>(.*?)</div>', page, re.S)
     if m:
         return re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", m.group(1))).strip()
     return ""
 
 
-def extract_discuz_message(html: str) -> str:
+def extract_discuz_message(page: str) -> str:
     """提取 Discuz 通用提示页(id=messagetext)的文案。"""
-    m = re.search(r'id="messagetext"[^>]*>\s*<p>(.*?)</p>', html, re.S)
+    m = re.search(r'id="messagetext"[^>]*>\s*<p>(.*?)</p>', page, re.S)
     if not m:
-        m = re.search(r'<div class="alert_(?:error|info)"[^>]*>(.*?)</div>', html, re.S)
+        m = re.search(r'<div class="alert_(?:error|info)"[^>]*>(.*?)</div>', page, re.S)
     if m:
         return re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", m.group(1))).strip()
     return ""
 
 
-def parse_stats(html: str) -> str:
+def parse_stats(page: str) -> str:
     """解析签到进度:连续天数 / 进度条 / 距转正还差几天。"""
     parts = []
-    m = re.search(r"已连续签到\s*(\d+)\s*天", html)
+    m = re.search(r"已连续签到\s*(\d+)\s*天", page)
     if m:
         parts.append(f"连续 {m.group(1)} 天")
-    m = re.search(r'flp-bignum">\s*(\d+)\s*<span>/\s*(\d+)\s*天', html)
+    m = re.search(r'flp-bignum">\s*(\d+)\s*<span>/\s*(\d+)\s*天', page)
     if m:
         parts.append(f"进度 {m.group(1)}/{m.group(2)}")
-    m = re.search(r"距离转正还差\s*<b>(\d+)</b>\s*天", html)
+    m = re.search(r"距离转正还差\s*<b>(\d+)</b>\s*天", page)
     if m:
         parts.append(f"还差 {m.group(1)} 天转正")
     return "  │  ".join(parts)
@@ -312,7 +335,11 @@ def parse_stats(html: str) -> str:
 def new_session(host: str, cookie_str: str = "") -> requests.Session:
     """构建会话。cookie_str 为空时用于账号密码登录。"""
     session = requests.Session()
-    session.verify = False
+    # 代理只认脚本自己的解析链(WNFLB_PROXY > 青龙全局代理 env > 直连)。
+    # trust_env 必须关掉:Windows 上 requests 会静默采用注册表系统代理,
+    # 击穿这套优先级(实测本机系统代理把该站路由到超时,而直连正常)。
+    session.trust_env = False
+    session.verify = True
     session.headers.update({
         "User-Agent": DEFAULT_UA,
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -365,7 +392,12 @@ def read_cookie_cache() -> dict:
 
 
 def write_cookie_cache(username: str, cookie_str: str):
-    """写入指定用户的 Cookie 缓存(只存凭证,绝不存密码)。"""
+    """
+    写入指定用户的 Cookie 缓存(只存凭证,绝不存密码)。
+    走 .part 临时文件 + os.replace 原子替换:进程写一半崩溃不会留下损坏 JSON;
+    临时文件先收 0600 再替换,避免同容器其他用户读到登录态 Cookie
+    (Windows 上 chmod 语义不同,失败不影响功能)。
+    """
     data = {}
     if COOKIE_CACHE_FILE.exists():
         try:
@@ -377,11 +409,23 @@ def write_cookie_cache(username: str, cookie_str: str):
         "cookies": cookie_str,
         "update_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     }
+    tmp = COOKIE_CACHE_FILE.with_name(COOKIE_CACHE_FILE.name + ".part")
     try:
-        with open(COOKIE_CACHE_FILE, "w", encoding="utf-8") as f:
+        with open(tmp, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        try:
+            os.chmod(tmp, 0o600)
+        except OSError:
+            pass
+        os.replace(tmp, COOKIE_CACHE_FILE)
     except Exception as e:
         print(f"⚠️ Cookie 缓存写入失败(不影响签到): {e}")
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 # ============================ 账号密码登录 ============================
@@ -608,10 +652,12 @@ def do_checkin(session: requests.Session, host: str, page_html: str) -> dict:
             if DEBUG:
                 print(f"   🔍 302 Location: {location}")
 
-            # 跟随到结果页取提示文案与最新进度
+            # 跟随到结果页取提示文案与最新进度。
+            # Location 可能是相对路径,requests 不会自动按响应 URL 拼接,必须 urljoin。
             result_html = ""
+            follow_url = urljoin(resp.url, location) if location else plugin_url
             try:
-                followed = http_request(session, "GET", location or plugin_url,
+                followed = http_request(session, "GET", follow_url,
                                         allow_redirects=True)
                 result_html = followed.text
             except Exception as e:
@@ -619,7 +665,11 @@ def do_checkin(session: requests.Session, host: str, page_html: str) -> dict:
                     print(f"   🔍 结果页获取失败: {e}")
 
             toast = extract_toast(result_html)
-            stats = parse_stats(result_html) or parse_stats(page_html)
+            # 结果页拉不到时不回退到签到前页面的进度——那是昨天的连续天数,
+            # 签到成功后再展示会误导;改用 302 里 d= 携带的最新连续天数拼一条。
+            stats = parse_stats(result_html)
+            if not stats and days is not None:
+                stats = f"连续 {days} 天"
 
             if done == DONE_SUCCESS:
                 return {"success": True, "duplicate": False, "cookie_invalid": False,

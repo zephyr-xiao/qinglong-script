@@ -7,6 +7,7 @@ cron: 23 8 * * *
 登录强制图片验证码（Discuz seccode，idhash 固定为 cS），本地 ddddocr 自动识别；
 k_misign 签到需通过算术验证（"签到验证：A - B = ?"），脚本解析后自动计算二次请求；
 登录 Cookie JSON 缓存复用，失效自动重新登录。
+站点偶发 Cloudflare 522（回源超时）等瞬时错误页会自动退避重试，不会误判成改版或掉登录。
 
 环境变量：
   SXSY_ACCOUNTS          账号列表：用户名#密码，多账号用 & 或换行分隔；
@@ -96,6 +97,13 @@ LOGIN_MAX_TRIES = 3             # 验证码 OCR 识别重试上限（含首次�
 
 # 致命登录错误关键词：出现即停止重试（避免反复触发风控/封禁计数）
 _LOGIN_FATAL_KEYWORDS = ("密码错误", "密码不正确", "登录失败次数过多", "账户被", "帐号被", "被锁定", "被禁止")
+
+# 站点间歇性返回 Cloudflare 522（回源超时）等错误页，属于瞬时故障：
+# 必须退避重试，不能当成"Cookie 失效"或"站点改版"，否则会白白丢掉有效会话。
+_SITE_ERROR_STATUS = frozenset({408, 425, 429, 500, 502, 503, 504,
+                                520, 521, 522, 523, 524, 525, 526})
+HTTP_TRIES = 3                  # 单个 GET 请求最大尝试次数（含首次）
+HTTP_BACKOFF = (5, 15)          # 各次重试前等待秒数，末项复用
 
 
 # ---------------- 通用工具 ----------------
@@ -206,6 +214,54 @@ def build_session(proxy: str, timeout: int) -> requests.Session:
     return s
 
 
+# ---------------- HTTP 重试层 ----------------
+def page_title(html: str) -> str:
+    """提取页面标题（用于错误诊断，截断避免刷屏）。"""
+    m = re.search(r"<title>(.*?)</title>", html or "", re.S | re.I)
+    return m.group(1).strip()[:60] if m else ""
+
+
+def is_site_error(resp) -> bool:
+    """是否为 CDN/源站临时错误页。
+
+    Cloudflare 回源超时会返回 520~526（本站实测 522），状态码是首要判据；
+    个别 CDN 用 200 包装错误页，再按标题兜底识别。
+    """
+    if resp.status_code in _SITE_ERROR_STATUS:
+        return True
+    return bool(re.search(
+        r"\b5\d{2}:\s*(Connection timed out|Web server is down|Origin is unreachable)",
+        page_title(resp.text), re.I))
+
+
+def get_retry(session: requests.Session, url: str, headers: dict = None,
+              debug: bool = False, label: str = "请求",
+              tries: int = HTTP_TRIES) -> tuple:
+    """GET 带退避重试，返回 (响应, 错误描述)；成功时错误描述为空串。
+
+    网络异常与 CDN/源站 5xx（Cloudflare 522 等）都重试——这类故障通常持续几秒
+    到几十秒，一次成功请求就能继续流程，比直接判失败划算得多。
+    """
+    last_err = ""
+    for attempt in range(1, tries + 1):
+        try:
+            r = session.get(url, timeout=session._timeout, headers=headers)
+        except Exception as e:
+            last_err = f"{type(e).__name__}: {e}"
+        else:
+            if not is_site_error(r):
+                return r, ""
+            title = page_title(r.text)
+            last_err = f"HTTP {r.status_code}" + (f"「{title}」" if title else "")
+            if debug:
+                print(f"    [debug] {label} 第 {attempt}/{tries} 次返回错误页: {last_err}")
+        if attempt < tries:
+            delay = HTTP_BACKOFF[min(attempt - 1, len(HTTP_BACKOFF) - 1)]
+            print(f"    ⏳ {label} 暂时不可用（{last_err}），{delay}s 后重试（{attempt}/{tries}）")
+            time.sleep(delay)
+    return None, last_err
+
+
 # ---------------- Cookie 缓存（仅账密模式使用） ----------------
 def read_cookie_cache() -> dict:
     if COOKIE_CACHE.exists():
@@ -218,6 +274,9 @@ def read_cookie_cache() -> dict:
 
 
 def write_cookie_cache(username: str, cookie_str: str):
+    """写入指定用户的 Cookie 缓存（只存凭证，绝不存密码）。
+    两段写 + os.replace 原子替换：写一半崩溃只丢本次，不损坏已有全部账号的缓存；
+    临时文件先收 0600 再替换（Windows 下 chmod 失败不影响功能）。"""
     data = {}
     if COOKIE_CACHE.exists():
         try:
@@ -225,38 +284,58 @@ def write_cookie_cache(username: str, cookie_str: str):
                 data = json.load(f)
         except Exception:
             data = {}
-    data.setdefault("accounts", {})[username] = {
+    if not isinstance(data, dict) or not isinstance(data.get("accounts"), dict):
+        data = {"accounts": {}}
+    data["accounts"][username] = {
         "cookies": cookie_str,
         "update_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     }
+    tmp = COOKIE_CACHE.with_name(COOKIE_CACHE.name + ".part")
     try:
-        with open(COOKIE_CACHE, "w", encoding="utf-8") as f:
+        with open(tmp, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        try:
+            os.chmod(tmp, 0o600)
+        except OSError:
+            pass
+        os.replace(tmp, COOKIE_CACHE)
     except Exception as e:
         print(f"⚠️ Cookie 缓存写入失败: {e}")
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 # ---------------- 登录层 ----------------
-def check_cookie_valid(session: requests.Session, debug: bool = False) -> bool:
-    """GET forum.php 判登录态：discuz_uid > 0 即有效。"""
-    try:
-        r = session.get(FORUM_URL, timeout=session._timeout)
-    except Exception as e:
-        print(f"⚠️ Cookie 检测请求失败: {e}")
-        return False
+def check_cookie_valid(session: requests.Session, debug: bool = False):
+    """GET forum.php 判登录态：discuz_uid > 0 即有效。
+
+    返回 True/False；站点临时故障（重试后仍拿不到正常页面）返回 None，
+    调用方据此保留缓存而不是误判为"Cookie 失效"。
+    """
+    r, err = get_retry(session, FORUM_URL, debug=debug, label="论坛首页")
+    if r is None:
+        print(f"    ⚠️ 论坛首页暂时不可用（{err}）")
+        return None
     m = re.search(r"discuz_uid\s*=\s*'(\d+)'", r.text)
     uid = m.group(1) if m else "0"
     if debug:
-        print(f"    [debug] forum.php uid={uid}")
+        print(f"    [debug] forum.php uid={uid}, HTTP {r.status_code}")
     return uid not in ("", "0")
 
 
 def _ocr(session: requests.Session, idhash: str, ocr, debug: bool) -> str:
-    """下载 seccode 图片并识别一次，返回识别文本。"""
-    r = session.get(
+    """下载 seccode 图片并识别一次，返回识别文本；图片拿不到时返回空串（交给登录重试）。"""
+    r, err = get_retry(
+        session,
         f"{BASE}/misc.php?mod=seccode&update={time.time()}&idhash={idhash}",
-        timeout=session._timeout,
-    )
+        debug=debug, label="验证码图片", tries=2)
+    if r is None:
+        print(f"    ⚠️ 验证码图片暂时不可用（{err}）")
+        return ""
     if debug:
         print(f"    [debug] 验证码图片 HTTP {r.status_code}, {len(r.content)}B")
     return ocr.classification(r.content)
@@ -272,18 +351,27 @@ def discuz_login(session: requests.Session, username: str, password: str,
         return False, "缺少 ddddocr 库：账密登录需要它识别验证码，请在「依赖管理」-「Python」安装 ddddocr（或改用 Cookie 模式）"
 
     login_referer = LOGIN_URL
+    last_reason = "未知原因"
     for attempt in range(1, LOGIN_MAX_TRIES + 1):
-        try:
-            r = session.get(login_referer, timeout=session._timeout)
-        except Exception as e:
-            return False, f"登录页请求失败: {e}"
+        r, err = get_retry(session, login_referer, debug=debug,
+                           label="登录页", tries=2)
+        if r is None:
+            last_reason = f"登录页暂时不可用（{err}）"
+            print(f"    ⚠️ 第 {attempt}/{LOGIN_MAX_TRIES} 次 {last_reason}，重试...")
+            time.sleep(2)
+            continue
 
         m = re.search(r'name="formhash"\s+value="([a-f0-9]+)"', r.text)
         formhash = m.group(1) if m else ""
         m = re.search(r"updateseccode\('([a-zA-Z0-9]+)'", r.text)
         idhash = m.group(1) if m else ""
         if not formhash:
-            return False, "登录页无 formhash（可能站点改版或被风控拦截）"
+            # 排除瞬时错误页后仍无 formhash，才可能是改版或风控页；带上状态码与标题便于定位
+            last_reason = (f"登录页无 formhash（HTTP {r.status_code}"
+                           f"，标题「{page_title(r.text) or '无'}」）")
+            print(f"    ⚠️ 第 {attempt}/{LOGIN_MAX_TRIES} 次 {last_reason}，重试...")
+            time.sleep(3)
+            continue
 
         data = {
             "formhash": formhash,
@@ -297,18 +385,24 @@ def discuz_login(session: requests.Session, username: str, password: str,
         }
         if idhash:
             # seccode 链路：update 接口拿 seccodehash -> 取图 -> OCR
-            try:
-                ru = session.get(
-                    f"{BASE}/misc.php?mod=seccode&action=update&idhash={idhash}"
-                    f"&{time.time()}&modid={MODID}&inajax=1",
-                    timeout=session._timeout,
-                )
-            except Exception as e:
-                return False, f"验证码 update 接口请求失败: {e}"
+            ru, err = get_retry(
+                session,
+                f"{BASE}/misc.php?mod=seccode&action=update&idhash={idhash}"
+                f"&{time.time()}&modid={MODID}&inajax=1",
+                debug=debug, label="验证码接口", tries=2,
+            )
+            if ru is None:
+                last_reason = f"验证码接口暂时不可用（{err}）"
+                print(f"    ⚠️ 第 {attempt}/{LOGIN_MAX_TRIES} 次 {last_reason}，重试...")
+                time.sleep(2)
+                continue
             hm = re.search(r'name="seccodehash"\s+type="hidden"\s+value="([a-zA-Z0-9]+)"', ru.text)
             seccodehash = hm.group(1) if hm else ""
             if not seccodehash:
-                return False, "验证码 update 接口未返回 seccodehash（站点可能改版）"
+                last_reason = "验证码 update 接口未返回 seccodehash（站点可能改版）"
+                print(f"    ⚠️ 第 {attempt}/{LOGIN_MAX_TRIES} 次 {last_reason}，重试...")
+                time.sleep(2)
+                continue
             try:
                 code = _ocr(session, idhash, ocr, debug)
             except Exception as e:
@@ -336,33 +430,40 @@ def discuz_login(session: requests.Session, username: str, password: str,
         if "succeedhandle" in body or "succeedlocation" in body:
             return True, "登录成功"
 
+        if is_site_error(r2):
+            last_reason = f"登录接口返回错误页（HTTP {r2.status_code}）"
+            print(f"    ⚠️ 第 {attempt}/{LOGIN_MAX_TRIES} 次 {last_reason}，重试...")
+            time.sleep(3)
+            continue
+
         # 失败原因分类
         if any(kw in body for kw in _LOGIN_FATAL_KEYWORDS):
             err = re.search(r"show_error\('([^']{0,120})", body)
             return False, f"账号密码错误或账号受限，停止重试: {err.group(1) if err else '见日志'}"
         if "验证码" in body:
+            last_reason = "验证码识别错误"
             print(f"    ⚠️ 第 {attempt}/{LOGIN_MAX_TRIES} 次验证码识别错误，重试...")
             time.sleep(2)
             continue
         err = re.search(r"show_error\('([^']{0,120})", body)
-        print(f"    ⚠️ 第 {attempt}/{LOGIN_MAX_TRIES} 次登录未成功: {err.group(1) if err else body[:150]!r}，重试...")
+        last_reason = f"登录未成功: {err.group(1) if err else body[:100]}"
+        print(f"    ⚠️ 第 {attempt}/{LOGIN_MAX_TRIES} 次{last_reason}，重试...")
         time.sleep(2)
 
-    return False, f"验证码连续 {LOGIN_MAX_TRIES} 次识别失败（本机 ddddocr 对该站识别率不足时请改用 Cookie 模式）"
+    return False, f"登录失败（{last_reason}）"
 
 
 # ---------------- 签到层 ----------------
-def _get_sign_page(session: requests.Session, debug: bool = False) -> str:
-    """GET 签到页，返回 HTML；请求异常返回空串。"""
-    try:
-        r = session.get(SIGN_URL, timeout=session._timeout,
-                        headers={"Referer": FORUM_URL})
-        if debug:
-            print(f"    [debug] 签到页 HTTP {r.status_code}, {len(r.text)}B")
-        return r.text
-    except Exception as e:
-        print(f"⚠️ 签到页请求失败: {e}")
-        return ""
+def _get_sign_page(session: requests.Session, debug: bool = False) -> tuple:
+    """GET 签到页，返回 (HTML, 错误描述)；成功时错误描述为空串。"""
+    r, err = get_retry(session, SIGN_URL, headers={"Referer": FORUM_URL},
+                       debug=debug, label="签到页")
+    if r is None:
+        print(f"⚠️ 签到页请求失败: {err}")
+        return "", err
+    if debug:
+        print(f"    [debug] 签到页 HTTP {r.status_code}, {len(r.text)}B")
+    return r.text, ""
 
 
 def do_signin(session: requests.Session, debug: bool = False) -> dict:
@@ -374,9 +475,9 @@ def do_signin(session: requests.Session, debug: bool = False) -> dict:
       4. 回查签到页确认 JD_sign 消失
     返回 {"state": signed_today|success|failed, "message": str, "stats": str}
     """
-    html = _get_sign_page(session, debug)
+    html, err = _get_sign_page(session, debug)
     if not html:
-        return {"state": "failed", "message": "签到页请求失败", "stats": ""}
+        return {"state": "failed", "message": f"签到页请求失败（{err}）", "stats": ""}
 
     if 'id="JD_sign"' not in html:
         # 无签到按钮：区分「已签」与「Cookie 失效被踢回登录页」
@@ -394,21 +495,22 @@ def do_signin(session: requests.Session, debug: bool = False) -> dict:
     formhash = m.group(1)
 
     sign_headers = {"Referer": SIGN_URL, "X-Requested-With": "XMLHttpRequest"}
-    try:
-        r = session.get(
-            f"{SIGN_URL}&operation=qiandao&formhash={formhash}&format=text",
-            timeout=session._timeout, headers=sign_headers)
-    except Exception as e:
-        return {"state": "failed", "message": f"签到接口请求失败: {e}", "stats": ""}
+    r, err = get_retry(
+        session,
+        f"{SIGN_URL}&operation=qiandao&formhash={formhash}&format=text",
+        headers=sign_headers, debug=debug, label="签到接口", tries=2)
+    if r is None:
+        return {"state": "failed", "message": f"签到接口请求失败（{err}）", "stats": ""}
 
     # 第一次返回：算术题（站点开启 mathverify 时）；部分站点关闭验证时直接返回结果
     q = re.search(r'var q="([^"]*)"', r.text)
     if not q:
         cdata = re.search(r"<!\[CDATA\[(.*?)\]\]>", r.text, re.S)
         text = cdata.group(1).strip() if cdata else r.text[:150]
+        page, _ = _get_sign_page(session, debug)
         return {"state": "failed",
                 "message": f"签到接口未返回算术验证题，原始返回: {text[:100]}",
-                "stats": fetch_sign_stats(_get_sign_page(session, debug))}
+                "stats": fetch_sign_stats(page)}
 
     answer = solve_math(q.group(1))
     if answer is None:
@@ -416,19 +518,27 @@ def do_signin(session: requests.Session, debug: bool = False) -> dict:
     if debug:
         print(f"    [debug] 算术题: {q.group(1)} -> {answer}")
 
-    try:
-        r2 = session.get(
-            f"{SIGN_URL}&operation=qiandao&formhash={formhash}&format=text"
-            f"&mathverify_answer={quote(str(answer))}",
-            timeout=session._timeout, headers=sign_headers)
-    except Exception as e:
-        return {"state": "failed", "message": f"签到确认请求失败: {e}", "stats": ""}
+    r2, err = get_retry(
+        session,
+        f"{SIGN_URL}&operation=qiandao&formhash={formhash}&format=text"
+        f"&mathverify_answer={quote(str(answer))}",
+        headers=sign_headers, debug=debug, label="签到确认接口", tries=2)
+    if r2 is None:
+        return {"state": "failed", "message": f"签到确认请求失败（{err}）", "stats": ""}
 
     cdata = re.search(r"<!\[CDATA\[(.*?)\]\]>", r2.text, re.S)
     result_text = cdata.group(1).strip() if cdata else r2.text[:150]
 
     # 以页面回查为准做最终状态判定（返回文本因插件版本而异，不可靠）
-    html2 = _get_sign_page(session, debug)
+    html2, recheck_err = _get_sign_page(session, debug)
+    if not html2:
+        # 回查页拿不到时不能直接当成功：接口文案确认过才算，否则如实报未确认
+        if any(k in result_text for k in ("已签到", "签到成功")):
+            return {"state": "success",
+                    "message": f"签到成功（{result_text[:40]}，回查页暂不可用）", "stats": ""}
+        return {"state": "failed",
+                "message": f"签到结果未确认（{result_text[:60]}；回查失败: {recheck_err}）",
+                "stats": ""}
     stats = fetch_sign_stats(html2)
     if 'id="JD_sign"' not in html2:
         return {"state": "success", "message": f"签到成功（{result_text[:40]}）", "stats": stats}
@@ -459,11 +569,15 @@ def run_one_account(cred, proxy: str, timeout: int, debug: bool) -> dict:
         if cached:
             for k, v in parse_cookie_str(cached).items():
                 session.cookies.set(k, v)
-            if check_cookie_valid(session, debug):
+            valid = check_cookie_valid(session, debug)
+            if valid is True:
                 print("    💾 缓存 Cookie 有效，跳过登录")
-            else:
+            elif valid is False:
                 print("    ⚠️ 缓存 Cookie 失效，重新登录")
                 session.cookies.clear()
+            else:
+                # 站点瞬时故障无法判断登录态：保留缓存先试签到，避免白白丢会话
+                print("    ⚠️ 无法确认 Cookie 状态（站点临时故障），先按缓存继续")
 
         # 2) 缓存缺失/失效 -> 账密登录
         if not session.cookies:

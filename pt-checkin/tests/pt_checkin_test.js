@@ -5,6 +5,8 @@
  * `node --check` 只保证语法，本文件保证解析正则与真实页面结构不脱节。
  */
 const assert = require('assert');
+const fs = require('fs');
+const nodePath = require('path');
 const {
   parseLoginPage,
   parseCrabptAttendance,
@@ -15,6 +17,8 @@ const {
   judgeNovahdSign,
   judgeBtschoolIndex,
   credentialFingerprint,
+  acquireLock,
+  releaseLock,
 } = require('../pt_checkin.js');
 
 let passed = 0;
@@ -197,6 +201,57 @@ test('credentialFingerprint 随种子变化且稳定', () => {
   assert.notStrictEqual(a, credentialFingerprint('PT_FP_TEST_CK', 'user1'));
   delete process.env.PT_FP_TEST_CK;
   assert.strictEqual(credentialFingerprint('PT_FP_TEST_CK', ''), '');
+});
+
+// ----------------------------------------
+// 运行锁：独占创建（'wx'）语义，防两个实例同时认为自己拿到锁
+// ----------------------------------------
+test('acquireLock: 无锁获取/进行中跳过/陈旧接管/已结束接管', () => {
+  const tmpRoot = nodePath.join(__dirname, '.test_tmp');
+  fs.mkdirSync(tmpRoot, { recursive: true });
+  const dir = fs.mkdtempSync(nodePath.join(tmpRoot, 'lock-'));
+  const file = nodePath.join(dir, 'pt_checkin.lock');
+  const t0 = 1_800_000_000_000;
+  const STALE = 30 * 60_000;
+
+  // 无锁 → 独占创建成功，锁文件内容可解析
+  assert.strictEqual(acquireLock(t0, file, STALE).skip, false);
+  const created = JSON.parse(fs.readFileSync(file, 'utf8'));
+  assert.strictEqual(created.finishedAt, null);
+  assert.ok(created.startedAt > 0);
+
+  // 进行中的锁 → 跳过
+  const busy = acquireLock(t0 + 60_000, file, STALE);
+  assert.strictEqual(busy.skip, true);
+  assert.match(busy.reason, /仍在进行/);
+
+  // 锁陈旧（超 stale 阈值）→ 接管
+  assert.strictEqual(acquireLock(t0 + 31 * 60_000, file, STALE).skip, false);
+
+  // releaseLock 标记结束后 → 下一次可直接接管
+  releaseLock(file);
+  assert.strictEqual(acquireLock(t0 + 32 * 60_000, file, STALE).skip, false);
+
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('acquireLock: 抢锁竞态下后到的一方必须跳过', () => {
+  const tmpRoot = nodePath.join(__dirname, '.test_tmp');
+  fs.mkdirSync(tmpRoot, { recursive: true });
+  const dir = fs.mkdtempSync(nodePath.join(tmpRoot, 'lock-'));
+  const file = nodePath.join(dir, 'pt_checkin.lock');
+  const t0 = 1_800_000_000_000;
+  const STALE = 30 * 60_000;
+
+  // 模拟竞态：两方先后基于同一份"已结束"的旧锁到达
+  fs.writeFileSync(file, JSON.stringify({ startedAt: t0 - 60_000, pid: 1, finishedAt: t0 - 30_000 }));
+  // 第一方清理旧锁并独占重建成功
+  assert.strictEqual(acquireLock(t0, file, STALE).skip, false);
+  // 第二方到达时锁已被重建为"进行中" → 必须跳过，不能双方都跑
+  const loser = acquireLock(t0, file, STALE);
+  assert.strictEqual(loser.skip, true);
+
+  fs.rmSync(dir, { recursive: true, force: true });
 });
 
 console.log(`\n${passed} 个用例全部通过`);

@@ -21,19 +21,45 @@ def _load_module():
     mod = importlib.util.module_from_spec(spec)
     try:
         spec.loader.exec_module(mod)
+        return mod
     except SystemExit:
-        stub = types.ModuleType("requests")
-        stub.Session = object
-        stub.exceptions = types.SimpleNamespace(RequestException=Exception)
-        sys.modules["requests"] = stub
+        pass
+    # 脚本缺依赖会在 import 阶段 sys.exit；只对确实缺失的模块打桩，且绝不
+    # 覆盖 sys.modules 里已存在的真实模块（同进程其它测试模块会被殃及）。
+    # cv2/numpy 缺失时脚本可加载，但合成图用例无法运行 → 由 _HAS_CV_STACK 跳过。
+    for name in ("requests", "cv2", "numpy"):
+        if name not in sys.modules:
+            stub = types.ModuleType(name)
+            if name == "requests":
+                stub.Session = object
+                stub.exceptions = types.SimpleNamespace(RequestException=Exception)
+            sys.modules[name] = stub
+    try:
         spec.loader.exec_module(mod)
+    except SystemExit as e:
+        raise unittest.SkipTest(
+            "laowangfip_checkin 缺少 requests 之外的依赖，无法加载被测模块") from e
     return mod
 
 
 m = _load_module()
 
-import numpy as np  # noqa: E402
-import cv2  # noqa: E402
+try:
+    import numpy as _np_probe  # noqa: E402
+    import cv2 as _cv2_probe  # noqa: E402
+except ImportError:
+    _np_probe = None
+    _cv2_probe = None
+# 加载器可能往 sys.modules 塞过裸 stub（缺真实库时），import 仍会"成功"，
+# 因此按能力探测判断，而不是按导入是否抛错
+_HAS_CV_STACK = bool(
+    _np_probe is not None
+    and hasattr(_np_probe, "random")
+    and hasattr(_np_probe, "uint8")
+    and hasattr(_cv2_probe, "imencode")
+)
+np = _np_probe   # 仅在 _HAS_CV_STACK 为真时被用例使用
+cv2 = _cv2_probe
 
 
 # ---- 站点真实 JS（node 运行 generateSecurePayload）产出的基准值，用于对拍 ----
@@ -111,6 +137,7 @@ class TestHumanTrack(unittest.TestCase):
         self.assertGreaterEqual(len(track), 30)  # 点数足够，避免 error_track
 
 
+@unittest.skipUnless(_HAS_CV_STACK, "合成图回归需要 numpy + opencv-python-headless")
 class TestSolveSlider(unittest.TestCase):
     @staticmethod
     def _synthetic_sprite(gap_x, piece_w=50, gap_y=65):
