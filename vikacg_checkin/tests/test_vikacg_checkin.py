@@ -7,6 +7,7 @@
 """
 import json
 import os
+import socket
 import sys
 import time
 import unittest
@@ -248,24 +249,99 @@ class TestRunOneTask(unittest.TestCase):
 
 
 class TestResolveProxy(unittest.TestCase):
-    def test_specific_first(self):
-        with mock.patch.dict(os.environ, {"VIKACG_PROXY": "http://specific:1",
-                                          "HTTPS_PROXY": "http://global:2"}, clear=False):
-            proxy, source = vc.resolve_proxy("VIKACG_PROXY")
-        self.assertEqual((proxy, source), ("http://specific:1", "VIKACG_PROXY"))
+    """默认直连：只认 VIKACG_PROXY，全局代理变量不再回退。"""
 
-    def test_global_fallback(self):
-        with mock.patch.dict(os.environ, {"HTTPS_PROXY": "http://global:2",
-                                          "VIKACG_PROXY": ""}, clear=False):
-            proxy, source = vc.resolve_proxy("VIKACG_PROXY")
-        self.assertEqual((proxy, source), ("http://global:2", "HTTPS_PROXY"))
+    def test_explicit_proxy(self):
+        with mock.patch.dict(os.environ, {"VIKACG_PROXY": "http://specific:1"}, clear=False):
+            self.assertEqual(vc.resolve_proxy(), ("http://specific:1", "VIKACG_PROXY"))
 
-    def test_direct_when_none(self):
-        env = {k: "" for k in vc.GLOBAL_PROXY_KEYS}
-        env["VIKACG_PROXY"] = ""
+    def test_global_env_ignored(self):
+        # 青龙给任务注入 HTTPS_PROXY 时，站点仍应直连（走代理会撞 CF 风控出口）
+        env = {"VIKACG_PROXY": "", "HTTPS_PROXY": "http://global:2",
+               "HTTP_PROXY": "http://global:2", "ALL_PROXY": "socks5://global:3"}
         with mock.patch.dict(os.environ, env, clear=False):
-            proxy, source = vc.resolve_proxy("VIKACG_PROXY")
-        self.assertEqual((proxy, source), ("", ""))
+            self.assertEqual(vc.resolve_proxy(), ("", "直连"))
+
+    def test_direct_aliases(self):
+        for value in ("none", "direct", "DIRECT", "off", "0", "false"):
+            with mock.patch.dict(os.environ, {"VIKACG_PROXY": value}, clear=False):
+                self.assertEqual(vc.resolve_proxy()[0], "", value)
+
+    def test_empty_means_direct(self):
+        with mock.patch.dict(os.environ, {"VIKACG_PROXY": "  "}, clear=False):
+            self.assertEqual(vc.resolve_proxy(), ("", "直连"))
+
+
+class TestEnvProxyFallback(unittest.TestCase):
+    """全局代理变量只作直连失败时的备用出口。"""
+
+    def test_reads_global_env(self):
+        with mock.patch.dict(os.environ, {"HTTPS_PROXY": "http://g:2"}, clear=False):
+            self.assertEqual(vc.resolve_env_proxy(), ("http://g:2", "HTTPS_PROXY"))
+
+    def test_none_when_unset(self):
+        env = {k: "" for k in vc.GLOBAL_PROXY_KEYS}
+        with mock.patch.dict(os.environ, env, clear=False):
+            self.assertEqual(vc.resolve_env_proxy(), ("", ""))
+
+
+class TestFailoverSession(unittest.TestCase):
+    """直连被掐断时自动切备用代理，且只切一次。"""
+
+    def setUp(self):
+        self.primary = mock.MagicMock()
+        self.fallback = mock.MagicMock()
+
+    def test_switches_on_connection_error(self):
+        self.primary.post.side_effect = requests.exceptions.ConnectionError("reset")
+        ok = mock.MagicMock(status_code=200)
+        self.fallback.post.return_value = ok
+        session = vc.FailoverSession(self.primary, self.fallback, "直连", "代理 http://p:1")
+        self.assertIs(session.post("https://example.com/"), ok)
+        self.assertTrue(session.switched)
+
+    def test_switches_on_timeout(self):
+        self.primary.post.side_effect = requests.exceptions.ReadTimeout("slow")
+        ok = mock.MagicMock(status_code=200)
+        self.fallback.post.return_value = ok
+        session = vc.FailoverSession(self.primary, self.fallback, "直连", "代理")
+        self.assertIs(session.post("https://example.com/"), ok)
+
+    def test_no_fallback_reraises(self):
+        self.primary.post.side_effect = requests.exceptions.ConnectionError("reset")
+        session = vc.FailoverSession(self.primary, None, "直连", "")
+        with self.assertRaises(requests.exceptions.ConnectionError):
+            session.post("https://example.com/")
+
+    def test_primary_ok_no_switch(self):
+        ok = mock.MagicMock(status_code=200)
+        self.primary.post.return_value = ok
+        session = vc.FailoverSession(self.primary, self.fallback, "直连", "代理")
+        self.assertIs(session.post("https://example.com/"), ok)
+        self.fallback.post.assert_not_called()
+        self.assertFalse(session.switched)
+
+    def test_switch_logged_once(self):
+        self.primary.post.side_effect = requests.exceptions.ConnectionError("reset")
+        self.fallback.post.return_value = mock.MagicMock(status_code=200)
+        session = vc.FailoverSession(self.primary, self.fallback, "直连", "代理 http://p:1")
+        with mock.patch("builtins.print") as mp:
+            session.post("https://example.com/")
+            session.post("https://example.com/")
+        self.assertEqual(mp.call_count, 1)
+
+
+class TestForceIpv4(unittest.TestCase):
+    """直连时禁用 IPv6：AAAA 记录在大陆常被 reset。"""
+
+    def test_hook_returns_af_inet(self):
+        from urllib3.util import connection
+        original = connection.allowed_gai_family
+        try:
+            vc.force_ipv4()
+            self.assertEqual(connection.allowed_gai_family(), socket.AF_INET)
+        finally:
+            connection.allowed_gai_family = original
 
 
 class TestEnsureToken(unittest.TestCase):
@@ -414,6 +490,29 @@ class TestNetworkErrorHelpers(unittest.TestCase):
         self.assertTrue(issubclass(vc.NetworkError, RuntimeError))
 
 
+def _html_resp(status=403,
+               body="<html><head><title>Just a moment...</title></head></html>",
+               headers=None):
+    """构造 CF 挑战页 / 网关错误页这类非 JSON 响应。"""
+    resp = mock.MagicMock()
+    resp.status_code = status
+    resp.headers = ({"Content-Type": "text/html; charset=UTF-8",
+                     "Cf-Mitigated": "challenge"} if headers is None else headers)
+    resp.text = body
+    resp.json.side_effect = ValueError("not json")
+    return resp
+
+
+def _json_resp(status, payload):
+    """构造业务 JSON 响应。"""
+    resp = mock.MagicMock()
+    resp.status_code = status
+    resp.headers = {"Content-Type": "application/json"}
+    resp.text = json.dumps(payload, ensure_ascii=False)
+    resp.json.return_value = payload
+    return resp
+
+
 class TestApiPostRetry(unittest.TestCase):
     """api_post 网络重试：连接类异常重试 2 次，业务响应不重试。"""
 
@@ -451,6 +550,66 @@ class TestApiPostRetry(unittest.TestCase):
         self.assertEqual(self.session.post.call_count, 1)
 
 
+class TestTransientIntercept(unittest.TestCase):
+    """CF 人机校验页识别：专属响应头最准，JSON 业务响应一律排除，正文特征兜底。"""
+
+    def test_header_challenge(self):
+        self.assertTrue(vc.is_transient_intercept(_html_resp()))
+
+    def test_json_business_response_excluded(self):
+        # 站点自己的 400/403 JSON（如「非法的客户端」）不是拦截页，不能重试
+        self.assertFalse(vc.is_transient_intercept(
+            _json_resp(400, {"status": "fail", "message": "非法的客户端"})))
+
+    def test_html_body_without_header(self):
+        # 部分前置网关不带 Cf-Mitigated 头，用正文特征兜底
+        self.assertTrue(vc.is_transient_intercept(
+            _html_resp(403, headers={"Content-Type": "text/html"})))
+
+    def test_gateway_page_detected(self):
+        self.assertTrue(vc.is_transient_intercept(
+            _html_resp(502, body="<html><body>Bad Gateway</body></html>",
+                       headers={"Content-Type": "text/html"})))
+
+    def test_normal_html_not_intercept(self):
+        self.assertFalse(vc.is_transient_intercept(
+            _html_resp(200, body="<html><body>hello</body></html>",
+                       headers={"Content-Type": "text/html"})))
+
+
+class TestApiPostChallengeRetry(unittest.TestCase):
+    """api_post 对 CF 挑战页也重试：换一条 TCP 连接可能落到没被风控的出口。"""
+
+    def setUp(self):
+        self.session = mock.MagicMock()
+
+    def test_challenge_then_success(self):
+        self.session.post.side_effect = [
+            _html_resp(), _json_resp(401, {"status": "fail", "message": "未登录"})]
+        with mock.patch.object(vc.time, "sleep") as ms:
+            r = vc.api_post(self.session, "/userMission", {}, "d", "c", token="t")
+        self.assertEqual(r["http_code"], 401)
+        self.assertEqual(self.session.post.call_count, 2)
+        self.assertEqual(ms.call_count, 1)
+
+    def test_challenge_exhausted_reports_actionable_hint(self):
+        self.session.post.return_value = _html_resp()
+        with mock.patch.object(vc.time, "sleep") as ms:
+            r = vc.api_post(self.session, "/userMission", {}, "d", "c", token="t")
+        self.assertEqual(r["http_code"], 403)
+        self.assertIn("Cloudflare 人机校验", r["json"]["message"])
+        self.assertIn("VIKACG_PROXY", r["json"]["message"])
+        self.assertEqual(self.session.post.call_count, 3)  # 首次 + 2 次重试
+        self.assertEqual(ms.call_count, 2)
+
+    def test_business_json_403_not_retried(self):
+        self.session.post.return_value = _json_resp(
+            403, {"status": "fail", "message": "非法的客户端，请下载官方版本"})
+        r = vc.api_post(self.session, "/userMission", {}, "d", "c", token="t")
+        self.assertEqual(r["http_code"], 403)
+        self.assertEqual(self.session.post.call_count, 1)
+
+
 class TestErrorTextCleaning(unittest.TestCase):
     """非 JSON 响应清洗与拦截页检测。"""
 
@@ -483,10 +642,12 @@ class TestErrorTextCleaning(unittest.TestCase):
         session = mock.MagicMock()
         resp = mock.MagicMock()
         resp.status_code = 403
+        resp.headers = {"Content-Type": "text/html; charset=UTF-8"}
         resp.text = "<html><title>Just a moment...</title>\n  <p>checking</p></html>"
         resp.json.side_effect = ValueError("no json")
         session.post.return_value = resp
-        r = vc.api_post(session, "/userMission", {}, "d", "c", token="t")
+        with mock.patch.object(vc.time, "sleep"):
+            r = vc.api_post(session, "/userMission", {}, "d", "c", token="t")
         msg = r["json"]["message"]
         self.assertNotIn("<", msg)
         self.assertIn("疑似 CF/网关拦截页", msg)

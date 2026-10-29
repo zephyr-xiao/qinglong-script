@@ -8,7 +8,9 @@ cron: 23 8 * * *
 登录态（token + 设备指纹）按账号本地缓存复用：缓存有效直接签到；401 先用 refreshToken
 静默续期、失败才重新账密登录（缓存只存凭证不存密码，原子写 + 0600 收口）。设备指纹
 （X-Device-Code）与 token 绑定且随缓存持久化，避免每次运行换设备触发风控。
-连接类网络异常（超时/被掐/代理失败）自动重试 2 次并分类报错；业务 4xx/5xx 不重试。
+连接类网络异常（超时/被掐/代理失败）与 Cloudflare 人机校验页自动重试 2 次并分类报错；
+业务 4xx/5xx 不重试。挑战页重试有效的原因：出口 IP 被风控才触发挑战，换一条 TCP 连接
+可能落到代理组里另一个干净出口（实测同一代理交替出现 403 挑战与 200）。
 
 接口探测结论（2026-10-07，源自前端 Nuxt bundle 逆向 + 真机验证）：
   POST /api/vikacg/v1/login          {"account","password","platform":"web"} → data.token/refreshToken
@@ -25,8 +27,9 @@ cron: 23 8 * * *
   VIKACG_NOTIFY_ONLY_FAIL true/false 仅失败时推送，默认 false
   VIKACG_TIMEOUT         HTTP 超时秒数，默认 30
   VIKACG_DEBUG           true/false 输出调试细节，默认 false
-  VIKACG_PROXY           HTTP/SOCKS 代理，如 http://172.17.0.1:7890（站点在 Cloudflare 后，
-                         大陆直连 TLS 常被掐断，一般需要代理；也读全局 HTTPS_PROXY 等变量）
+  VIKACG_PROXY           可选代理，如 http://172.17.0.1:7890。默认直连（强制 IPv4），设
+                         none/direct 也表示直连；直连被掐断时自动用全局 HTTPS_PROXY 等
+                         作备用出口（全局变量不参与主路由选择）
   VIKACG_INSECURE        true/false 跳过 TLS 证书校验（自签代理场景），默认 false
   VIKACG_BASE_URL        站点地址，默认 https://www.vikacg.cc（备用域名时改）
 作者: zephyr_xiao
@@ -35,6 +38,7 @@ import base64
 import json
 import os
 import re
+import socket
 import sys
 import time
 import traceback
@@ -102,11 +106,19 @@ BASE_URL = os.getenv("VIKACG_BASE_URL", "https://www.vikacg.cc").rstrip("/")
 API_BASE = BASE_URL + "/api/vikacg/v1"
 TOKEN_CACHE_FILE = Path(__file__).resolve().parent / "vikacg_token.json"
 
-# 站点在 Cloudflare 后，大陆直连 TLS 常被掐断；代理一律非必须，三级回退见 resolve_proxy
+# 站点直连可达：真正的问题是 IPv6（AAAA 记录在大陆常被 reset）和代理出口被 CF 风控。
+# 因此默认直连并强制 IPv4，不再回退 HTTPS_PROXY 之类全局代理变量（青龙常给任务注入），
+# 只有显式设置 VIKACG_PROXY 才走代理。
+DIRECT_ALIASES = ("none", "direct", "off", "0", "false")
+# 全局代理变量只在「直连被掐断」时作为备用出口，不参与主路由选择
 GLOBAL_PROXY_KEYS = (
     "HTTPS_PROXY", "https_proxy",
     "HTTP_PROXY", "http_proxy",
     "ALL_PROXY", "all_proxy",
+)
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
 )
 
 ALREADY_SIGNED_IN_KEYWORDS = [
@@ -149,13 +161,43 @@ def parse_credentials(env_value: str):
     return accounts
 
 
-def resolve_proxy(*specific_keys: str) -> tuple:
-    """解析代理地址，返回 (代理地址, 来源变量名)。优先级：专属变量 > 全局代理 > 直连。"""
-    for name in (*specific_keys, *GLOBAL_PROXY_KEYS):
+def resolve_proxy() -> tuple:
+    """解析代理配置，返回 (代理地址, 来源说明)。默认返回直连。
+
+    只认 VIKACG_PROXY：青龙常给任务注入全局 HTTPS_PROXY，撞上被 Cloudflare 风控的
+    数据中心出口就整站 403 挑战，所以这里刻意不回退全局代理变量。
+    值为 none/direct/off 等也按直连处理，方便在面板里显式声明。
+    """
+    value = (os.getenv("VIKACG_PROXY") or "").strip()
+    if not value or value.lower() in DIRECT_ALIASES:
+        return "", "直连"
+    return value, "VIKACG_PROXY"
+
+
+def resolve_env_proxy() -> tuple:
+    """读取环境里的代理（仅作直连失败时的备用出口），返回 (代理地址, 变量名)。
+
+    青龙常给任务注入全局 HTTPS_PROXY，直连被掐断（大陆到 Cloudflare 的瞬时 reset
+    是成片出现的）时用它兜底，比整轮任务失败强；主路由仍是直连。
+    """
+    for name in GLOBAL_PROXY_KEYS:
         value = (os.getenv(name) or "").strip()
         if value:
             return value, name
     return "", ""
+
+
+def force_ipv4():
+    """直连时只解析 IPv4：站点 A 记录稳定可用，AAAA 记录在大陆常被 reset。
+
+    urllib3 在建立连接时调用 allowed_gai_family()，替换它就等于全局禁用 IPv6，
+    只影响当前进程，不动系统配置。
+    """
+    try:
+        from urllib3.util import connection as urllib3_connection
+        urllib3_connection.allowed_gai_family = lambda: socket.AF_INET
+    except Exception:
+        pass
 
 
 def mask(s: str) -> str:
@@ -201,7 +243,8 @@ class NetworkError(RuntimeError):
     """网络请求重试耗尽后的失败，message 已含分类与排查指引。"""
 
 
-NETWORK_RETRY_DELAYS = (3, 6)  # 连接类异常重试间隔（秒）；拿到 HTTP 响应（含 4xx/5xx）不重试
+# 重试间隔（秒）：连接类异常与 CF 挑战页/网关页共用；正常业务响应（含 4xx/5xx）不重试
+NETWORK_RETRY_DELAYS = (3, 6)
 
 
 def describe_network_error(e: Exception) -> str:
@@ -216,7 +259,7 @@ def describe_network_error(e: Exception) -> str:
     if isinstance(e, requests.exceptions.SSLError):
         return "TLS 握手失败（直连被掐断或代理异常）"
     if isinstance(e, requests.exceptions.ConnectionError):
-        return "连接失败（站点在 Cloudflare 后，大陆直连常被掐断，请配置 VIKACG_PROXY）"
+        return "连接失败（直连与备用代理均不可达，检查网络或设 VIKACG_PROXY）"
     return str(e) or type(e).__name__
 
 
@@ -242,6 +285,26 @@ def looks_like_intercept_page(text: str) -> bool:
         "bad gateway", "gateway timeout", "service temporarily unavailable",
     )
     return any(m in head for m in markers)
+
+
+def is_cf_challenge(resp) -> bool:
+    """是否命中 Cloudflare 人机校验（站点被挑战时整站返回该响应头）。"""
+    return (resp.headers.get("Cf-Mitigated") or "").strip().lower() == "challenge"
+
+
+def is_transient_intercept(resp) -> bool:
+    """响应是否是 CF 人机校验页 / 网关错误页（换连接重试有意义的那一类）。
+
+    挑战由出口 IP 风控触发，整站（含 API）都会返回 403 HTML；代理组有多个节点/IP 时，
+    重连可能换个出口就通，所以这类响应值得重试，而业务 4xx/5xx 不该重试。
+    判定顺序：CF 专属响应头（最准）→ Content-Type 是 JSON 直接排除 → 正文特征兜底。
+    """
+    if is_cf_challenge(resp):
+        return True
+    if "application/json" in (resp.headers.get("Content-Type") or "").lower():
+        return False
+    body = getattr(resp, "text", "") or ""
+    return isinstance(body, str) and looks_like_intercept_page(body)
 
 
 # 服务端校验浏览器特征头（Sec-Fetch-* 等），缺失报「非法的客户端」，
@@ -275,10 +338,10 @@ def api_post(session: "requests.Session", path: str, payload: dict, device_code:
              client_code: str, token: str = "", timeout: int = 30) -> dict:
     """POST JSON 并返回 {http_code, json}。
 
-    连接类网络异常按 NETWORK_RETRY_DELAYS 重试，耗尽后抛 NetworkError；
-    拿到 HTTP 响应（含 4xx/5xx）不算网络异常，交由调用方按业务语义处理。
+    两类情况按 NETWORK_RETRY_DELAYS 重试，耗尽后抛 NetworkError（连接类异常）或
+    返回带拦截提示的失败 JSON（挑战页）：连接类网络异常，以及 CF 人机校验/网关拦截页。
+    其余 HTTP 响应（含业务 4xx/5xx）不重试，交由调用方按业务语义处理。
     """
-    last_error = None
     for attempt in range(1 + len(NETWORK_RETRY_DELAYS)):
         try:
             resp = session.post(
@@ -287,23 +350,84 @@ def api_post(session: "requests.Session", path: str, payload: dict, device_code:
                 headers=build_headers(device_code, client_code, token),
                 timeout=timeout,
             )
-            break
         except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
-            last_error = e
-            if attempt < len(NETWORK_RETRY_DELAYS):
-                delay = NETWORK_RETRY_DELAYS[attempt]
-                print(f"           ⚠️ 网络异常（{describe_network_error(e)}），"
-                      f"{delay}s 后重试（{attempt + 1}/{len(NETWORK_RETRY_DELAYS)}）")
-                time.sleep(delay)
-    else:
-        raise NetworkError(f"网络请求失败：{describe_network_error(last_error)}")
+            if attempt >= len(NETWORK_RETRY_DELAYS):
+                raise NetworkError(f"网络请求失败：{describe_network_error(e)}") from e
+            delay = NETWORK_RETRY_DELAYS[attempt]
+            print(f"           ⚠️ 网络异常（{describe_network_error(e)}），"
+                  f"{delay}s 后重试（{attempt + 1}/{len(NETWORK_RETRY_DELAYS)}）")
+            time.sleep(delay)
+            continue
+        # 挑战页重试：新连接可能落到代理组里另一个没被风控的出口
+        if attempt < len(NETWORK_RETRY_DELAYS) and is_transient_intercept(resp):
+            delay = NETWORK_RETRY_DELAYS[attempt]
+            print(f"           ⚠️ 命中 Cloudflare 人机校验/网关拦截页，"
+                  f"{delay}s 后换连接重试（{attempt + 1}/{len(NETWORK_RETRY_DELAYS)}）")
+            time.sleep(delay)
+            continue
+        break
     try:
         data = resp.json()
     except Exception:
         raw = resp.text or ""
-        hint = "疑似 CF/网关拦截页" if looks_like_intercept_page(raw) else "非 JSON 响应"
+        if is_cf_challenge(resp):
+            hint = ("Cloudflare 人机校验拦截（代理出口 IP 被风控），"
+                    "请在 mihomo 里换个节点或更换 VIKACG_PROXY 后重跑")
+        elif looks_like_intercept_page(raw):
+            hint = "疑似 CF/网关拦截页"
+        else:
+            hint = "非 JSON 响应"
         data = {"status": "fail", "message": f"[{hint}] {clean_error_text(raw)}"}
     return {"http_code": resp.status_code, "json": data if isinstance(data, dict) else {}}
+
+
+# ============ 会话与双路由 ============
+
+def make_session(proxy: str = "") -> "requests.Session":
+    """构造会话：proxy 为空即直连（强制 IPv4）。
+
+    trust_env 一律关闭，代理只由入参决定；否则 requests 会自己从环境变量里读代理，
+    绕过这里的主/备路由设计。
+    """
+    session = requests.Session()
+    session.headers.update({"User-Agent": USER_AGENT})
+    # 默认校验 TLS 证书（登录请求含明文密码，禁校验有 MITM 风险）；
+    # 自签代理等场景用 VIKACG_INSECURE=true 显式放开
+    session.verify = not env_bool("VIKACG_INSECURE", False)
+    session.trust_env = False
+    if proxy:
+        session.proxies.update({"http": proxy, "https": proxy})
+    else:
+        force_ipv4()
+    return session
+
+
+class FailoverSession:
+    """主路由优先、连接类失败自动切备用路由的会话包装。
+
+    主路由默认直连（强制 IPv4，不会被 CF 风控），但大陆到 Cloudflare 的 reset 是
+    成片出现的，可能连续十几秒全部失败；此时用备用代理重发同一个请求，避免整轮任务
+    因瞬时网络抖动失败。主路由是代理时备用路由为直连，同理兜底。
+    只接管 post()，其余行为由内层 Session 决定。
+    """
+
+    def __init__(self, primary, fallback=None, primary_desc: str = "", fallback_desc: str = ""):
+        self.primary = primary
+        self.fallback = fallback
+        self.primary_desc = primary_desc
+        self.fallback_desc = fallback_desc
+        self.switched = False
+
+    def post(self, url, **kwargs):
+        try:
+            return self.primary.post(url, **kwargs)
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
+            if self.fallback is None:
+                raise
+            if not self.switched:
+                self.switched = True
+                print(f"           🔀 {self.primary_desc}不可用，本次运行改用{self.fallback_desc}")
+            return self.fallback.post(url, **kwargs)
 
 
 # ============ 凭证缓存（只存凭证与设备指纹，绝不存密码） ============
@@ -539,15 +663,18 @@ def main():
     timeout = env_int("VIKACG_TIMEOUT", 30)
     debug = env_bool("VIKACG_DEBUG", False)
 
-    proxy, proxy_source = resolve_proxy("VIKACG_PROXY")
+    proxy, proxy_source = resolve_proxy()
+    env_proxy, env_source = resolve_env_proxy()
 
     print("=" * 60)
     print(f"🚀 {title}  开始执行  {datetime.now():%Y-%m-%d %H:%M:%S}")
     print("=" * 60)
     if proxy:
-        print(f"🌐 代理: {proxy} （来源: {proxy_source}）")
+        print(f"🌐 主路由: 代理 {proxy} （来源: {proxy_source}），直连兜底")
+    elif env_proxy:
+        print(f"🌐 主路由: 直连（强制 IPv4），被掐断时自动回退代理 {env_proxy}（来源: {env_source}）")
     else:
-        print("🌐 代理: 未配置，直连（站点在 Cloudflare 后，直连失败请配 VIKACG_PROXY）")
+        print("🌐 直连（强制 IPv4，无可用代理兜底；要改走代理请设 VIKACG_PROXY）")
 
     accounts = parse_credentials(os.getenv("VIKACG_ACCOUNTS", ""))
     if not accounts:
@@ -559,15 +686,13 @@ def main():
         sys.exit(1)
 
     print(f"📋 共发现 {len(accounts)} 个账号\n")
-    session = requests.Session()
-    session.headers.update({"User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")})
-    # 默认校验 TLS 证书（登录请求含明文密码，禁校验有 MITM 风险）；
-    # 自签代理等场景用 VIKACG_INSECURE=true 显式放开
-    session.verify = not env_bool("VIKACG_INSECURE", False)
     if proxy:
-        session.proxies.update({"http": proxy, "https": proxy})
+        session = FailoverSession(make_session(proxy), make_session(),
+                                  f"代理 {proxy}", "直连")
+    else:
+        fallback = make_session(env_proxy) if env_proxy else None
+        session = FailoverSession(make_session(), fallback, "直连",
+                                  f"代理 {env_proxy}" if fallback else "")
 
     results, success_cnt = [], 0
     for idx, (account, password) in enumerate(accounts, 1):
