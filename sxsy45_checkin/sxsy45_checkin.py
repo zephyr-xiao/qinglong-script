@@ -3,11 +3,15 @@
 new Env('尚香书苑签到');
 cron: 23 8 * * *
 
-尚香书苑（sxsy45.com）Discuz! X3.5 论坛 k_misign 插件每日签到。
+尚香书苑 Discuz! X3.5 论坛 k_misign 插件每日签到。
+站点主域名不定期更换（旧域名 301 到"最新地址"导航页），脚本启动时自动探测可用域名：
+先试内置候选，再解析导航页里站点自维护的最新域名。
 登录强制图片验证码（Discuz seccode，idhash 固定为 cS），本地 ddddocr 自动识别；
 k_misign 签到需通过算术验证（"签到验证：A - B = ?"），脚本解析后自动计算二次请求；
 登录 Cookie JSON 缓存复用，失效自动重新登录。
-站点偶发 Cloudflare 522（回源超时）等瞬时错误页会自动退避重试，不会误判成改版或掉登录。
+网络默认直连（本站国内可达，走境外代理会被 Cloudflare 当数据中心 IP 发人机质询）；
+站点偶发 Cloudflare 522（回源超时）等瞬时错误页会自动退避重试，不会误判成改版或掉登录；
+Cloudflare 人机质询页（403 "Just a moment..."）单独识别，按出口 IP 风控处理，不清 Cookie 缓存。
 
 环境变量：
   SXSY_ACCOUNTS          账号列表：用户名#密码，多账号用 & 或换行分隔；
@@ -16,7 +20,8 @@ k_misign 签到需通过算术验证（"签到验证：A - B = ?"），脚本解
   SXSY_NOTIFY_ONLY_FAIL  true/false 仅失败时推送，默认 false
   SXSY_TIMEOUT           秒    请求超时，默认 30
   SXSY_DEBUG             true/false 调试模式，默认 false
-  SXSY_PROXY             HTTP 代理（可选，如 http://172.17.0.1:7890）
+  SXSY_PROXY             HTTP 代理（可选）；**默认直连**，不读全局 HTTPS_PROXY。
+                         填 URL 走代理，填 direct/none/off 同样强制直连
 依赖：requests 必装；ddddocr 仅账密登录时需要（Cookie 模式无需安装）
 作者: zephyr_xiao
 """
@@ -81,8 +86,13 @@ def send_notify(title: str, content: str) -> bool:
     return False
 
 
-# ---------------- 站点常量（均为 2026-09-29 实测） ----------------
-BASE = "https://sxsy45.com"
+# ---------------- 站点常量（均为 2026-10-30 实测） ----------------
+# 站点主域名会不定期更换：旧域名 301 到一个纯 JS 的"最新地址"导航页（不是新站），
+# 跟随重定向只会拿到导航页。所以 BASE 仅作默认值，运行时由 resolve_base() 探测后覆盖。
+DEFAULT_BASE = "https://sxsy33.com"
+DOMAIN_CANDIDATES = ("https://sxsy33.com", "https://sxsy45.com")
+NAV_URL = "https://sxsy.pw"     # "最新地址"导航页：旧域名 301 的落点，页面内写着当前主域名
+BASE = DEFAULT_BASE
 SITE_NAME = "尚香书苑"
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
@@ -104,6 +114,15 @@ _SITE_ERROR_STATUS = frozenset({408, 425, 429, 500, 502, 503, 504,
                                 520, 521, 522, 523, 524, 525, 526})
 HTTP_TRIES = 3                  # 单个 GET 请求最大尝试次数（含首次）
 HTTP_BACKOFF = (5, 15)          # 各次重试前等待秒数，末项复用
+
+# Cloudflare 托管质询（403 "Just a moment..." / 503 challenge-platform）：
+# 判定依据是出口 IP 被风控，与账号密码、Cookie 都无关。刷重试只会加重风控，
+# 也不能据此认定"Cookie 失效"，所以单独一类、只给一次重试机会（代理节点有机会切换）。
+CF_CHALLENGE_MARK = "Cloudflare 人机质询"
+CF_CHALLENGE_TITLE_MARKERS = ("Just a moment", "Attention Required",
+                              "Checking your browser", "Verify you are human")
+CF_CHALLENGE_TRIES = 2          # 同一出口最多尝试次数（含首次）
+CF_CHALLENGE_BACKOFF = 15       # 两次尝试之间的等待秒数
 
 
 # ---------------- 通用工具 ----------------
@@ -201,6 +220,31 @@ def fetch_sign_stats(html: str) -> str:
     return "  │  ".join(parts)
 
 
+# 本站国内可直连；走境外代理反而会被 Cloudflare 当成数据中心 IP 发人机质询，
+# 所以默认直连。需要代理时显式设 SXSY_PROXY=<url>，或设 SXSY_PROXY=direct 强制直连。
+DIRECT_PROXY_VALUES = ("direct", "none", "off", "0", "false", "-")
+
+def resolve_proxy() -> tuple:
+    """解析网络出口，返回 (代理地址, 来源说明)；地址为空表示直连。
+
+    与通用约定的差异：**默认直连，不回退全局 HTTPS_PROXY**。原因是本站套 Cloudflare，
+    经境外代理节点访问会被判为可疑数据中心 IP 而返回 403 质询（2026-10-28 实测），
+    直连家庭宽带出口才稳定。
+    """
+    value = (os.getenv("SXSY_PROXY") or "").strip()
+    if value:
+        if value.lower() in DIRECT_PROXY_VALUES:
+            return "", "SXSY_PROXY=直连"
+        return value, "SXSY_PROXY"
+    ignored = next(
+        (name for name in ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy",
+                           "ALL_PROXY", "all_proxy")
+         if (os.getenv(name) or "").strip()),
+        "",
+    )
+    return "", (f"默认直连，已忽略 {ignored}" if ignored else "默认直连")
+
+
 def build_session(proxy: str, timeout: int) -> requests.Session:
     s = requests.Session()
     s.headers.update({
@@ -210,6 +254,9 @@ def build_session(proxy: str, timeout: int) -> requests.Session:
     })
     if proxy:
         s.proxies.update({"http": proxy, "https": proxy})
+    else:
+        # 直连时必须关掉 trust_env，否则 requests 仍会从环境变量读 HTTPS_PROXY 走代理
+        s.trust_env = False
     s._timeout = timeout
     return s
 
@@ -234,6 +281,29 @@ def is_site_error(resp) -> bool:
         page_title(resp.text), re.I))
 
 
+def is_cf_challenge(resp) -> bool:
+    """是否为 Cloudflare 人机质询页（出口 IP 被风控）。
+
+    质询页既没有 formhash 也没有 discuz_uid，若当成正常页面处理，会被误读成
+    "Cookie 失效/站点改版"，进而清掉有效缓存去登录，而登录同样会被拦。
+    """
+    if resp is None:
+        return False
+    headers = getattr(resp, "headers", None) or {}
+    if str(headers.get("cf-mitigated") or "").lower() == "challenge":
+        return True
+    if resp.status_code not in (403, 429, 503):
+        return False
+    if any(mark in page_title(resp.text) for mark in CF_CHALLENGE_TITLE_MARKERS):
+        return True
+    return "challenge-platform" in (resp.text or "")
+
+
+def _is_challenge_err(err: str) -> bool:
+    """get_retry 的错误描述是否来自 CF 人机质询。"""
+    return CF_CHALLENGE_MARK in (err or "")
+
+
 def get_retry(session: requests.Session, url: str, headers: dict = None,
               debug: bool = False, label: str = "请求",
               tries: int = HTTP_TRIES) -> tuple:
@@ -241,16 +311,37 @@ def get_retry(session: requests.Session, url: str, headers: dict = None,
 
     网络异常与 CDN/源站 5xx（Cloudflare 522 等）都重试——这类故障通常持续几秒
     到几十秒，一次成功请求就能继续流程，比直接判失败划算得多。
+    CF 人机质询单独处理：绑定出口 IP，同一出口连打只会加重风控，故最多试
+    CF_CHALLENGE_TRIES 次；仍被拦则返回带 CF_CHALLENGE_MARK 的错误，交调用方定性。
     """
     last_err = ""
+    cf_hits = 0
     for attempt in range(1, tries + 1):
         try:
             r = session.get(url, timeout=session._timeout, headers=headers)
         except Exception as e:
             last_err = f"{type(e).__name__}: {e}"
         else:
+            if is_cf_challenge(r):
+                cf_hits += 1
+                last_err = f"{CF_CHALLENGE_MARK}（HTTP {r.status_code}）"
+                if debug:
+                    print(f"    [debug] {label} 命中 CF 质询页（第 {cf_hits} 次）")
+                if cf_hits >= CF_CHALLENGE_TRIES or attempt >= tries:
+                    print(f"    ⛔ {label} 命中 {last_err}，停止重试")
+                    return None, last_err
+                print(f"    ⏳ {label} 命中 {last_err}，{CF_CHALLENGE_BACKOFF}s 后重试")
+                time.sleep(CF_CHALLENGE_BACKOFF)
+                continue
             if not is_site_error(r):
-                return r, ""
+                if r.status_code < 400:
+                    return r, ""
+                # 4xx（以及未列入瞬时故障的 5xx）不是可重试的临时错误：原样报出状态码与标题，
+                # 避免调用方把 WAF 拦截页/404 误读成"未登录/页面改版"
+                title = page_title(r.text)
+                last_err = f"HTTP {r.status_code}" + (f"「{title}」" if title else "")
+                print(f"    ⛔ {label} 返回 {last_err}，不是可用页面")
+                return None, last_err
             title = page_title(r.text)
             last_err = f"HTTP {r.status_code}" + (f"「{title}」" if title else "")
             if debug:
@@ -260,6 +351,108 @@ def get_retry(session: requests.Session, url: str, headers: dict = None,
             print(f"    ⏳ {label} 暂时不可用（{last_err}），{delay}s 后重试（{attempt}/{tries}）")
             time.sleep(delay)
     return None, last_err
+
+
+# ---------------- 域名发现 ----------------
+# 站点换域名时旧域名会 301 到"最新地址"导航页：HTTP 200、标题正常，但没有 formhash。
+# requests 默认跟随重定向，于是登录流程拿到的是导航页，报出来是"登录页无 formhash"，
+# 看着像改版或风控，实际只是域名换了。运行前先探测可用域名，避免整轮签到白跑。
+def apply_base(base: str) -> None:
+    """切换站点根地址，并同步所有派生 URL。"""
+    global BASE, SIGN_URL, LOGIN_URL, FORUM_URL
+    BASE = base.rstrip("/")
+    SIGN_URL = f"{BASE}/plugin.php?id=k_misign:sign"
+    LOGIN_URL = f"{BASE}/member.php?mod=logging&action=login"
+    FORUM_URL = f"{BASE}/forum.php"
+
+
+_PROBE_TIMEOUT = 15             # 域名探测超时上限（秒）：站点响应不稳，探测不必等满用户配置
+
+
+def _login_page_probe(session: requests.Session, base: str,
+                      debug: bool = False) -> tuple:
+    """探测 base 是否为可用站点，返回 (状态, 说明, 页面文本)。
+
+    状态语义：True 可用；False 不可用；None 出口 IP 被 CF 质询（换域名同样会被拦）。
+    只对网络异常重试一次（本站偶发读超时很常见）；HTTP 层结果不重试，
+    4xx/5xx 的语义要原样保留，且逐个别重试比单点长等更快出结果。
+    """
+    url = f"{base.rstrip('/')}/member.php?mod=logging&action=login"
+    timeout = min(session._timeout, _PROBE_TIMEOUT)
+    r, last_err = None, ""
+    for attempt in (1, 2):
+        try:
+            r = session.get(url, timeout=timeout)
+            break
+        except Exception as e:
+            last_err = f"{type(e).__name__}: {e}"
+            if debug:
+                print(f"    [debug] 探测 {base} 第 {attempt} 次异常: {last_err}")
+            if attempt == 1:
+                time.sleep(2)
+    if r is None:
+        return False, last_err, ""
+    if is_cf_challenge(r):
+        return None, f"{CF_CHALLENGE_MARK}（HTTP {r.status_code}）", ""
+    if r.status_code >= 400:
+        return False, f"HTTP {r.status_code}", ""
+    if re.search(r'name="formhash"\s+value="[a-f0-9]+"', r.text):
+        return True, f"HTTP {r.status_code}", r.text
+    return False, f"HTTP {r.status_code} 无 formhash（标题「{page_title(r.text) or '无'}」）", r.text
+
+
+def _domain_from_nav(html: str) -> str:
+    """从"最新地址"导航页解析站点当前主域名（站点自己维护的 CONFIG）。"""
+    m = (re.search(r'websiteUrl\s*:\s*"([^"]+)"', html or "")
+         or re.search(r'latestDomain\s*:\s*"([^"]+)"', html or ""))
+    if not m:
+        return ""
+    url = m.group(1).strip().rstrip("/")
+    return url if url.startswith("http") else "https://" + url
+
+
+def resolve_base(session: requests.Session, debug: bool = False) -> tuple:
+    """确定本次运行使用的站点域名，返回 (base, 说明)；找不到返回 ("", 原因汇总)。
+
+    顺序：候选域名逐个探测 -> 探测中若落到导航页则解析其最新域名 -> 主动再取一次导航页。
+    命中 CF 质询时立即返回该域名：同一出口换域名一样被拦，继续探测只是徒增风控。
+    """
+    notes, nav_domains = [], []
+
+    def _try(base: str):
+        state, note, html = _login_page_probe(session, base, debug)
+        if state is True:
+            return base, note
+        if state is None:
+            return base, note
+        notes.append(f"{base} {note}")
+        found = _domain_from_nav(html)
+        if found:
+            nav_domains.append(found)
+        return None
+
+    for base in DOMAIN_CANDIDATES:
+        hit = _try(base)
+        if hit:
+            return hit
+
+    # 候选都不可用：导航页是站点自维护的最新域名来源，主动再取一次
+    r, err = get_retry(session, NAV_URL, debug=debug, label="最新地址页", tries=2)
+    if r is not None:
+        found = _domain_from_nav(r.text)
+        if found:
+            nav_domains.append(found)
+    else:
+        notes.append(f"{NAV_URL} {err}")
+
+    tried = {b.rstrip("/").lower() for b in DOMAIN_CANDIDATES}
+    for base in dict.fromkeys(nav_domains):
+        if base.rstrip("/").lower() in tried:
+            continue
+        hit = _try(base)
+        if hit:
+            return hit
+    return "", "；".join(notes)
 
 
 # ---------------- Cookie 缓存（仅账密模式使用） ----------------
@@ -318,7 +511,10 @@ def check_cookie_valid(session: requests.Session, debug: bool = False):
     """
     r, err = get_retry(session, FORUM_URL, debug=debug, label="论坛首页")
     if r is None:
-        print(f"    ⚠️ 论坛首页暂时不可用（{err}）")
+        if _is_challenge_err(err):
+            print(f"    ⚠️ 论坛首页被拦截（{err}）：出口 IP 被风控，与 Cookie 无关，保留缓存先试签到")
+        else:
+            print(f"    ⚠️ 论坛首页暂时不可用（{err}）")
         return None
     m = re.search(r"discuz_uid\s*=\s*'(\d+)'", r.text)
     uid = m.group(1) if m else "0"
@@ -356,6 +552,10 @@ def discuz_login(session: requests.Session, username: str, password: str,
         r, err = get_retry(session, login_referer, debug=debug,
                            label="登录页", tries=2)
         if r is None:
+            if _is_challenge_err(err):
+                # 质询绑定出口 IP：再打只会加重风控，也不该耗掉登录重试次数
+                return False, (f"登录页被拦截（{err}）：出口 IP 被 Cloudflare 风控，"
+                               f"与账号密码无关；稍后重试，或用 SXSY_PROXY=direct 强制直连")
             last_reason = f"登录页暂时不可用（{err}）"
             print(f"    ⚠️ 第 {attempt}/{LOGIN_MAX_TRIES} 次 {last_reason}，重试...")
             time.sleep(2)
@@ -392,6 +592,9 @@ def discuz_login(session: requests.Session, username: str, password: str,
                 debug=debug, label="验证码接口", tries=2,
             )
             if ru is None:
+                if _is_challenge_err(err):
+                    return False, (f"验证码接口被拦截（{err}）：出口 IP 被 Cloudflare 风控，"
+                                   f"与账号密码无关；稍后重试，或用 SXSY_PROXY=direct 强制直连")
                 last_reason = f"验证码接口暂时不可用（{err}）"
                 print(f"    ⚠️ 第 {attempt}/{LOGIN_MAX_TRIES} 次 {last_reason}，重试...")
                 time.sleep(2)
@@ -429,6 +632,11 @@ def discuz_login(session: requests.Session, username: str, password: str,
         body = r2.text
         if "succeedhandle" in body or "succeedlocation" in body:
             return True, "登录成功"
+
+        if is_cf_challenge(r2):
+            # POST 同样会被质询：继续重试只会被拦，直接如实报出
+            return False, (f"登录接口被拦截（{CF_CHALLENGE_MARK}，HTTP {r2.status_code}）："
+                           f"出口 IP 被 Cloudflare 风控，与账号密码无关；稍后重试，或用 SXSY_PROXY=direct 强制直连")
 
         if is_site_error(r2):
             last_reason = f"登录接口返回错误页（HTTP {r2.status_code}）"
@@ -477,7 +685,7 @@ def do_signin(session: requests.Session, debug: bool = False) -> dict:
     """
     html, err = _get_sign_page(session, debug)
     if not html:
-        return {"state": "failed", "message": f"签到页请求失败（{err}）", "stats": ""}
+        return {"state": "failed", "message": f"签到页请求失败：{err}", "stats": ""}
 
     if 'id="JD_sign"' not in html:
         # 无签到按钮：区分「已签」与「Cookie 失效被踢回登录页」
@@ -500,7 +708,7 @@ def do_signin(session: requests.Session, debug: bool = False) -> dict:
         f"{SIGN_URL}&operation=qiandao&formhash={formhash}&format=text",
         headers=sign_headers, debug=debug, label="签到接口", tries=2)
     if r is None:
-        return {"state": "failed", "message": f"签到接口请求失败（{err}）", "stats": ""}
+        return {"state": "failed", "message": f"签到接口请求失败：{err}", "stats": ""}
 
     # 第一次返回：算术题（站点开启 mathverify 时）；部分站点关闭验证时直接返回结果
     q = re.search(r'var q="([^"]*)"', r.text)
@@ -524,7 +732,7 @@ def do_signin(session: requests.Session, debug: bool = False) -> dict:
         f"&mathverify_answer={quote(str(answer))}",
         headers=sign_headers, debug=debug, label="签到确认接口", tries=2)
     if r2 is None:
-        return {"state": "failed", "message": f"签到确认请求失败（{err}）", "stats": ""}
+        return {"state": "failed", "message": f"签到确认请求失败：{err}", "stats": ""}
 
     cdata = re.search(r"<!\[CDATA\[(.*?)\]\]>", r2.text, re.S)
     result_text = cdata.group(1).strip() if cdata else r2.text[:150]
@@ -576,8 +784,8 @@ def run_one_account(cred, proxy: str, timeout: int, debug: bool) -> dict:
                 print("    ⚠️ 缓存 Cookie 失效，重新登录")
                 session.cookies.clear()
             else:
-                # 站点瞬时故障无法判断登录态：保留缓存先试签到，避免白白丢会话
-                print("    ⚠️ 无法确认 Cookie 状态（站点临时故障），先按缓存继续")
+                # 站点瞬时故障或出口被 CF 质询、无法判断登录态：保留缓存先试签到，避免白白丢会话
+                print("    ⚠️ 无法确认 Cookie 状态（站点临时故障/出口被拦），先按缓存继续")
 
         # 2) 缓存缺失/失效 -> 账密登录
         if not session.cookies:
@@ -622,17 +830,20 @@ def main():
     notify_only_fail = env_bool("SXSY_NOTIFY_ONLY_FAIL", False)
     debug = env_bool("SXSY_DEBUG", False)
     timeout = env_int("SXSY_TIMEOUT", 30)
-    proxy, proxy_src = "", ""
-    for name in ("SXSY_PROXY", "HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"):
-        v = (os.getenv(name) or "").strip()
-        if v:
-            proxy, proxy_src = v, name
-            break
+    proxy, proxy_src = resolve_proxy()
 
     print("=" * 60)
     print(f"🚀 {title}  开始执行  {datetime.now():%Y-%m-%d %H:%M:%S}")
-    if proxy:
-        print(f"🌐 代理: {proxy} （来源: {proxy_src}）")
+    print(f"🌐 网络: {proxy if proxy else '直连'} （{proxy_src}）")
+
+    # 站点会换主域名，先确认本次用哪个，再进入账号流程
+    probe_session = build_session(proxy, timeout)
+    base, base_note = resolve_base(probe_session, debug)
+    if base:
+        apply_base(base)
+        print(f"🌐 站点域名: {BASE}（{base_note}）")
+    else:
+        print(f"⚠️ 未确认可用域名，按默认 {BASE} 继续（{base_note}）")
     print("=" * 60)
 
     env_value = os.getenv("SXSY_ACCOUNTS", "").strip()
