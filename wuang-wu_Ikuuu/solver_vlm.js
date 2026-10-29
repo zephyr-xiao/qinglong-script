@@ -19,7 +19,11 @@
  *   IKUUU_VLM_TIMEOUT   单次请求超时秒数，默认 120
  *   IKUUU_VLM_VOTES     投票次数，默认 2（1 = 不投票）
  *   IKUUU_VLM_ZOOM      合成图放大倍数，默认 3
- *   IKUUU_VLM_MAX_TOKENS 单次回复上限，默认 50000
+ *   IKUUU_VLM_MAX_TOKENS 单次回复上限，默认 4000
+ *                        （多数网关把"输出预留"计入每分钟 token 额度，给太大会自我限流，
+ *                          见 README「点选验证码与解法器」；推理模型需要时再调大）
+ *   IKUUU_VLM_429_BACKOFF 撞限流（HTTP 429）后的退避秒数，逗号分隔，默认 20,60
+ *                        （上游 TPM/RPM 是每分钟滚动窗口，等过一个窗口再试才有效）
  *   IKUUU_VLM_DEBUG     1 = 把合成图与模型原始回复写到本目录 _vlm_debug/
  *   IKUUU_CHROMIUM_PATH 可选，Chromium 可执行文件路径；留空时自动探测持久目录
  *                       与 Playwright 默认缓存（见 chromium_path.js）
@@ -208,11 +212,62 @@ async function composeImage({ type, imagePath, tplPaths, imageSize }) {
   }
 }
 
-// token 上限：默认 50000（新 API 类网关上限 65536，实测 50000 可用、100000 被拒）
+// token 上限：默认 4000（网关硬上限一般 65536，实测 50000 可用、100000 被拒）
+// 默认值不能给太大：多数网关把 max_tokens 当作"输出预留"计入每分钟 token 额度，
+// 预留 5 万等于每发一个请求就把自己的限流窗口占满（2026-10-29 实测：同一提示词下
+// max_tokens=2000/4000 正常、8000/50000 立刻 429）。答案为几十 token 的 JSON，4000 足够；
+// 推理模型确实需要更多时再显式调大。
 // 截断重试会按 factor 放大，但**必须夹在上限内**，否则请求直接被判非法
 const MAX_TOKENS_CEILING = 60000;
 function computeMaxTokens(baseTokens, factor = 1) {
   return Math.min(Math.max(1000, baseTokens) * Math.max(1, factor), MAX_TOKENS_CEILING);
+}
+
+// ==========================================
+// 限流（HTTP 429）退避
+// 上游把"每分钟 token / 请求数"做成滚动窗口，撞满后一两秒就返回 429
+// （如"inference exceeds tpm/rpm limit"），但窗口要整整一分钟才滑过去——
+// 4s/12s 这种短退避必然还在窗口内，重试等于白撞。故 429 单独用长退避。
+// ==========================================
+const DEFAULT_429_BACKOFF_SEC = [20, 60];
+
+// 429 退避表（秒），默认 [20, 60]；IKUUU_VLM_429_BACKOFF 可覆盖（逗号分隔，如 "10,30"）。
+// 每次调用现取环境变量：便于单测注入极小值，也避免模块加载顺序把配置固化。
+function rateLimitBackoffSec(env = process.env) {
+  const raw = env.IKUUU_VLM_429_BACKOFF;
+  const s = raw === undefined || raw === null ? '' : String(raw).trim();
+  if (!s) return DEFAULT_429_BACKOFF_SEC;
+  const list = s.split(',')
+    .map((x) => Number(x.trim()))
+    .filter((n) => Number.isFinite(n) && n >= 0);
+  return list.length ? list : DEFAULT_429_BACKOFF_SEC;
+}
+
+// Retry-After 可能是秒数或 HTTP 日期；夹在 [5, 90] 秒，既不会被异常值拖死，也不会几乎不等待
+const RETRY_AFTER_MIN_MS = 5000;
+const RETRY_AFTER_MAX_MS = 90000;
+function parseRetryAfter(raw) {
+  const s = raw === undefined || raw === null ? '' : String(raw).trim();
+  if (!s) return null;
+  let ms = null;
+  const sec = Number(s);
+  if (Number.isFinite(sec)) {
+    ms = sec * 1000;
+  } else {
+    const when = Date.parse(s);
+    if (Number.isFinite(when)) ms = when - Date.now();
+  }
+  if (ms === null || !Number.isFinite(ms)) return null;
+  return Math.min(RETRY_AFTER_MAX_MS, Math.max(RETRY_AFTER_MIN_MS, ms));
+}
+
+// 本次 429 该等多久（毫秒）；返回 null 表示退避次数已用完、不再重试。
+// 非 429 一律返回 null——5xx 与网络异常走另一条短退避，两边互不挤占次数。
+function rateLimitWaitMs(status, retryAfterMs, triedCount, backoffSec) {
+  if (status !== 429) return null;
+  if (Number.isFinite(retryAfterMs)) return retryAfterMs;
+  if (triedCount >= backoffSec.length) return null;
+  return backoffSec[triedCount] * 1000;
 }
 
 // 解析模型响应（纯函数，便于单测）：
@@ -238,11 +293,12 @@ function parseModelReply(data) {
   return { ok: true, data: parsed, finish };
 }
 
-// 调单个模型一次（失败抛异常）；网关有限速（429 tpm/rpm），内部退避重试
+// 调单个模型一次（失败抛异常）
+// 429 限流按 rateLimitBackoffSec() 的长退避等过窗口再试；5xx/网络异常走 4s、12s 的短退避。
 // tokenFactor：token 上限倍数（思考被截断时上层会按双倍重试一次）
 // hardPrompt：附加在提示词末尾的强制指令（截断重试时用）
 async function callModelOnce(model, imageBuffer, prompt, attempt = 1, tokenFactor = 1, hardPrompt = '') {
-  const baseTokens = safeNum(process.env.IKUUU_VLM_MAX_TOKENS, 50000, 1000);
+  const baseTokens = safeNum(process.env.IKUUU_VLM_MAX_TOKENS, 4000, 1000);
   const body = {
     model,
     temperature: 0,
@@ -256,8 +312,14 @@ async function callModelOnce(model, imageBuffer, prompt, attempt = 1, tokenFacto
       ],
     }],
   };
+  // 两类重试各记各的次数：429 撞的是上游分钟窗口，5xx/网络异常是另一回事，
+  // 混用一个计数器会让"限流等了两次"把网络抖动的重试机会也吃光
+  const backoffSec = rateLimitBackoffSec();
+  const NETWORK_BACKOFF_MS = [4000, 12000];
+  let rateLimitTries = 0;
+  let networkTries = 0;
   let lastErr = null;
-  for (let i = 0; i < 3; i++) {
+  for (;;) {
     try {
       const resp = await fetch(`${BASE_URL}/chat/completions`, {
         method: 'POST',
@@ -275,14 +337,27 @@ async function callModelOnce(model, imageBuffer, prompt, attempt = 1, tokenFacto
         const err = new Error(msg);
         // "模型不存在/无可用渠道"这类问题在本模型上重试无用（跳过退避，直接交给上层换模型）；
         // 400 属于请求非法（配置错），同样不重试
+        err.status = resp.status;
         err.modelLevel = resp.status === 400 || MODEL_ERROR_HINT.some((h) => text.includes(h));
-        // 限速/网关繁忙才在同一模型上退避重试
-        if ((resp.status === 429 || resp.status >= 500) && !err.modelLevel) {
-          lastErr = err;
-          const wait = [4000, 12000][i];
-          if (wait) {
-            log(`模型 ${model} 第 ${i + 1} 次请求失败（${resp.status}），${wait / 1000}s 后重试`);
+        if (!err.modelLevel) {
+          // 限流：等过一个分钟窗口再试，比短退避有效得多
+          const wait = rateLimitWaitMs(resp.status, parseRetryAfter(resp.headers.get('retry-after')),
+            rateLimitTries, backoffSec);
+          if (wait !== null) {
+            rateLimitTries += 1;
+            lastErr = err;
+            log(`模型 ${model} 被限流（HTTP ${resp.status}），${Math.round(wait / 1000)}s 后重试`
+              + `（第 ${rateLimitTries}/${backoffSec.length} 次）`);
             await sleep(wait);
+            continue;
+          }
+          // 网关 5xx / 繁忙：短退避重试
+          if (resp.status >= 500 && networkTries < NETWORK_BACKOFF_MS.length) {
+            lastErr = err;
+            const waitMs = NETWORK_BACKOFF_MS[networkTries];
+            networkTries += 1;
+            log(`模型 ${model} 网关异常（HTTP ${resp.status}），${waitMs / 1000}s 后重试`);
+            await sleep(waitMs);
             continue;
           }
         }
@@ -316,11 +391,14 @@ async function callModelOnce(model, imageBuffer, prompt, attempt = 1, tokenFacto
       throw err;
     } catch (e) {
       lastErr = e;
-      // 模型级故障不重试（已标记），直接抛给上层换模型
-      if (i < 2 && !e.modelLevel && /429|HTTP 5\d\d|fetch failed|timeout|aborted/i.test(String(e.message))) {
-        const wait = [4000, 12000][i];
-        log(`请求异常（${String(e.message).substring(0, 60)}），${wait / 1000}s 后重试`);
-        await sleep(wait);
+      // 带 status 的响应级错误已在上面的分支里按状态码处理过，这里只兜网络层异常；
+      // 模型级故障（err.modelLevel）不重试，直接抛给上层换模型
+      if (!e.modelLevel && !e.status && networkTries < NETWORK_BACKOFF_MS.length
+        && /fetch failed|timeout|aborted|ECONN|ENOTFOUND|socket hang up/i.test(String(e.message))) {
+        const waitMs = NETWORK_BACKOFF_MS[networkTries];
+        networkTries += 1;
+        log(`请求异常（${String(e.message).substring(0, 60)}），${waitMs / 1000}s 后重试`);
+        await sleep(waitMs);
         continue;
       }
       throw e;
@@ -577,4 +655,9 @@ module.exports = {
   // 投票与坐标过滤：决定"要不要把坐标交给服务端"的两道闸门
   vote,
   pickClicks,
+  // 限流退避：429 的等待策略（纯函数 + 单次调用，便于单测注入）
+  rateLimitBackoffSec,
+  parseRetryAfter,
+  rateLimitWaitMs,
+  callModelOnce,
 };

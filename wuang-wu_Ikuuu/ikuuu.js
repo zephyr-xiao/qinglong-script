@@ -89,7 +89,7 @@ const RETRY_DELAY_MS = safeNum(process.env.IKUUU_RETRY_DELAY, 300, 10) * 1000;
 // 解法器超时（秒）：显式配置优先；未配置时按内置视觉解法器的最坏耗时推导。
 // 固定 180s 会与解法器自身预算脱节——解法器默认 2 票、单次请求超时 120s，
 // 一票撞超时后重试成功、再跑第二票就要 200s 以上，主流程先放弃，算出来的坐标被丢弃。
-// 推导口径：每票 = 单次请求超时 + 一次退避等待；多模型兜底会让最坏耗时再乘模型数。
+// 推导口径：每票 = 单次请求超时 + 一次短退避 + 429 限流退避预算；多模型兜底再乘模型数。
 // 结果夹在 [180, 600] 秒：下限保持轻量解法器的原有行为，上限避免整轮登录被拖太久。
 function deriveSolverTimeoutSec(env = process.env) {
   const raw = env.IKUUU_SOLVER_TIMEOUT;
@@ -101,12 +101,27 @@ function deriveSolverTimeoutSec(env = process.env) {
     String(env.IKUUU_VLM_MODEL || '').split(',').map((s) => s.trim()).filter(Boolean).length || 1));
   const RETRY_WAIT_SEC = 4; // solver_vlm.js 首次超时后的退避（[4000, 12000] 的第一档）
   const STARTUP_MARGIN_SEC = 30; // 进程启动 + 挑战图合成
-  const budget = votes * (vlmTimeout + RETRY_WAIT_SEC) * models + STARTUP_MARGIN_SEC;
+  const budget = votes * (vlmTimeout + RETRY_WAIT_SEC + rateLimitBudgetSec(env)) * models + STARTUP_MARGIN_SEC;
   return Math.min(600, Math.max(180, Math.ceil(budget / 30) * 30));
+}
+
+// 429 限流退避的总预算（秒），必须与 solver_vlm.js 的 rateLimitBackoffSec() 同口径：
+// 解法器在窗口里干等时不产出任何日志，主流程若按旧的 4s 预算算超时，会把正在等待的解法器杀掉。
+function rateLimitBudgetSec(env = process.env) {
+  const raw = env.IKUUU_VLM_429_BACKOFF;
+  const s = raw === undefined || raw === null ? '' : String(raw).trim();
+  const list = s
+    ? s.split(',').map((x) => Number(x.trim())).filter((n) => Number.isFinite(n) && n >= 0)
+    : [];
+  const backoff = list.length ? list : [20, 60];
+  return backoff.reduce((sum, n) => sum + n, 0);
 }
 const SOLVER_TIMEOUT_MS = deriveSolverTimeoutSec() * 1000;
 // 点选挑战最多整页重来几次（每次刷新会重新抽取验证形式）
 const MAX_CAPTCHA_ROUNDS = safeNum(process.env.IKUUU_CAPTCHA_ROUNDS, 6, 1);
+// 验证码阶段总时长预算（秒）：解法器撞限流时单轮可能要等一分半，抽满 6 轮会拖到十几分钟。
+// 超预算就不再重抽，把当前失败原因如实报出去。正常一轮就过，这里只兜异常情况。
+const CAPTCHA_BUDGET_MS = safeNum(process.env.IKUUU_CAPTCHA_BUDGET, 600, 60) * 1000;
 
 // 登录会话 Cookie 缓存：脚本目录 .token/（.gitignore 已覆盖），按账号邮箱隔离
 // ikuuu 会话有效期 24h（expire_in），留 30 分钟余量；cron 每天一次时约每天重登一次
@@ -645,7 +660,9 @@ async function solveChallenge(challenge, type, loginHost) {
       }
       break;
     }
-    return { ok: false, msg: last.msg, unavailable: last.unavailable === true || solverUnavailable(last.msg) };
+    // 交给主流程的"要不要停止重抽"标记只认配置/认证类故障：
+    // 限流与超时是瞬时的，换一次抽取就可能成功，不该一次就结束整轮登录
+    return { ok: false, msg: last.msg, unavailable: last.unavailable === true || solverFatal(last.msg) };
   } catch (e) {
     return { ok: false, msg: `准备挑战图片失败: ${e.message}`, unavailable: solverUnavailable(e.message) };
   } finally {
@@ -654,10 +671,19 @@ async function solveChallenge(challenge, type, loginHost) {
 }
 
 // 解法器失败信息分类（纯函数，便于单测）：
-//   true  = 解法器本身不可用（未配 key / 网关不通 / 认证失败 / 超时）→ 换题重抽没意义
-//   false = 内容类失败（投票分歧、思考被截断、输出无法解析）→ 值得换个抽取再试
+//   true  = 解法器这一路走不通（认证失败 / 网关报错 / 超时 / 限流）→ 换备用解法器还有救
+//   false = 内容类失败（投票分歧、思考被截断、输出无法解析）→ 换解法器没用，让主流程换题
 function solverUnavailable(msg) {
   return /未配置|无法启动|超时|fetch failed|abort|ECONN|ENOTFOUND|HTTP (400|401|403|404|429|5\d\d)/i.test(msg || '');
+}
+
+// 解法器"配置/认证类"故障（纯函数，便于单测）：
+//   true  = 换题重抽一定还是同样的错（没配 key、模型名不存在、令牌失效、命令路径写错）→ 直接结束本轮
+//   false = 可能是上游瞬时问题（429 限流、5xx、超时）→ 换一次抽取或等一会儿就能过
+// 429 必须落在这里的 false 侧：上游 TPM/RPM 是每分钟滚动窗口，撞满后一分钟内自愈，
+// 把它当"永久不可用"会让一次限流就作废掉全部抽取机会。
+function solverFatal(msg) {
+  return /未配置|无法启动|Cannot find module|MODULE_NOT_FOUND|command not found|No such file or directory|HTTP (400|401|403|404)/i.test(msg || '');
 }
 
 // 解法器原始输出 → 针对常见配置错误的提示（纯函数，便于单测）
@@ -861,8 +887,14 @@ async function browserLogin({ host, email, password }) {
     //   · 点选类（word/icon/nine）：需要外部解法器给坐标，没有解法器就直接失败并说明形式。
     let captchaReady = false;
     let failMsg = null;
+    const captchaStartMs = Date.now();
     for (let round = 1; round <= MAX_CAPTCHA_ROUNDS && !captchaReady; round++) {
       if (round > 1) {
+        if (Date.now() - captchaStartMs > CAPTCHA_BUDGET_MS) {
+          console.log(`  ⏳ 验证码已处理 ${Math.round((Date.now() - captchaStartMs) / 1000)}s，`
+            + `超出预算 ${CAPTCHA_BUDGET_MS / 1000}s，停止重抽`);
+          break;
+        }
         captchaType = null;
         await page.reload({ waitUntil: 'domcontentloaded' });
         await page.waitForTimeout(2500);
@@ -916,12 +948,16 @@ async function browserLogin({ host, email, password }) {
       if (!solved.ok) {
         failMsg = `解法器未解决验证码: ${solved.msg}`;
         console.log(`  ⚠️ ${failMsg}`);
-        // 解法器链整体不可用（没配 key / 网关不通 / 认证失败 / 超时）时换题重抽没有意义，
-        // 只会把整轮任务空转几百秒 —— 直接失败并如实报出原因
+        // 配置/认证类故障（没配 key、模型名不存在、令牌失效、命令路径写错）换题重抽没有意义，
+        // 只会把整轮任务空转几百秒 —— 直接失败并如实报出原因。
+        // 限流与超时不在此列：它们会自愈，换一次抽取比原地放弃更有机会过
         if (solved.unavailable) {
           console.log('  ⛔ 解法器不可用（非题目本身问题），停止重抽');
           break;
         }
+        // 走到这里说明不是配置类故障：可能是限流/超时（会自愈），也可能是投票分歧/解错（换题才好），
+        // 两种都值得再抽一次
+        console.log(`  ↻ 换一次抽取再试（第 ${round}/${MAX_CAPTCHA_ROUNDS} 次）`);
         continue;
       }
       captchaReady = await submitClicks(page, challenge, solved.clicks, solved.size);
@@ -1563,6 +1599,7 @@ module.exports = {
   extractSolverJson,
   normalizeClicks,
   solverUnavailable,
+  solverFatal,
   isRetryableStatus,
   solverOutputHint,
   firstErrorLine,
@@ -1587,6 +1624,7 @@ module.exports = {
   FALLBACK_HOSTS,
   safeNum,
   deriveSolverTimeoutSec,
+  rateLimitBudgetSec,
   killProcessTree,
   runSolver,
   pickLoginHost,
