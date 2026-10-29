@@ -19,6 +19,7 @@ const {
   extractSolverJson,
   normalizeClicks,
   solverUnavailable,
+  solverFatal,
   isRetryableStatus,
   solverOutputHint,
   firstErrorLine,
@@ -43,6 +44,7 @@ const {
   FALLBACK_HOSTS,
   safeNum,
   deriveSolverTimeoutSec,
+  rateLimitBudgetSec,
   killProcessTree,
   runSolver,
   pickLoginHost,
@@ -52,7 +54,10 @@ const {
   main,
 } = require('./ikuuu');
 // 视觉解法器的纯函数（脚本被 require 时不会跑主流程）
-const { parseModelReply, wantedCount, buildPrompt, computeMaxTokens, vote, pickClicks } = require('./solver_vlm');
+const {
+  parseModelReply, wantedCount, buildPrompt, computeMaxTokens, vote, pickClicks,
+  rateLimitBackoffSec, parseRetryAfter, rateLimitWaitMs, callModelOnce,
+} = require('./solver_vlm');
 
 // 模拟发布页：域名被拆成多段字符串字面量后拼接（取自 ikuuu.win 真实页面结构）
 const OBFUSCATED_PAGE = [
@@ -402,7 +407,7 @@ test('normalizeClicks: 过滤非法坐标，越界点位丢弃', () => {
   assert.deepStrictEqual(normalizeClicks([], size), []);
 });
 
-test('solverUnavailable: 区分"解法器不可用"与"内容类失败"', () => {  // 不可用：重抽没意义，应当直接失败
+test('solverUnavailable: 区分"这一路解法器走不通"与"内容类失败"', () => {  // 走不通：值得换备用解法器
   assert.strictEqual(solverUnavailable('视觉模型解法失败: HTTP 401: {"error":{"message":"无效的令牌"}}'), true);
   assert.strictEqual(solverUnavailable('视觉模型解法失败: HTTP 429: inference exceeds tpm/rpm limit'), true);
   assert.strictEqual(solverUnavailable('视觉模型解法失败: HTTP 400: field MaxTokens invalid, should be in [1, 65536]'), true);
@@ -411,13 +416,32 @@ test('solverUnavailable: 区分"解法器不可用"与"内容类失败"', () => 
   assert.strictEqual(solverUnavailable('解法器无法启动: spawn node ENOENT'), true);
   assert.strictEqual(solverUnavailable('解法器超时（180s）'), true);
   assert.strictEqual(solverUnavailable('视觉模型解法失败: fetch failed'), true);
-  // 内容类：值得换个抽取再试
+  // 内容类：换解法器没用，让主流程换题
   assert.strictEqual(solverUnavailable('视觉模型解法失败: 模型无正文输出（finish_reason=length，可能 token 不足）'), false);
   assert.strictEqual(solverUnavailable('各次调用结果分歧过大（最大偏差 40px）'), false);
   assert.strictEqual(solverUnavailable('各次调用给出的点数不一致（1/3）'), false);
   assert.strictEqual(solverUnavailable('模型输出无法解析为 JSON: ```json {"clicks": [[1,2]]```'), false);
   assert.strictEqual(solverUnavailable(''), false);
   assert.strictEqual(solverUnavailable(undefined), false);
+});
+
+test('solverFatal: 只有"换题也没用"的配置类故障才终止整轮重抽', () => {
+  // 配置 / 认证 / 路径：重抽一定还是同样的错
+  assert.strictEqual(solverFatal('未配置 IKUUU_VLM_API_KEY'), true);
+  assert.strictEqual(solverFatal('解法器无法启动: spawn node ENOENT'), true);
+  assert.strictEqual(solverFatal('解法器输出无法解析（exit=1）: Error: Cannot find module \'/x/solver_vlm.js\''), true);
+  assert.strictEqual(solverFatal('视觉模型解法失败: HTTP 401: {"error":{"message":"无效的令牌"}}'), true);
+  assert.strictEqual(solverFatal('视觉模型解法失败: HTTP 403: forbidden'), true);
+  assert.strictEqual(solverFatal('视觉模型解法失败: HTTP 400: field MaxTokens invalid'), true);
+  // 限流 / 5xx / 超时：上游一分钟内自愈，换一次抽取就可能过，不能作废全部抽取机会
+  assert.strictEqual(solverFatal('视觉模型解法失败: HTTP 429: {"error":{"message":"inference exceeds tpm/rpm limit"}}'), false);
+  assert.strictEqual(solverFatal('视觉模型解法失败: HTTP 503: upstream unavailable'), false);
+  assert.strictEqual(solverFatal('解法器超时（450s）'), false);
+  assert.strictEqual(solverFatal('视觉模型解法失败: fetch failed'), false);
+  // 内容类失败同样不该终止整轮
+  assert.strictEqual(solverFatal('各次调用结果分歧过大（最大偏差 40px）'), false);
+  assert.strictEqual(solverFatal(''), false);
+  assert.strictEqual(solverFatal(undefined), false);
 });
 
 test('isRetryableStatus: 只重试"可能过一会儿就好"的失败', () => {
@@ -479,6 +503,154 @@ test('computeMaxTokens: token 上限按倍数放大但夹在网关上限内', ()
   assert.strictEqual(computeMaxTokens(12000, 0), 12000);   // 倍数不低于 1
 });
 
+test('rateLimitBackoffSec: 429 退避表默认 20/60 秒，可用环境变量覆盖', () => {
+  assert.deepStrictEqual(rateLimitBackoffSec({}), [20, 60]);
+  assert.deepStrictEqual(rateLimitBackoffSec({ IKUUU_VLM_429_BACKOFF: '10,30' }), [10, 30]);
+  assert.deepStrictEqual(rateLimitBackoffSec({ IKUUU_VLM_429_BACKOFF: ' 5 ' }), [5]);
+  assert.deepStrictEqual(rateLimitBackoffSec({ IKUUU_VLM_429_BACKOFF: '0' }), [0]);   // 允许立即重试（单测用）
+  assert.deepStrictEqual(rateLimitBackoffSec({ IKUUU_VLM_429_BACKOFF: '' }), [20, 60]);     // 空白回落默认
+  assert.deepStrictEqual(rateLimitBackoffSec({ IKUUU_VLM_429_BACKOFF: 'abc' }), [20, 60]);  // 非法值回落默认
+  assert.deepStrictEqual(rateLimitBackoffSec({ IKUUU_VLM_429_BACKOFF: '-5' }), [20, 60]);   // 负数非法
+});
+
+test('parseRetryAfter: 秒数与 HTTP 日期都认，并夹在 [5s, 90s]', () => {
+  assert.strictEqual(parseRetryAfter('30'), 30000);
+  assert.strictEqual(parseRetryAfter(' 2 '), 5000);      // 太短没意义，抬到 5s
+  assert.strictEqual(parseRetryAfter('600'), 90000);     // 太长会拖死任务，压到 90s
+  const inTen = new Date(Date.now() + 10000).toUTCString();
+  const ms = parseRetryAfter(inTen);
+  assert.ok(ms >= 5000 && ms <= 11000, `HTTP 日期应换算成约 10s，实际 ${ms}`);
+  assert.strictEqual(parseRetryAfter(''), null);
+  assert.strictEqual(parseRetryAfter(null), null);
+  assert.strictEqual(parseRetryAfter('not-a-date'), null);
+});
+
+test('rateLimitWaitMs: 只对 429 生效，Retry-After 优先，退避用尽返回 null', () => {
+  const backoff = [20, 60];
+  assert.strictEqual(rateLimitWaitMs(429, null, 0, backoff), 20000);
+  assert.strictEqual(rateLimitWaitMs(429, null, 1, backoff), 60000);
+  assert.strictEqual(rateLimitWaitMs(429, null, 2, backoff), null);        // 两档用完 → 放弃
+  assert.strictEqual(rateLimitWaitMs(429, 7000, 0, backoff), 7000);        // 服务端给了就听它的
+  assert.strictEqual(rateLimitWaitMs(429, 7000, 9, backoff), 7000);        // Retry-After 不受次数限制
+  assert.strictEqual(rateLimitWaitMs(503, null, 0, backoff), null);        // 5xx 走短退避，不在此处
+  assert.strictEqual(rateLimitWaitMs(400, null, 0, backoff), null);
+});
+
+test('callModelOnce: 默认 max_tokens 为 4000（输出预留计入 TPM，给大了会自我限流）', async () => {
+  const realFetch = global.fetch;
+  const realMax = process.env.IKUUU_VLM_MAX_TOKENS;
+  delete process.env.IKUUU_VLM_MAX_TOKENS;
+  let sent = null;
+  global.fetch = async (url, opts) => {
+    sent = JSON.parse(opts.body);
+    return {
+      ok: true,
+      status: 200,
+      headers: new Map(),
+      text: async () => JSON.stringify({ choices: [{ message: { content: '{"clicks":[[1,2]]}' }, finish_reason: 'stop' }] }),
+    };
+  };
+  try {
+    await callModelOnce('m', Buffer.from('fake'), 'p');
+    // 2026-10-29 实测：同一提示词下 max_tokens=2000/4000 正常，8000/50000 立刻 429
+    assert.strictEqual(sent.max_tokens, 4000);
+  } finally {
+    global.fetch = realFetch;
+    if (realMax === undefined) delete process.env.IKUUU_VLM_MAX_TOKENS;
+    else process.env.IKUUU_VLM_MAX_TOKENS = realMax;
+  }
+});
+
+test('callModelOnce: 429 按退避表重试，第二次成功即返回（2026-10-29 限流事故回归）', async () => {
+  const realFetch = global.fetch;
+  const realBackoff = process.env.IKUUU_VLM_429_BACKOFF;
+  process.env.IKUUU_VLM_429_BACKOFF = '0,0';   // 单测不等真窗口
+  let calls = 0;
+  global.fetch = async () => {
+    calls += 1;
+    if (calls === 1) {
+      return {
+        ok: false,
+        status: 429,
+        headers: new Map(),
+        text: async () => '{"error":{"message":"inference exceeds tpm/rpm limit","type":"rate_limit_error"}}',
+      };
+    }
+    return {
+      ok: true,
+      status: 200,
+      headers: new Map(),
+      text: async () => JSON.stringify({ choices: [{ message: { content: '{"clicks":[[10,20]]}' }, finish_reason: 'stop' }] }),
+    };
+  };
+  try {
+    const data = await callModelOnce('m', Buffer.from('fake'), 'p');
+    assert.deepStrictEqual(data, { clicks: [[10, 20]] });
+    assert.strictEqual(calls, 2);
+  } finally {
+    global.fetch = realFetch;
+    if (realBackoff === undefined) delete process.env.IKUUU_VLM_429_BACKOFF;
+    else process.env.IKUUU_VLM_429_BACKOFF = realBackoff;
+  }
+});
+
+test('callModelOnce: 429 退避用尽后抛出（不无限重试）', async () => {
+  const realFetch = global.fetch;
+  const realBackoff = process.env.IKUUU_VLM_429_BACKOFF;
+  process.env.IKUUU_VLM_429_BACKOFF = '0';
+  let calls = 0;
+  global.fetch = async () => {
+    calls += 1;
+    return {
+      ok: false,
+      status: 429,
+      headers: new Map(),
+      text: async () => '{"error":{"message":"inference exceeds tpm/rpm limit"}}',
+    };
+  };
+  try {
+    await assert.rejects(() => callModelOnce('m', Buffer.from('fake'), 'p'), /HTTP 429/);
+    assert.strictEqual(calls, 2);   // 首次 + 一档退避
+  } finally {
+    global.fetch = realFetch;
+    if (realBackoff === undefined) delete process.env.IKUUU_VLM_429_BACKOFF;
+    else process.env.IKUUU_VLM_429_BACKOFF = realBackoff;
+  }
+});
+
+test('callModelOnce: 5xx 与 429 各走各的退避，不互相挤占次数', async () => {
+  const realFetch = global.fetch;
+  const realBackoff = process.env.IKUUU_VLM_429_BACKOFF;
+  process.env.IKUUU_VLM_429_BACKOFF = '0';
+  let calls = 0;
+  global.fetch = async () => {
+    calls += 1;
+    if (calls === 1) {
+      return { ok: false, status: 502, headers: new Map(), text: async () => 'bad gateway' };
+    }
+    if (calls === 2) {
+      return {
+        ok: false, status: 429, headers: new Map(), text: async () => '{"error":{"message":"tpm/rpm limit"}}',
+      };
+    }
+    return {
+      ok: true,
+      status: 200,
+      headers: new Map(),
+      text: async () => JSON.stringify({ choices: [{ message: { content: '{"clicks":[[1,2]]}' }, finish_reason: 'stop' }] }),
+    };
+  };
+  try {
+    const data = await callModelOnce('m', Buffer.from('fake'), 'p');
+    assert.deepStrictEqual(data, { clicks: [[1, 2]] });
+    assert.strictEqual(calls, 3);
+  } finally {
+    global.fetch = realFetch;
+    if (realBackoff === undefined) delete process.env.IKUUU_VLM_429_BACKOFF;
+    else process.env.IKUUU_VLM_429_BACKOFF = realBackoff;
+  }
+});
+
 test('wantedCount: 从提示语里取"要选几个"', () => {
   assert.strictEqual(wantedCount('选 3 个符合右图的图片'), 3);
   assert.strictEqual(wantedCount('请选出2个相同的'), 2);
@@ -535,21 +707,34 @@ test('safeNum: 数值环境变量非法值回落默认值', () => {
   assert.strictEqual(safeNum(' 42 ', 0), 42);               // 带空白
 });
 
+test('rateLimitBudgetSec: 429 退避预算与解法器同口径', () => {
+  assert.strictEqual(rateLimitBudgetSec({}), 80);                             // 默认 20 + 60
+  assert.strictEqual(rateLimitBudgetSec({ IKUUU_VLM_429_BACKOFF: '10,30' }), 40);
+  assert.strictEqual(rateLimitBudgetSec({ IKUUU_VLM_429_BACKOFF: ' 15 ' }), 15);
+  assert.strictEqual(rateLimitBudgetSec({ IKUUU_VLM_429_BACKOFF: '' }), 80);   // 空白回落默认
+  assert.strictEqual(rateLimitBudgetSec({ IKUUU_VLM_429_BACKOFF: 'abc' }), 80); // 非法值回落默认
+});
+
 test('deriveSolverTimeoutSec: 超时预算与解法器自身耗时对齐', () => {
   // 显式配置优先（打码平台可自行收紧/放宽）
   assert.strictEqual(deriveSolverTimeoutSec({ IKUUU_SOLVER_TIMEOUT: '90' }), 90);
-  // 默认视觉解法器：2 票 × (120 + 4s 退避) + 30s 启动余量 = 278 → 向上取整到 300
-  assert.strictEqual(deriveSolverTimeoutSec({}), 300);
-  // 单票 + 短超时：1×(60+4)+30 = 94 → 保持 180 下限
+  // 默认视觉解法器：2 票 × (120 + 4s 短退避 + 80s 限流退避) + 30s 启动余量 = 438 → 450
+  // 429 那 80s 必须算进来：解法器在窗口里干等时不打日志，主流程先超时就会把它杀掉
+  assert.strictEqual(deriveSolverTimeoutSec({}), 450);
+  // 单票 + 短超时：1×(60+4+80)+30 = 174 → 保持 180 下限
   assert.strictEqual(deriveSolverTimeoutSec({ IKUUU_VLM_TIMEOUT: '60', IKUUU_VLM_VOTES: '1' }), 180);
-  // 双模型兜底：2×124×2+30 = 526 → 540
-  assert.strictEqual(deriveSolverTimeoutSec({ IKUUU_VLM_MODEL: 'm1,m2' }), 540);
+  // 双模型兜底：2×204×2+30 = 846 → 撞上限 600
+  assert.strictEqual(deriveSolverTimeoutSec({ IKUUU_VLM_MODEL: 'm1,m2' }), 600);
+  // 自定限流退避也参与推导：1×(60+4+10)+30 = 104 → 180 下限
+  assert.strictEqual(deriveSolverTimeoutSec({
+    IKUUU_VLM_TIMEOUT: '60', IKUUU_VLM_VOTES: '1', IKUUU_VLM_429_BACKOFF: '10',
+  }), 180);
   // 极端配置撞上限 600
   assert.strictEqual(deriveSolverTimeoutSec({ IKUUU_VLM_TIMEOUT: '300', IKUUU_VLM_VOTES: '5', IKUUU_VLM_MODEL: 'a,b,c' }), 600);
   // 非法值回落默认
-  assert.strictEqual(deriveSolverTimeoutSec({ IKUUU_VLM_TIMEOUT: 'abc' }), 300);
+  assert.strictEqual(deriveSolverTimeoutSec({ IKUUU_VLM_TIMEOUT: 'abc' }), 450);
   // 空白串等同于未配置
-  assert.strictEqual(deriveSolverTimeoutSec({ IKUUU_SOLVER_TIMEOUT: '  ' }), 300);
+  assert.strictEqual(deriveSolverTimeoutSec({ IKUUU_SOLVER_TIMEOUT: '  ' }), 450);
 });
 
 test('killProcessTree: 超时后真正结束子进程（含 shell 包装）', async () => {
