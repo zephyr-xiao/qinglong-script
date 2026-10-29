@@ -1,0 +1,79 @@
+{
+  "fetched_at": "2026-10-29T06:52:16+00:00",
+  "repo": "zephyr-xiao/qinglong-script",
+  "views_14d": {
+    "count": 82,
+    "uniques": 35
+  },
+  "clones_14d": {
+    "count": 162,
+    "uniques": 76
+  },
+  "stars": 4,
+  "forks": 2,
+  "watchers": 0,
+  "referrers": [
+    {
+      "referrer": "github.com",
+      "views": 25,
+      "uniques": 22
+    },
+    {
+      "referrer": "Bing",
+      "views": 5,
+      "uniques": 4
+    }
+  ],
+  "popular_paths": [
+    {
+      "path": "/zephyr-xiao/qinglong-script",
+      "views": 27,
+      "uniques": 24
+    },
+    {
+      "path": "/zephyr-xiao/qinglong-script/blob/main/xsijishe_checkin/README.md",
+      "views": 7,
+      "uniques": 3
+    },
+    {
+      "path": "/zephyr-xiao/qinglong-script/blob/main/sxsy45_checkin/README.md",
+      "views": 4,
+      "uniques": 2
+    },
+    {
+      "path": "/zephyr-xiao/qinglong-script/tree/main/jlc_checkin",
+      "views": 4,
+      "uniques": 2
+    },
+    {
+      "path": "/zephyr-xiao/qinglong-script/tree/main",
+      "views": 3,
+      "uniques": 3
+    },
+    {
+      "path": "/zephyr-xiao/qinglong-script/blob/main/vikacg_checkin/README.md",
+      "views": 3,
+      "uniques": 2
+    },
+    {
+      "path": "/zephyr-xiao/qinglong-script/blob/main/Rainyun/README.md",
+      "views": 2,
+      "uniques": 2
+    },
+    {
+      "path": "/zephyr-xiao/qinglong-script/blob/main/xhcyv_checkin/README.md",
+      "views": 2,
+      "uniques": 2
+    },
+    {
+      "path": "/zephyr-xiao/qinglong-script/tree/main/stats",
+      "views": 2,
+      "uniques": 2
+    },
+    {
+      "path": "/zephyr-xiao/qinglong-script/blob/main/Cloud189Checkin/README.md",
+      "views": 2,
+      "uniques": 1
+    }
+  ]
+}
