@@ -1,5 +1,7 @@
 # -*- coding: utf-8 -*-
 """sxsy45_checkin 单元测试（纯函数 + mock 分支判定，不发真实请求）"""
+import contextlib
+import io
 import os
 import sys
 import types
@@ -282,6 +284,37 @@ class TestSiteErrorDetection(unittest.TestCase):
         self.assertFalse(msc.is_site_error(self._resp(404, "<title>404 Not Found</title>")))
 
 
+class TestCfChallengeDetection(unittest.TestCase):
+    """Cloudflare 人机质询页必须单独识别，不能被当成 Cookie 失效或站点改版。"""
+
+    def _resp(self, status, body="", headers=None):
+        return mock.MagicMock(status_code=status, text=body, headers=headers or {})
+
+    def test_403_just_a_moment(self):
+        body = ("<html><head><title>Just a moment...</title></head>"
+                "<body>Checking your browser before accessing</body></html>")
+        self.assertTrue(msc.is_cf_challenge(self._resp(403, body)))
+
+    def test_cf_mitigated_header(self):
+        self.assertTrue(msc.is_cf_challenge(
+            self._resp(403, "<title>任意标题</title>", {"cf-mitigated": "challenge"})))
+
+    def test_challenge_platform_body(self):
+        """CF 有时用 503 + challenge-platform 脚本下发质询。"""
+        body = ('<html><title>请稍候...</title><script src="/cdn-cgi/challenge-platform/'
+                'h/b/orchestrate/chl_page/v1"></script></html>')
+        self.assertTrue(msc.is_cf_challenge(self._resp(503, body)))
+
+    def test_normal_403_not_challenge(self):
+        self.assertFalse(msc.is_cf_challenge(self._resp(403, "<title>403 Forbidden</title>")))
+
+    def test_normal_page_not_challenge(self):
+        self.assertFalse(msc.is_cf_challenge(self._resp(200, "<title>登录 - 尚香书苑</title>")))
+
+    def test_none_response(self):
+        self.assertFalse(msc.is_cf_challenge(None))
+
+
 class TestGetRetry(unittest.TestCase):
     """CDN 522 / 网络异常必须退避重试，不能一次失败就放弃。"""
 
@@ -320,6 +353,59 @@ class TestGetRetry(unittest.TestCase):
             r, err = msc.get_retry(s, "https://example.com", label="测试")
         self.assertIs(r, ok)
 
+    def test_challenge_retried_once_then_gives_up(self):
+        """CF 质询绑定出口 IP：最多试 CF_CHALLENGE_TRIES 次，不能无限刷。"""
+        s = self._session()
+        challenge = mock.MagicMock(status_code=403,
+                                   text="<title>Just a moment...</title>", headers={})
+        s.get.return_value = challenge
+        with mock.patch.object(msc.time, "sleep") as sleeper:
+            r, err = msc.get_retry(s, "https://example.com", label="测试", tries=3)
+        self.assertIsNone(r)
+        self.assertIn(msc.CF_CHALLENGE_MARK, err)
+        self.assertEqual(s.get.call_count, msc.CF_CHALLENGE_TRIES)
+        self.assertEqual(sleeper.call_count, msc.CF_CHALLENGE_TRIES - 1)
+
+    def test_challenge_then_success(self):
+        """质询后重试命中正常页：应继续流程。"""
+        s = self._session()
+        challenge = mock.MagicMock(status_code=403,
+                                   text="<title>Just a moment...</title>", headers={})
+        ok = mock.MagicMock(status_code=200, text="<title>登录 - 尚香书苑</title>", headers={})
+        s.get.side_effect = [challenge, ok]
+        with mock.patch.object(msc.time, "sleep"):
+            r, err = msc.get_retry(s, "https://example.com", label="测试")
+        self.assertIs(r, ok)
+        self.assertEqual(err, "")
+
+    def test_no_sleep_after_last_attempt(self):
+        """最后一次尝试命中质询时不能空睡，直接返回。"""
+        s = self._session()
+        err_resp = mock.MagicMock(status_code=522,
+                                  text="<title>x | 522: Connection timed out</title>", headers={})
+        challenge = mock.MagicMock(status_code=403,
+                                   text="<title>Just a moment...</title>", headers={})
+        s.get.side_effect = [err_resp, challenge]
+        with mock.patch.object(msc.time, "sleep") as sleeper:
+            r, err = msc.get_retry(s, "https://example.com", label="测试", tries=2)
+        self.assertIsNone(r)
+        self.assertIn(msc.CF_CHALLENGE_MARK, err)
+        self.assertEqual(s.get.call_count, 2)
+        self.assertEqual(sleeper.call_count, 1)  # 只该有一次 522 的退避
+
+    def test_403_without_challenge_returns_none_immediately(self):
+        """非质询类 403（WAF 直接拦截）不是可用页面，也不能被当成"未登录"。"""
+        s = self._session()
+        blocked = mock.MagicMock(status_code=403,
+                                 text="<title>403 Forbidden</title>", headers={})
+        s.get.return_value = blocked
+        with mock.patch.object(msc.time, "sleep") as sleeper:
+            r, err = msc.get_retry(s, "https://example.com", label="测试", tries=3)
+        self.assertIsNone(r)
+        self.assertIn("403", err)
+        self.assertEqual(s.get.call_count, 1)
+        self.assertEqual(sleeper.call_count, 0)
+
 
 class TestCheckCookieValid(unittest.TestCase):
     """Cookie 检测三态：站点故障时必须返回 None，避免误清有效缓存。"""
@@ -342,6 +428,99 @@ class TestCheckCookieValid(unittest.TestCase):
     def test_unknown_on_site_error(self):
         with mock.patch.object(msc, "get_retry", return_value=(None, "HTTP 522「522: Connection timed out」")):
             self.assertIsNone(msc.check_cookie_valid(self._session()))
+
+    def test_unknown_on_cf_challenge(self):
+        """CF 质询页没有 discuz_uid，必须判"无法确认"，绝不能让调用方清缓存。"""
+        err = f"{msc.CF_CHALLENGE_MARK}（HTTP 403）"
+        buf = io.StringIO()
+        with mock.patch.object(msc, "get_retry", return_value=(None, err)), \
+             contextlib.redirect_stdout(buf):
+            self.assertIsNone(msc.check_cookie_valid(self._session()))
+        self.assertIn("保留缓存", buf.getvalue())
+
+
+class TestRunOneAccountKeepsCacheOnChallenge(unittest.TestCase):
+    """站点无法判定登录态时（CF 质询/522）不得重登、不得丢缓存。"""
+
+    def test_skips_login_when_cookie_state_unknown(self):
+        cached = {"exampleuser": {"cookies": "u52q_2132_saltkey=K; u52q_2132_auth=V"}}
+        with mock.patch.object(msc, "read_cookie_cache", return_value=cached), \
+             mock.patch.object(msc, "check_cookie_valid", return_value=None), \
+             mock.patch.object(msc, "discuz_login") as login, \
+             mock.patch.object(msc, "do_signin", return_value={
+                 "state": "failed",
+                 "message": f"签到页请求失败：{msc.CF_CHALLENGE_MARK}（HTTP 403）",
+                 "stats": ""}):
+            result = msc.run_one_account(("exampleuser", "pw123"), "", 30, False)
+        self.assertFalse(result["success"])
+        login.assert_not_called()
+
+
+class TestLoginChallengeAbort(unittest.TestCase):
+    """登录页被 CF 质询时必须立刻停手：不消耗登录重试次数，也不加重风控。"""
+
+    def test_aborts_on_first_challenge(self):
+        session = mock.MagicMock()
+        session._timeout = 30
+        stub = types.ModuleType("ddddocr")
+        stub.DdddOcr = lambda *a, **k: mock.MagicMock()
+        err = f"{msc.CF_CHALLENGE_MARK}（HTTP 403）"
+        with mock.patch.dict(sys.modules, {"ddddocr": stub}), \
+             mock.patch.object(msc, "get_retry", return_value=(None, err)) as mocked_get, \
+             mock.patch.object(msc.time, "sleep"):
+            ok, msg = msc.discuz_login(session, "exampleuser", "pw123")
+        self.assertFalse(ok)
+        self.assertIn(msc.CF_CHALLENGE_MARK, msg)
+        self.assertIn("出口 IP", msg)
+        self.assertEqual(mocked_get.call_count, 1)
+
+    def test_aborts_when_seccode_query_challenged(self):
+        """验证码接口被质询同样立刻失败。"""
+        session = mock.MagicMock()
+        session._timeout = 30
+        login_page = mock.MagicMock(
+            status_code=200,
+            text=('<input type="hidden" name="formhash" value="9a17bb38" />'
+                  "<script>updateseccode('cS','member::logging')</script>"),
+            headers={})
+        err = f"{msc.CF_CHALLENGE_MARK}（HTTP 403）"
+        stub = types.ModuleType("ddddocr")
+        stub.DdddOcr = lambda *a, **k: mock.MagicMock()
+        with mock.patch.dict(sys.modules, {"ddddocr": stub}), \
+             mock.patch.object(msc, "get_retry",
+                               side_effect=[(login_page, ""), (None, err)]), \
+             mock.patch.object(msc.time, "sleep"):
+            ok, msg = msc.discuz_login(session, "exampleuser", "pw123")
+        self.assertFalse(ok)
+        self.assertIn("验证码接口被拦截", msg)
+        session.post.assert_not_called()
+
+    def test_aborts_when_login_post_challenged(self):
+        """账密 POST 也被质询时同样立刻失败，不再浪费下一轮登录尝试。"""
+        session = mock.MagicMock()
+        session._timeout = 30
+        session.post.return_value = mock.MagicMock(
+            status_code=403, text="<title>Just a moment...</title>", headers={})
+        login_page = mock.MagicMock(
+            status_code=200,
+            text=('<input type="hidden" name="formhash" value="9a17bb38" />'
+                  "<script>updateseccode('cS','member::logging')</script>"),
+            headers={})
+        seccode_update = mock.MagicMock(
+            status_code=200,
+            text='<input type="hidden" name="seccodehash" type="hidden" value="S12ab" />',
+            headers={})
+        stub = types.ModuleType("ddddocr")
+        stub.DdddOcr = lambda *a, **k: mock.MagicMock()
+        with mock.patch.dict(sys.modules, {"ddddocr": stub}), \
+             mock.patch.object(msc, "get_retry",
+                               side_effect=[(login_page, ""), (seccode_update, "")]), \
+             mock.patch.object(msc, "_ocr", return_value="abcd"), \
+             mock.patch.object(msc.time, "sleep"):
+            ok, msg = msc.discuz_login(session, "exampleuser", "pw123")
+        self.assertFalse(ok)
+        self.assertIn("登录接口被拦截", msg)
+        self.assertEqual(session.post.call_count, 1)
 
 
 class TestCookieCacheAtomicWrite(unittest.TestCase):
@@ -393,6 +572,215 @@ class TestCookieCacheAtomicWrite(unittest.TestCase):
                          "salt_auth=OLD")
         self.assertFalse(
             self._cache.with_name(self._cache.name + ".part").exists())
+
+
+class TestResolveProxy(unittest.TestCase):
+    """本站默认直连：不读全局代理，只有显式 SXSY_PROXY 才走代理。"""
+
+    _KEYS = ("SXSY_PROXY", "HTTPS_PROXY", "https_proxy",
+             "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy")
+
+    def _env(self, **kv):
+        # 先放空值、再放 kv：Windows 的 os.environ 大小写不敏感，
+        # 空的 https_proxy 与 HTTPS_PROXY 是同一个变量，顺序反了会把注入值清空
+        clean = {k: "" for k in self._KEYS if k not in kv}
+        clean.update(kv)
+        return mock.patch.dict(os.environ, clean)
+
+    def test_default_direct_ignores_global_proxy(self):
+        with self._env(HTTPS_PROXY="http://127.0.0.1:7890"):
+            proxy, src = msc.resolve_proxy()
+        self.assertEqual(proxy, "")
+        self.assertIn("HTTPS_PROXY", src)   # 被忽略的变量要写进日志，便于排查
+
+    def test_explicit_proxy(self):
+        with self._env(SXSY_PROXY="http://127.0.0.1:7890"):
+            proxy, src = msc.resolve_proxy()
+        self.assertEqual(proxy, "http://127.0.0.1:7890")
+        self.assertEqual(src, "SXSY_PROXY")
+
+    def test_explicit_direct_keywords(self):
+        for value in ("direct", "none", "off", "0", "false", "-"):
+            with self._env(SXSY_PROXY=value, HTTPS_PROXY="http://127.0.0.1:7890"):
+                proxy, src = msc.resolve_proxy()
+            self.assertEqual(proxy, "", value)
+            self.assertIn("直连", src)
+
+    def test_direct_session_disables_env_proxy(self):
+        """直连时 trust_env 必须关掉，否则 requests 仍会读 HTTPS_PROXY 走代理。"""
+        with mock.patch.dict(os.environ, {"HTTPS_PROXY": "http://127.0.0.1:7890"}):
+            session = msc.build_session("", 30)
+        self.assertFalse(session.trust_env)
+        self.assertEqual(dict(session.proxies), {})
+
+    def test_proxy_session_sets_both_schemes(self):
+        session = msc.build_session("http://127.0.0.1:7890", 30)
+        self.assertEqual(session.proxies["http"], "http://127.0.0.1:7890")
+        self.assertEqual(session.proxies["https"], "http://127.0.0.1:7890")
+
+
+class TestDomainFromNav(unittest.TestCase):
+    """导航页解析：站点自维护的最新域名是换域名后的权威来源。"""
+
+    def test_website_url_preferred(self):
+        html = ('const CONFIG = {latestDomain:"old.com",'
+                'websiteUrl:"https://sxsy33.com",telegramUrl:"https://t.me/x"};')
+        self.assertEqual(msc._domain_from_nav(html), "https://sxsy33.com")
+
+    def test_latest_domain_only_gets_https(self):
+        self.assertEqual(msc._domain_from_nav('latestDomain:"sxsy33.com",'),
+                         "https://sxsy33.com")
+
+    def test_login_page_has_no_domain(self):
+        self.assertEqual(msc._domain_from_nav("<html><title>登录 - 尚香书苑</title></html>"), "")
+
+    def test_empty_input(self):
+        self.assertEqual(msc._domain_from_nav(""), "")
+
+
+class TestLoginPageProbe(unittest.TestCase):
+    """探测结果三分：可用 / 不可用 / 出口被 CF 质询（换域名无用）。"""
+
+    def _session(self, resp=None, exc=None):
+        s = mock.MagicMock()
+        s._timeout = 10
+        if exc is not None:
+            s.get.side_effect = exc
+        else:
+            s.get.return_value = resp
+        return s
+
+    def test_ok_when_formhash_present(self):
+        resp = mock.MagicMock(status_code=200, headers={},
+                              text='<input name="formhash" value="9a17bb38" />')
+        state, note, _ = msc._login_page_probe(self._session(resp), "https://a.example")
+        self.assertTrue(state)
+        self.assertIn("200", note)
+
+    def test_nav_page_without_formhash(self):
+        """旧域名 301 落地的导航页：200 但无 formhash，必须判为不可用。"""
+        resp = mock.MagicMock(status_code=200, headers={},
+                              text='<title>小说论坛 - 最新地址</title>')
+        state, note, html = msc._login_page_probe(self._session(resp), "https://a.example")
+        self.assertFalse(state)
+        self.assertIn("无 formhash", note)
+        self.assertIn("最新地址", html)
+
+    def test_cf_challenge_returns_none(self):
+        resp = mock.MagicMock(status_code=403, headers={},
+                              text='<title>Just a moment...</title>')
+        state, note, _ = msc._login_page_probe(self._session(resp), "https://a.example")
+        self.assertIsNone(state)
+        self.assertIn(msc.CF_CHALLENGE_MARK, note)
+
+    def test_network_error_not_available(self):
+        """网络异常重试一次仍失败 -> 不可用，原因带异常类型。"""
+        with mock.patch.object(msc.time, "sleep"):
+            state, note, _ = msc._login_page_probe(
+                self._session(exc=OSError("boom")), "https://a.example")
+        self.assertFalse(state)
+        self.assertIn("OSError", note)
+
+    def test_network_error_retried_once(self):
+        """站点偶发读超时：探测重试一次，第二次成功即采用。"""
+        resp = mock.MagicMock(status_code=200, headers={},
+                              text='<input name="formhash" value="9a17bb38" />')
+        s = mock.MagicMock()
+        s._timeout = 30
+        s.get.side_effect = [OSError("read timed out"), resp]
+        with mock.patch.object(msc.time, "sleep"):
+            state, _, _ = msc._login_page_probe(s, "https://a.example")
+        self.assertTrue(state)
+        self.assertEqual(s.get.call_count, 2)
+
+
+class TestResolveBase(unittest.TestCase):
+    """域名发现：候选域名 -> 导航页最新域名；CF 质询时不再换域名。"""
+
+    CANDIDATES = ("https://old.example", "https://older.example")
+
+    def _run(self, probe_map, nav_html="", nav_err="HTTP 500"):
+        def probe(session, base, debug=False):
+            return probe_map.get(base, (False, "HTTP 404", ""))
+
+        resp = mock.MagicMock(text=nav_html) if nav_html else None
+        with mock.patch.object(msc, "DOMAIN_CANDIDATES", self.CANDIDATES), \
+             mock.patch.object(msc, "_login_page_probe", side_effect=probe), \
+             mock.patch.object(msc, "get_retry",
+                               return_value=(resp, "" if resp else nav_err)):
+            return msc.resolve_base(mock.MagicMock())
+
+    def test_first_candidate_ok(self):
+        base, note = self._run({"https://old.example": (True, "HTTP 200", "")})
+        self.assertEqual(base, "https://old.example")
+        self.assertIn("200", note)
+
+    def test_fallback_to_next_candidate(self):
+        base, _ = self._run({
+            "https://old.example": (False, "HTTP 200 无 formhash（标题「小说论坛 - 最新地址」）", ""),
+            "https://older.example": (True, "HTTP 200", ""),
+        })
+        self.assertEqual(base, "https://older.example")
+
+    def test_nav_html_from_redirected_probe(self):
+        """旧域名 301 到导航页：探测拿到的页面本身就是导航页，可直接解析。"""
+        nav = 'latestDomain:"https://sxsy33.com"'
+        base, _ = self._run({
+            "https://old.example": (False, "HTTP 200 无 formhash（标题「小说论坛 - 最新地址」）", nav),
+            "https://older.example": (False, "HTTP 404", ""),
+            "https://sxsy33.com": (True, "HTTP 200", ""),
+        })
+        self.assertEqual(base, "https://sxsy33.com")
+
+    def test_discover_from_nav_url(self):
+        """候选全挂时主动取导航页，用其中的最新域名。"""
+        base, _ = self._run({"https://sxsy33.com": (True, "HTTP 200", "")},
+                            nav_html='websiteUrl:"https://sxsy33.com"')
+        self.assertEqual(base, "https://sxsy33.com")
+
+    def test_cf_challenge_stops_probing(self):
+        """出口被风控时换域名一样被拦，立即返回让上层报风控。"""
+        base, note = self._run({
+            "https://old.example": (None, f"{msc.CF_CHALLENGE_MARK}（HTTP 403）", ""),
+        })
+        self.assertEqual(base, "https://old.example")
+        self.assertIn("人机质询", note)
+
+    def test_all_fail_returns_empty_with_reasons(self):
+        base, note = self._run({})
+        self.assertEqual(base, "")
+        self.assertIn("404", note)
+
+    def test_nav_domain_already_tried_is_skipped(self):
+        """导航页给出的域名若已在候选里试过，不重复请求。"""
+        calls = []
+
+        def probe(session, base, debug=False):
+            calls.append(base)
+            return (False, "HTTP 404", 'websiteUrl:"https://old.example"')
+
+        with mock.patch.object(msc, "DOMAIN_CANDIDATES", self.CANDIDATES), \
+             mock.patch.object(msc, "_login_page_probe", side_effect=probe), \
+             mock.patch.object(msc, "get_retry", return_value=(None, "HTTP 500")):
+            base, _ = msc.resolve_base(mock.MagicMock())
+        self.assertEqual(base, "")
+        self.assertEqual(calls.count("https://old.example"), 1)
+
+
+class TestApplyBase(unittest.TestCase):
+    """切换域名后所有派生 URL 必须同步，否则仍会打到旧域名。"""
+
+    def test_derived_urls_follow_base(self):
+        saved = (msc.BASE, msc.SIGN_URL, msc.LOGIN_URL, msc.FORUM_URL)
+        try:
+            msc.apply_base("https://sxsy33.com/")
+            self.assertEqual(msc.BASE, "https://sxsy33.com")
+            self.assertEqual(msc.SIGN_URL, "https://sxsy33.com/plugin.php?id=k_misign:sign")
+            self.assertEqual(msc.LOGIN_URL,
+                             "https://sxsy33.com/member.php?mod=logging&action=login")
+            self.assertEqual(msc.FORUM_URL, "https://sxsy33.com/forum.php")
+        finally:
+            msc.BASE, msc.SIGN_URL, msc.LOGIN_URL, msc.FORUM_URL = saved
 
 
 if __name__ == "__main__":

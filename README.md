@@ -24,7 +24,7 @@
 | 纸鸢下载签到 | mybt.kiteyuan.info 每日签到 + 访问任务，Casdoor 账号密码自动登录换 JWT，JWT 缓存原子复用（401/403 才重登），多账号 + 网络重试，分层判定 + 未确认档位 | [mybt-checkin-ql/README.md](mybt-checkin-ql/README.md) | `task mybt-checkin-ql/mybt_checkin.py` |
 | 福利吧预注册签到 | wnflb2023.com「游客预注册签到」插件，连续签到 30 天转正，Cookie 直签或账号密码登录（验证码 ddddocr 自动识别 + Cookie 缓存），幂等跳过 + 进度统计 | [wnflb_checkin/README.md](wnflb_checkin/README.md) | `task wnflb_checkin/wnflb_checkin.py` |
 | 福利吧每日签到 | wnflb2023.com「每日签到」插件(fx_checkin)，Cookie 直签或账号密码登录（验证码 ddddocr 自动识别 + Cookie 缓存），页面状态正向确认 + 幂等跳过 + 业务失败自动重试 + 今日排名/连续天数统计 + 运行锁 | [wnflb_fx_checkin/README.md](wnflb_fx_checkin/README.md) | `task wnflb_fx_checkin/wnflb_fx_checkin.py` |
-| 尚香书苑签到 | sxsy45.com Discuz k_misign 签到，登录图片验证码 ddddocr 自动识别 + 算术验证自动计算，Cookie 直签或账密登录（Cookie 缓存复用），幂等跳过 + 签到统计 | [sxsy45_checkin/README.md](sxsy45_checkin/README.md) | `task sxsy45_checkin/sxsy45_checkin.py` |
+| 尚香书苑签到 | Discuz k_misign 签到，登录图片验证码 ddddocr 自动识别 + 算术验证自动计算，Cookie 直签或账密登录（Cookie 缓存复用），域名自动发现（站点换域名无需改代码），幂等跳过 + 签到统计 | [sxsy45_checkin/README.md](sxsy45_checkin/README.md) | `task sxsy45_checkin/sxsy45_checkin.py` |
 | 维咔VikACG签到 | www.vikacg.cc 钱包签到领积分，账密登录换 JWT 双 token（30 天）+ refreshToken 静默续期 + 设备指纹持久化，完整浏览器头模拟免验证码，401 三级降级链，409 已签到幂等，代理支持 | [vikacg_checkin/README.md](vikacg_checkin/README.md) | `task vikacg_checkin/vikacg_checkin.py` |
 | 芯幻签到 | xhcyv.com ACG 社区每日签到，账密登录换 `x_bbs_token`（JWT，3 天）并缓存复用，Bearer 鉴权 + 幂等跳过 + 失效自动重登，登录被风控时 ddddocr 自动过图形验证码，支持 token 直填 / 多账号 / `--check` 自检 | [xhcyv_checkin/README.md](xhcyv_checkin/README.md) | `task xhcyv_checkin/xhcyv_checkin.py` |
 
