@@ -1,22 +1,22 @@
 {
-  "fetched_at": "2026-10-29T06:52:16+00:00",
+  "fetched_at": "2026-10-31T06:50:12+00:00",
   "repo": "zephyr-xiao/qinglong-script",
   "views_14d": {
-    "count": 82,
-    "uniques": 35
+    "count": 108,
+    "uniques": 41
   },
   "clones_14d": {
-    "count": 162,
-    "uniques": 76
+    "count": 159,
+    "uniques": 73
   },
-  "stars": 4,
+  "stars": 5,
   "forks": 2,
   "watchers": 0,
   "referrers": [
     {
       "referrer": "github.com",
-      "views": 25,
-      "uniques": 22
+      "views": 29,
+      "uniques": 26
     },
     {
       "referrer": "Bing",
@@ -27,13 +27,23 @@
   "popular_paths": [
     {
       "path": "/zephyr-xiao/qinglong-script",
-      "views": 27,
-      "uniques": 24
+      "views": 32,
+      "uniques": 29
     },
     {
       "path": "/zephyr-xiao/qinglong-script/blob/main/xsijishe_checkin/README.md",
       "views": 7,
       "uniques": 3
+    },
+    {
+      "path": "/zephyr-xiao/qinglong-script/blob/main/wuang-wu_Ikuuu/README.md",
+      "views": 7,
+      "uniques": 2
+    },
+    {
+      "path": "/zephyr-xiao/qinglong-script/tree/main",
+      "views": 5,
+      "uniques": 4
     },
     {
       "path": "/zephyr-xiao/qinglong-script/blob/main/sxsy45_checkin/README.md",
@@ -46,7 +56,7 @@
       "uniques": 2
     },
     {
-      "path": "/zephyr-xiao/qinglong-script/tree/main",
+      "path": "/zephyr-xiao/qinglong-script/blob/main/Rainyun/README.md",
       "views": 3,
       "uniques": 3
     },
@@ -56,23 +66,13 @@
       "uniques": 2
     },
     {
-      "path": "/zephyr-xiao/qinglong-script/blob/main/Rainyun/README.md",
-      "views": 2,
+      "path": "/zephyr-xiao/qinglong-script/tree/main/wuang-wu_Ikuuu",
+      "views": 3,
       "uniques": 2
     },
     {
-      "path": "/zephyr-xiao/qinglong-script/blob/main/xhcyv_checkin/README.md",
-      "views": 2,
-      "uniques": 2
-    },
-    {
-      "path": "/zephyr-xiao/qinglong-script/tree/main/stats",
-      "views": 2,
-      "uniques": 2
-    },
-    {
-      "path": "/zephyr-xiao/qinglong-script/blob/main/Cloud189Checkin/README.md",
-      "views": 2,
+      "path": "/zephyr-xiao/qinglong-script/blob/main/wuang-wu_Ikuuu/ikuuu.js",
+      "views": 3,
       "uniques": 1
     }
   ]
