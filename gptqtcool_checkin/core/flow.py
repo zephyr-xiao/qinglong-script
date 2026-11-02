@@ -285,8 +285,15 @@ async def auto_checkin() -> dict:
     # 401 感知:页面渲染出的"已登录"UI 可能只是 localStorage 残影,
     # 服务端 token 过期时 API 会返回 401,以此判定登录态的真实有效性
     auth = {"count": 0}
+    # /auth/captcha 返回的验证码参数（y = 缺口行，比 DOM 换算更准）
+    captcha_state = {"seq": 0}
+    # /portal/checkin 的服务端裁决（code=0 即签到成功），是验证码是否通过的权威判据
+    checkin_state = {"seq": 0, "code": None, "message": ""}
     deadline = time.time() + MAX_RUNTIME_MIN * 60
-    result = {"ok": False, "stage": "", "rounds_used": 0, "retried": False, "screenshot": None}
+    result = {
+        "ok": False, "stage": "", "rounds_used": 0, "retried": False,
+        "screenshot": None, "message": "",
+    }
 
     def _on_auth_response(response):
         try:
@@ -294,6 +301,42 @@ async def auto_checkin() -> dict:
                 auth["count"] += 1
                 logger.warning(f"🚨 API 响应 401(累计 {auth['count']} 次): {response.url}")
         except Exception:
+            pass
+
+    async def _on_response(response):
+        """抓两类响应：验证码参数与签到裁决。
+
+        验证码参数（y/pieceSize）让缺口检测从二维搜索降成一维；
+        签到裁决（code）比页面文案可靠——签到失败时页面只留一句
+        "请完成人机验证"，无法区分"验证码没过"和"其他业务失败"。
+        """
+        _on_auth_response(response)
+        url = response.url
+        try:
+            if "/auth/captcha" in url:
+                data = await response.json()
+                payload = (data or {}).get("data") or {}
+                if payload.get("slider"):
+                    captcha_state.update({
+                        "seq": captcha_state.get("seq", 0) + 1,
+                        "y": payload.get("y"),
+                        "pieceSize": payload.get("pieceSize"),
+                        "width": payload.get("width"),
+                        "height": payload.get("height"),
+                    })
+            elif "/portal/checkin" in url and response.request.method == "POST":
+                data = await response.json()
+                checkin_state.update({
+                    "seq": checkin_state.get("seq", 0) + 1,
+                    "code": (data or {}).get("code"),
+                    "message": (data or {}).get("message") or "",
+                })
+                logger.info(
+                    f"📨 /portal/checkin → code={checkin_state['code']} "
+                    f"{checkin_state['message']}"
+                )
+        except Exception:
+            # 响应体可能已被页面消费/请求已取消，取不到就当没发生
             pass
 
     async with async_playwright() as p:
@@ -312,7 +355,7 @@ async def auto_checkin() -> dict:
 
             page.on("console", _on_page_console)
             page.on("pageerror", lambda err: logger.error(f"❌ 页面错误: {err}"))
-            page.on("response", _on_auth_response)
+            page.on("response", _on_response)
 
             logger.info(f"🌐 正在访问签到页面: {CHECKIN_URL}")
             await page.goto(CHECKIN_URL, wait_until="domcontentloaded", timeout=GPTQTCOOL_TIMEOUT)
@@ -370,10 +413,23 @@ async def auto_checkin() -> dict:
                         return result
                     continue
 
-                captcha_result = await wait_and_handle_captcha_with_retry(page)
+                captcha_result = await wait_and_handle_captcha_with_retry(
+                    page, captcha_state=captcha_state, checkin_state=checkin_state
+                )
+                # 服务端裁决优先：/portal/checkin 返回 code=0 即签到成功，
+                # 比页面文案可靠（失败时页面只留一句"请完成人机验证"）
+                if checkin_state.get("code") == 0:
+                    if await reload_and_verify(page):
+                        logger.info("✅ 刷新后确认已签到")
+                    else:
+                        logger.warning("⚠️ 服务端已确认签到成功,但刷新后未见已签到标记(以服务端为准)")
+                    result["ok"] = True
+                    result["stage"] = "done"
+                    return result
                 if captcha_result is False:
                     logger.warning("⚠️ 验证码未通过")
                     result["stage"] = "captcha"
+                    result["message"] = checkin_state.get("message") or ""
                     result["screenshot"] = _latest_fail_screenshot()
                 elif captcha_result is None:
                     logger.info("ℹ️ 本轮未出现验证码")
@@ -473,6 +529,8 @@ def notify_result(result: dict) -> None:
         "timeout": f"超时（>{MAX_RUNTIME_MIN} 分钟）",
     }.get(result.get("stage"), "未知阶段")
     lines = [f"失败阶段：{stage_text}"]
+    if result.get("message"):
+        lines.append(f"服务端提示：{result['message']}")
     if rounds >= 1:
         lines.append(f"已尝试 {rounds} 轮")
     if result.get("screenshot"):
