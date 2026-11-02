@@ -148,6 +148,17 @@ ikuuu 的登录是**分阶段流程**（`POST /auth/login`，`phase=password`）
 
 因此给出四条路线，**怎么选**：想省事就用 A′（本目录已附带 `solver_vlm.js`，配好网关和模型即可）；要接打码平台或自研识别用 A；只想手工维护 cookie 用 B；什么都不想做就等 C（站点改回宽松配置后账密模式自动可用）。
 
+**2026-11 起面板结构又变了一次：两种布局并存**，脚本自动识别（日志会打印 `整图点选` 或 `九宫格 3×3`）：
+
+| 布局 | 页面结构 | 坐标语义 |
+|---|---|---|
+| `single` 整图点选 | 一整张挑战图挂在 `.geetest_bg` 上（常见 300×200） | 图内像素坐标，按比例映射到该元素 |
+| `grid9` 九宫格 | 9 个 `.geetest_item_img` 共用一张 3×3 精灵图（`background-size:300% auto`），**页面里没有 `.geetest_bg`**，也没有"确定"键 | 坐标指**整张精灵图**，脚本先折算成所属格子，再点该格中心 |
+
+> 九宫格必须单独处理：早期版本找不到 `.geetest_bg` 时会退化成"窗口里第一个带背景图的元素"（= 左上角第 0 格），模型给的三个点全部被映射进同一格，六轮抽取必然全挂（2026-11-01 实测）。现在按"多个 `.geetest_item_img` 共用同一张背景图"识别九宫格，并把 `grid` 行列数传给解法器；提示词也改为按**布局**选择，而不是按 `/load` 的 `captcha_type`（改版后 `captcha_type` 可能仍报 `icon`/`word`，页面实际却是九宫格）。
+>
+> 九宫格题的面板提示语是英文（`Select  3  images with`），数量解析同时支持中英文。
+
 ### 路线 A：自写外部解法器（`IKUUU_SOLVER_CMD`）
 
 脚本把挑战图与待点图案交给你的命令，你用什么解都行（打码平台 API / 自研模型 / 本地视觉大模型）。协议：
@@ -156,17 +167,19 @@ ikuuu 的登录是**分阶段流程**（`POST /auth/login`，`phase=password`）
 
 ```json
 {
-  "type": "word",
-  "promptText": "请在下图依次点击",
+  "type": "nine",
+  "promptText": "Select  3  images with",
   "imagePath": "/tmp/ikuuu-captcha-xxxx/challenge.jpg",
-  "tplPaths": ["/tmp/.../tpl1.png", "/tmp/.../tpl2.png", "/tmp/.../tpl3.png"],
-  "imageSize": { "w": 300, "h": 200 },
-  "displaySize": { "w": 300, "h": 197 }
+  "tplPaths": ["/tmp/.../tpl1.png"],
+  "imageSize": { "w": 300, "h": 261 },
+  "grid": { "cols": 3, "rows": 3 },
+  "displaySize": { "w": 288, "h": 249 }
 }
 ```
 
-- `type`：本次验证形式（`word` / `icon` / `nine` / …）
-- `promptText`：面板提示语原文（如「请在下图依次点击」「选 3 个符合右图的图片」）。缺省为空串，解法器可据此判断"点几个、要不要按顺序"
+- `type`：本次验证形式（`word` / `icon` / `nine` / …）。九宫格布局下恒为 `nine`
+- `grid`：仅九宫格布局有值，精灵图被均分的行列数；坐标按整张精灵图给，主脚本负责折算格子
+- `promptText`：面板提示语原文（如「请在下图依次点击」「Select 3 images with」）。缺省为空串，解法器可据此判断"点几个、要不要按顺序"
 - `imagePath`：挑战图（带图案的图片，尺寸即 `imageSize`）
 - `tplPaths`：待点图案，**按此顺序依次点击**
 - 坐标一律用 `imageSize` 系的像素坐标（左上角为原点）

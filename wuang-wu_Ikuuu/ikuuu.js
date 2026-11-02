@@ -454,32 +454,89 @@ async function isCaptchaReady(page) {
 // 读取点选挑战面板：挑战图地址、待点图案、显示区域与图片自然尺寸
 // 验证形式（含挑战图与待点图案）在页面加载时的 /load 就已确定，点按钮只是校验，
 // 因此这里要能等面板渲染出来，并对不同形式的 DOM 结构做兼容（背景图/普通 img）。
+//
+// 站点同时下发两种布局，必须分开处理（2026-11 实测）：
+//   · single：一整张挑战图（常见 300×200）挂在 .geetest_bg 上，图内像素坐标按比例映射即可；
+//   · grid9 ：3×3 九宫格，多个 .geetest_item_img 共用同一张精灵图（background-size:300% auto，
+//             各自只露出一格），页面里根本没有 .geetest_bg。此时"图片坐标"指整张精灵图，
+//             点击必须落到所属格子的元素上——退化成"窗口里第一个带背景图的元素"会让所有点击
+//             都落进左上角第 0 格（2026-11-01 六轮全挂的根因）。
 async function readClickChallenge(page) {
   return page.evaluate(async () => {
     const win = document.querySelector('.geetest_window');
-    let target = null;
-    let imageUrl = null;
     const fromBg = (el) => {
       const cs = el ? getComputedStyle(el) : null;
       const m = cs ? /url\("([^"]+)"\)/.exec(cs.backgroundImage || '') : null;
       return m ? m[1] : null;
     };
-    // 优先 .geetest_bg，其次窗口内任意带背景图的元素，最后退化到 <img>
-    const primary = document.querySelector('.geetest_bg');
-    if (fromBg(primary)) {
-      target = primary;
-      imageUrl = fromBg(primary);
-    } else if (win) {
-      for (const el of win.querySelectorAll('*')) {
-        const u = fromBg(el);
-        if (u) { target = el; imageUrl = u; break; }
-      }
-      if (!imageUrl) {
-        const img = win.querySelector('img');
-        if (img && /^https?:/.test(img.src)) { target = img; imageUrl = img.src; }
+    const rectOf = (el) => {
+      const r = el.getBoundingClientRect();
+      return { x: r.x, y: r.y, w: r.width, h: r.height };
+    };
+
+    // —— 布局 A：九宫格 ——
+    // 判据：窗口内出现多个 .geetest_item_img 且共用同一张背景图（精灵图）
+    let cells = [];
+    let spriteUrl = null;
+    let cols = 3;
+    if (win) {
+      for (const el of win.querySelectorAll('.geetest_item_img')) {
+        const url = fromBg(el);
+        const r = rectOf(el);
+        if (!url || r.w < 20 || r.h < 20) continue;
+        if (!spriteUrl) {
+          spriteUrl = url;
+          // background-size: 300% auto → 横向 3 列
+          const m = /^(\d+(?:\.\d+)?)%/.exec(getComputedStyle(el).backgroundSize || '');
+          if (m) cols = Math.max(1, Math.round(100 / Number(m[1])));
+        }
+        if (url !== spriteUrl) continue;
+        const idx = /geetest_imgs(\d+)/.exec(String(el.className));
+        cells.push({ i: idx ? Number(idx[1]) : cells.length, rect: r });
       }
     }
-    const rect = target ? target.getBoundingClientRect() : null;
+    // 少于 4 格不算九宫格题（真实题目至少 4 格，常见 9 格）
+    const isGrid = cells.length >= 4;
+    let layout = isGrid ? 'grid9' : 'single';
+    let grid = null;
+    let imageUrl = null;
+    let rect = null;
+
+    if (isGrid) {
+      cells = cells.sort((a, b) => a.i - b.i);
+      const rows = Math.ceil(cells.length / cols);
+      // 九格并集 = 整张精灵图在页面上的显示区域
+      const xs = cells.map((c) => c.rect.x);
+      const ys = cells.map((c) => c.rect.y);
+      const xe = cells.map((c) => c.rect.x + c.rect.w);
+      const ye = cells.map((c) => c.rect.y + c.rect.h);
+      rect = {
+        x: Math.min(...xs), y: Math.min(...ys),
+        w: Math.max(...xe) - Math.min(...xs), h: Math.max(...ye) - Math.min(...ys),
+      };
+      imageUrl = spriteUrl;
+      grid = { cols, rows };
+    } else {
+      cells = [];
+      let target = null;
+      // 优先 .geetest_bg，其次窗口内任意带背景图的元素，最后退化到 <img>
+      const primary = document.querySelector('.geetest_bg');
+      if (fromBg(primary)) {
+        target = primary;
+        imageUrl = fromBg(primary);
+      } else if (win) {
+        for (const el of win.querySelectorAll('*')) {
+          const u = fromBg(el);
+          if (u) { target = el; imageUrl = u; break; }
+        }
+        if (!imageUrl) {
+          const img = win.querySelector('img');
+          if (img && /^https?:/.test(img.src)) { target = img; imageUrl = img.src; }
+        }
+      }
+      rect = target ? rectOf(target) : null;
+    }
+
     let natural = null;
     if (imageUrl) {
       // 只取 naturalWidth/Height，不设 crossOrigin（避免触发 CORS 失败）
@@ -493,18 +550,23 @@ async function readClickChallenge(page) {
       });
     }
     return {
-      visible: !!(rect && rect.width > 40 && rect.height > 40 && imageUrl),
+      layout,
+      visible: !!(rect && rect.w > 40 && rect.h > 40 && imageUrl),
       imageUrl,
+      grid,
+      cells,
       tplUrls: Array.from(document.querySelectorAll('.geetest_ques_tips img')).map((i) => i.src),
-      // 面板提示语（"请在下图依次点击" / "选 3 个符合右图的图片" …）：解法器据此判断点几个、要不要按顺序
+      // 面板提示语（"请在下图依次点击" / "Select 3 images with" …）：解法器据此判断点几个、要不要按顺序
       promptText: (() => {
         const el = document.querySelector('.geetest_text_tips') || document.querySelector('.geetest_tip');
         return el ? el.textContent.trim() : '';
       })(),
-      rect: rect ? { x: rect.x, y: rect.y, w: rect.width, h: rect.height } : null,
+      rect,
       natural,
     };
-  }).catch(() => ({ visible: false, imageUrl: null, tplUrls: [], rect: null, natural: null }));
+  }).catch(() => ({
+    layout: 'single', visible: false, imageUrl: null, grid: null, cells: [], tplUrls: [], rect: null, natural: null,
+  }));
 }
 
 // 等点选面板渲染出来（面板可能晚于 isReady 轮询才出现）
@@ -516,7 +578,7 @@ async function waitClickChallenge(page, timeoutMs = 10000) {
     if (last.visible) return last;
     await page.waitForTimeout(500);
   }
-  return last || { visible: false, imageUrl: null, tplUrls: [], rect: null, natural: null };
+  return last || { layout: 'single', visible: false, imageUrl: null, grid: null, cells: [], tplUrls: [], rect: null, natural: null };
 }
 
 // 下载到本地文件（给外部解法器读）；Referer 跟随实际登录域名
@@ -630,15 +692,24 @@ async function solveChallenge(challenge, type, loginHost) {
     }
     const size = imageSize(fs.readFileSync(imagePath)) || challenge.natural;
     if (!size) return { ok: false, msg: '无法读取挑战图尺寸' };
+    // 提示词要跟着"布局"走，而不是跟着 /load 的 captcha_type 走：
+    // 站点改版后，captcha_type 仍可能报 icon/word，但页面实际下发的是九宫格题
+    // （9 格拼图 + 1 个待找图标）。按 type 选提示词会让模型去找"整图里的三个图案"，
+    // 按 layout 选才是在回答"哪几格符合"。
+    const solverType = challenge.layout === 'grid9' ? 'nine' : type;
     const payload = {
-      type,
+      type: solverType,
       promptText: challenge.promptText || '',
       imagePath,
       tplPaths,
       imageSize: size,
+      grid: challenge.grid || undefined,
       displaySize: { w: Math.round(challenge.rect.w), h: Math.round(challenge.rect.h) },
     };
-    dbg('解法器入参:', JSON.stringify({ type, promptText: payload.promptText, imageSize: size, tplCount: tplPaths.length }));
+    dbg('解法器入参:', JSON.stringify({
+      type: solverType, layout: challenge.layout, grid: challenge.grid,
+      promptText: payload.promptText, imageSize: size, tplCount: tplPaths.length,
+    }));
 
     // 依次尝试命令链：主解法器不可用时换备用；内容类失败（解错/分歧）不再换（换了解法器也没用，让主流程换题）
     let last = null;
@@ -734,15 +805,38 @@ async function humanClick(page, x, y) {
   await page.mouse.up();
 }
 
+// 九宫格：整张精灵图上的像素坐标 → 格子序号（纯函数，便于单测）
+// 解法器给的是"整张精灵图"坐标（例如 300×261 的九格拼图），站点却是按"哪一格被选中"判定，
+// 所以必须先把坐标折算成所属格子，再去点那一格——否则会点错格。
+function cellIndexForPoint(x, y, size, grid) {
+  const cols = Math.max(1, Number(grid && grid.cols) || 3);
+  const rows = Math.max(1, Number(grid && grid.rows) || 3);
+  const clamp = (n, max) => Math.min(max - 1, Math.max(0, n));
+  const col = clamp(Math.floor((Number(x) / size.w) * cols), cols);
+  const row = clamp(Math.floor((Number(y) / size.h) * rows), rows);
+  return row * cols + col;
+}
+
 // 按解法器坐标点击图案 → 点"确定" → 等验证通过
 // 坐标映射每次点击前即时换算：面板可能因滚动/重排移动，之前缓存的 rect 不可靠
-async function clickImagePoint(page, imageUrl, ix, iy, size) {
-  const pt = await page.evaluate(({ url, x, y, w, h }) => {
+// 返回落点信息 { x, y, cell? }，映射失败返回 null
+async function clickImagePoint(page, challenge, ix, iy, size) {
+  const isGrid = challenge.layout === 'grid9';
+  const cellIdx = isGrid ? cellIndexForPoint(ix, iy, size, challenge.grid) : null;
+  const pt = await page.evaluate(({ url, x, y, w, h, cell }) => {
     const bgUrlOf = (el) => {
       const cs = el ? getComputedStyle(el) : null;
       const m = cs ? /url\("([^"]+)"\)/.exec(cs.backgroundImage || '') : null;
       return m ? m[1] : null;
     };
+    if (cell !== null) {
+      // 九宫格：点所属格子的中心（站点按整格判定，实测点格子中心可过）
+      const el = document.querySelector(`.geetest_imgs${cell}`);
+      if (!el) return null;
+      const r = el.getBoundingClientRect();
+      if (r.width < 20 || r.height < 20) return null;
+      return { x: r.x + r.width / 2, y: r.y + r.height / 2, cell };
+    }
     let target = document.querySelector('.geetest_bg');
     if (!target || bgUrlOf(target) !== url) {
       target = null;
@@ -754,26 +848,38 @@ async function clickImagePoint(page, imageUrl, ix, iy, size) {
     const r = target.getBoundingClientRect();
     if (r.width < 40 || r.height < 40) return null;
     return { x: r.x + (x / w) * r.width, y: r.y + (y / h) * r.height };
-  }, { url: imageUrl, x: ix, y: iy, w: size.w, h: size.h }).catch(() => null);
-  if (!pt) return false;
+  }, {
+    url: challenge.imageUrl, x: ix, y: iy, w: size.w, h: size.h, cell: cellIdx,
+  }).catch(() => null);
+  if (!pt) return null;
   await humanClick(page, pt.x, pt.y);
-  return true;
+  return pt;
 }
 
 async function submitClicks(page, challenge, clicks, size) {
   let clicked = 0;
+  const usedCells = new Set();
   for (const [ix, iy] of clicks) {
-    const ok = await clickImagePoint(page, challenge.imageUrl, ix, iy, size);
-    if (!ok) {
+    const pt = await clickImagePoint(page, challenge, ix, iy, size);
+    if (!pt) {
       console.log(`  ⚠️ 第 ${clicked + 1} 个点映射失败（面板已消失或结构变化）`);
       break;
     }
     clicked += 1;
-    console.log(`  🖱 点击图片坐标 (${Math.round(ix)},${Math.round(iy)})`);
+    if (pt.cell !== undefined) {
+      usedCells.add(pt.cell);
+      console.log(`  🖱 点击图片坐标 (${Math.round(ix)},${Math.round(iy)}) → 第 ${pt.cell + 1} 格`);
+    } else {
+      console.log(`  🖱 点击图片坐标 (${Math.round(ix)},${Math.round(iy)})`);
+    }
     await page.waitForTimeout(350 + Math.floor(Math.random() * 500));
   }
   if (clicked < clicks.length) return false;
-  await page.locator('.geetest_submit').click({ timeout: 8000 }).catch(() => { /* 某些形式无提交键 */ });
+  // 多个点落进同一格 = 只选出了一格，站点必然判错；提前把线索打出来，省得回头翻日志
+  if (challenge.layout === 'grid9' && usedCells.size < clicks.length) {
+    console.log(`  ⚠️ ${clicks.length} 个点只覆盖 ${usedCells.size} 个格子（解法器可能把同一格选了多次）`);
+  }
+  await page.locator('.geetest_submit').click({ timeout: 8000 }).catch(() => { /* 九宫格题没有"确定"键 */ });
   for (let i = 0; i < 24; i++) {
     await page.waitForTimeout(500);
     if (await isCaptchaReady(page)) return true;
@@ -930,7 +1036,8 @@ async function browserLogin({ host, email, password }) {
       // 2) 没直过 → 等点选挑战面板
       const challenge = await waitClickChallenge(page);
       dbg('挑战面板:', JSON.stringify({
-        visible: challenge.visible, type: captchaType,
+        visible: challenge.visible, type: captchaType, layout: challenge.layout,
+        grid: challenge.grid, cells: challenge.cells.length,
         natural: challenge.natural, tpl: challenge.tplUrls.length,
       }));
       await shot(page, `round${round}_${captchaType || 'unknown'}`);
@@ -938,7 +1045,10 @@ async function browserLogin({ host, email, password }) {
         failMsg = `验证码未通过，且未识别到点选面板（本次形式 ${typeLabel(captchaType)}）`;
         continue;
       }
-      console.log(`  🧩 站点下发点选验证码：${typeLabel(captchaType)}（第 ${round}/${MAX_CAPTCHA_ROUNDS} 次抽取）`);
+      const layoutLabel = challenge.layout === 'grid9'
+        ? `九宫格 ${challenge.grid.cols}×${challenge.grid.rows}`
+        : '整图点选';
+      console.log(`  🧩 站点下发点选验证码：${typeLabel(captchaType)} / ${layoutLabel}（第 ${round}/${MAX_CAPTCHA_ROUNDS} 次抽取）`);
       if (SOLVER_CMDS.length === 0) {
         failMsg = `站点已启用点选类验证码（${typeLabel(captchaType)}），脚本自身不做图形识别：`
           + '请配置 IKUUU_SOLVER_CMD 外部解法器，或在青龙里用 IKUUU_COOKIE 直填 cookie（见 README）';
@@ -1598,6 +1708,8 @@ module.exports = {
   imageSize,
   extractSolverJson,
   normalizeClicks,
+  cellIndexForPoint,
+  clickImagePoint,
   solverUnavailable,
   solverFatal,
   isRetryableStatus,
