@@ -107,13 +107,17 @@ async def dismiss_overlays(page) -> None:
 
 # 出现这些文案说明"当前正要求完成验证"
 CAPTCHA_TEXT_HINTS = [
-    "请完成滑块验证", "请先完成滑块验证", "请完成人机验证",
+    "请完成滑块验证", "请先完成滑块验证",
     "按住滑块向右拖动", "向右拖动完成验证", "拖动滑块",
     "滑动验证", "滑块验证", "安全验证",
 ]
 # 这些是"上一次验证失败/超时"的提示，只表示失败结果、不代表当前有验证码在等待，
 # 混进存在性判断会把残留文案误判成"仍有验证码"而空转，故单独判定
-CAPTCHA_FAILURE_HINTS = ["验证失败", "验证超时"]
+CAPTCHA_FAILURE_HINTS = ["验证失败", "验证超时", "请完成人机验证"]
+
+# 覆盖层（滑块弹窗）专属文案：弹窗关闭后这些文本会一起消失，
+# 而"请完成人机验证"是签到失败后留在结果区的提示，不能用来判断弹窗是否还在
+CAPTCHA_OVERLAY_HINTS = ["按住滑块向右拖动", "将拼图拖到缺口处", "请先完成滑块验证"]
 
 # 滑块选择器只取语义明确的：div[style*="position: absolute"][style*="left"] 这类过宽选择器误判率高，不用
 CAPTCHA_SLIDER_SELECTORS = [
@@ -147,8 +151,23 @@ async def detect_slider_captcha(page) -> bool:
     return False
 
 
+async def detect_captcha_overlay(page) -> bool:
+    """检测滑块验证码弹窗是否仍挂在页面上。
+
+    站点把验证码渲染成一个全屏 overlay（内含两张 data:image 与拖动手柄），
+    pointerup 后立刻 remove。用"弹窗专属文案"判断比用泛化的验证码关键词准：
+    签到失败后结果区会留下"请完成人机验证"，文本检测会把它误判成弹窗还在，
+    导致每次失败都白等几十秒。
+    """
+    try:
+        page_text = await page.inner_text("body")
+    except Exception:
+        return False
+    return any(t in page_text for t in CAPTCHA_OVERLAY_HINTS)
+
+
 async def has_captcha_failure_hint(page) -> bool:
-    """检测页面是否出现"验证失败/验证超时"提示（失败结果，不等于当前仍有验证码）"""
+    """检测页面是否出现"验证失败/超时/请完成人机验证"提示（失败结果，不等于当前仍有验证码）"""
     try:
         page_text = await page.inner_text("body")
     except Exception:
@@ -336,7 +355,123 @@ def detect_gap_by_template(
     return best_x, best_conf, best_method
 
 
-# ====================== 缺口检测：高亮方块 ======================
+# ====================== 缺口检测：描边方框（首选） ======================
+
+# 描边方框采信阈值
+# 1) FRAME_STROKE_WHITE_MIN: 四条边的最小均值必须达到该亮度——站点画的是纯白描边
+#    （实测四边均值恒在 250~254），自然亮区很难四边同时这么白；
+# 2) FRAME_STROKE_MIN_SCORE: 四边相对紧邻外侧的最小亮度增量，弱对比样本实测最低 3.3，
+#    自然纹理的假峰 < 2。
+# 两者缺一不可：只看增量会被亮天空里的方块骗到，只看白度会被亮天空本身骗到。
+FRAME_STROKE_WHITE_MIN = 235.0
+FRAME_STROKE_MIN_SCORE = 2.0
+
+
+def detect_gap_by_frame_stroke(
+    master: bytes,
+    gap_y: int | None,
+    tile_size: int,
+    y_tol: int = 2,
+    exclude_x1: float = 0.0,
+) -> tuple[int, int, float]:
+    """按"缺口 = 1px 纯白描边方框"定位缺口左上角(该站点验证码形态)
+
+    站点把拼图块从背景图裁走,再在缺口处画一个 tile_size 见方的描边方框
+    (描边像素 250~254,内部是半透明白)。自然纹理里"某块比周围亮"很常见
+    ——同一张背景图里的太阳反光会稳定抢分,旧的高亮检测因此每次都锁在
+    同一个假位置上。而"矩形四条边同时比紧邻外侧亮、且四边增量接近"
+    几乎只有画上去的描边才有,所以评分取四边增量的**最小值**:
+    任何一边不成立立即被否决。
+
+    参数:
+        gap_y: 缺口行(背景图自然坐标系)。站点接口 /auth/captcha 直接返回
+               该值(piece 的 top),已知时把二维搜索降成一维;传 None 则
+               全图扫 y 兜底(DOM 与接口都拿不到时的最后手段)。
+        y_tol: gap_y 的搜索半径(px),吸收 DOM 取整误差。实测 ±3 仍稳定命中。
+        exclude_x1: 排除 x < 该值的区域。仅"容器截图"兜底时拼图块预览会
+               画在背景图左侧,需要排除,否则预览的边框会被当成缺口描边。
+
+    返回 (gap_x, gap_y, score);score < FRAME_STROKE_MIN_SCORE 时上层应回退。
+    """
+    img = cv2.imdecode(np.frombuffer(master, dtype=np.uint8), cv2.IMREAD_COLOR)
+    if img is None:
+        logger.info("❌ 描边检测:无法解码背景图")
+        return 0, int(gap_y or 0), 0.0
+
+    h, w = img.shape[:2]
+    size = int(tile_size)
+    if size < 8 or size > min(w, h) - 4:
+        size = max(8, min(size, w - 4, h - 4))
+
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY).astype(np.float64)
+    # 积分图: cx[y, x] = 第 y 行 [0,x) 之和; cy[y, x] = 第 x 列 [0,y) 之和
+    cx = np.zeros((h, w + 1))
+    cx[:, 1:] = np.cumsum(gray, axis=1)
+    cy = np.zeros((h + 1, w))
+    cy[1:, :] = np.cumsum(gray, axis=0)
+
+    def score_map(y: int) -> np.ndarray:
+        """以第 y 行为上边缘时,逐列(缺口左边缘 x)的描边评分,长度 w-size+1
+
+        评分 = 四边相对紧邻外侧的最小亮度增量；四边均值不到
+        FRAME_STROKE_WHITE_MIN 的窗口直接否决(描边必须是纯白的)。
+        """
+        def row_mean(yy: int) -> np.ndarray:
+            return (cx[yy, size:] - cx[yy, :-size]) / size
+
+        top, top_out = row_mean(y), row_mean(y - 1)
+        bot, bot_out = row_mean(y + size - 1), row_mean(y + size)
+        col = (cy[y + size] - cy[y]) / size          # 每列的均值，长度 w
+        left = col[: w - size + 1]
+        right = col[size - 1:]
+        # 左右描边各自与紧邻外侧的一列比较(首尾列没有外侧,置 0 自然淘汰)
+        d_left = np.concatenate(([0.0], np.diff(col)))[: w - size + 1]
+        d_right = np.concatenate((col[size - 1:w - 1] - col[size:w], [0.0]))
+        contrast = np.minimum(
+            np.minimum(top - top_out, bot - bot_out),
+            np.minimum(d_left, d_right),
+        )
+        white = np.minimum(np.minimum(top, bot), np.minimum(left, right))
+        return np.where(white >= FRAME_STROKE_WHITE_MIN, contrast, -1e9)
+
+    # 上下描边都要有"外侧一行",所以 y 限定在 [1, h-size-1]
+    y_min, y_max = 1, h - size - 1
+    if gap_y is not None:
+        gy = int(round(gap_y))
+        y_min = max(y_min, gy - y_tol)
+        y_max = min(y_max, gy + y_tol)
+    if y_max < y_min:
+        logger.info(f"ℹ️ 描边检测:gap_y={gap_y} 超出可扫描范围,跳过")
+        return 0, int(gap_y or 0), 0.0
+
+    x_lo = max(1, int(exclude_x1) + 1)
+    best = (-1e9, 0, 0)
+    for y in range(y_min, y_max + 1):
+        scores = score_map(y)
+        if x_lo >= len(scores) - 1:
+            break
+        x = x_lo + int(np.argmax(scores[x_lo:len(scores) - 1]))
+        if scores[x] > best[0]:
+            best = (float(scores[x]), x, y)
+
+    score, x, y = best
+    if score < FRAME_STROKE_MIN_SCORE:
+        logger.info(f"🔍 描边方框检测未命中(最高分 {score:.1f} < {FRAME_STROKE_MIN_SCORE})")
+        return 0, int(gap_y or 0), 0.0
+
+    # 次峰(排除主峰 ±6px)衡量分离度:真描边通常 2 倍以上,分离度低时上层应降级
+    rest = score_map(y)
+    rest[max(0, x - 6):min(len(rest), x + 7)] = -1e9
+    second = float(rest.max()) if rest.size else -1e9
+    separation = "inf" if second < 0 else f"{score / max(1e-6, second):.1f}x"
+    logger.info(
+        f"🔍 描边方框检测: x={x}, y={y}, score={score:.1f}, 次峰={max(0.0, second):.1f}, "
+        f"分离度={separation}"
+    )
+    return x, y, score
+
+
+# ====================== 缺口检测：高亮方块（兜底） ======================
 
 # 高亮方块采信阈值:窗口与周边亮度差超过该值才认为存在白色半透明方块
 # (实测该站点方块得分 38~45,海水纹理/阳光亮斑本底 < 20,取中间偏下值)
@@ -347,26 +482,25 @@ def detect_gap_by_highlight(
     master: bytes,
     tile_size: int,
     prior_y: float | None = None,
-    bg_render_h: float | None = None,
     tile_rect: dict | None = None,
     bg_rect: dict | None = None,
 ) -> tuple[int, int, float]:
-    """高亮方块型缺口检测(该站点验证码形态)
+    """高亮方块型缺口检测(兜底:描边检测未命中时使用)
 
     站点的缺口不是"拼图内容挖洞"而是白色半透明方块直接标注在背景图上,
     拼图块图案与背景图内容无对应关系(线性回归 R²≈0.1),模板匹配必然失效。
-    检测原理:方块区域亮度显著高于周边海面,用拼图块尺寸滑窗计算
-    "窗口均值 - 环形周边均值",峰值位置即方块左上角(背景图自然坐标系)。
+    检测原理:方块区域亮度显著高于周边,用拼图块尺寸滑窗计算
+    "窗口均值 - 环形周边均值",峰值位置即方块左上角。
+
+    注意:该判据没有形状约束,同一张背景图里的太阳反光会稳定抢分
+    (实测 6/8 样本锁在固定假位置),所以只作兜底,首选走描边检测。
 
     参数:
-        prior_y: 拼图块 DOM 中心 y(渲染坐标系)。实测方块与拼图块同行,
-                 提供时按 bg_render_h/natural_h 比例换算后把扫描带限定在
-                 该 y 附近,抑制远处阳光亮斑干扰。传 None 则全图扫描
-                 (实测带限版本偶发漏检,全图版本可作独立候选补位)。
-        bg_render_h: 背景图渲染高度,用于 prior_y 的坐标换算。
+        prior_y: 拼图块中心 y,**背景图自然坐标系**(调用方负责换算)。
+                 提供时把扫描带限定在该 y ±size,抑制远处亮斑干扰。
         tile_rect / bg_rect: 拼图块与背景图的 DOM 渲染位置。拼图块预览
                  叠加在背景图左侧(非背景内容),映射到自然坐标系后排除,
-                 否则拼图块预览自身/其涂黑副本会被误判为高亮区。
+                 否则拼图块预览自身会被误判为高亮区。
 
     返回 (gap_x, gap_y, score);score < HIGHLIGHT_MIN_CONF 时上层应回退其他方法。
     """
@@ -397,15 +531,15 @@ def detect_gap_by_highlight(
         s = integral[y1, x1] - integral[y0, x1] - integral[y1, x0] + integral[y0, x0]
         return float(s) / ((y1 - y0) * (x1 - x0))
 
-    # y 扫描带:有先验时限定换算后的拼图块中心 y ±size,无先验时全图扫描
-    if prior_y is not None and bg_render_h:
-        py = prior_y * h / bg_render_h
-        y_min = max(0, int(py - size))
-        y_max = min(h - size, int(py + size))
+    # y 扫描带:有先验时限定该 y ±size,无先验时全图扫描
+    if prior_y is not None:
+        y_min = max(0, int(prior_y - size))
+        y_max = min(h - size, int(prior_y + size))
+        if y_max < y_min:  # 先验越界(坐标系传错)时显式回退,不再静默退化
+            logger.info(f"⚠️ 高亮检测:prior_y={prior_y:.0f} 越界,回退全图扫描")
+            y_min, y_max = 0, max(0, h - size)
     else:
         y_min, y_max = 0, h - size
-    if y_max < y_min:
-        y_min, y_max = 0, max(0, h - size)
 
     ring = max(6, size // 4)  # 环形周边厚度
     # x 从 size 起扫:方块不会贴到背景图左缘,且左侧边缘的环形数据不完整;
@@ -433,19 +567,38 @@ def detect_gap_by_highlight(
     return best_x, best_y, best_score
 
 
-# ====================== 缺口检测：四层递进 + 多候选 ======================
+# ====================== 缺口检测：逐层递进 + 多候选 ======================
 
-def _draw_candidates(screenshot: bytes, candidates: list[dict], save_debug_path: Path) -> None:
-    """把候选位置画到调试图上：首选红色粗线，备选橙色细线，便于回看检测是否偏位。"""
+def _draw_candidates(
+    screenshot: bytes,
+    candidates: list[dict],
+    save_debug_path: Path,
+    tile_size: int = 0,
+) -> None:
+    """把候选位置画到调试图上：首选红色粗线，备选橙色细线，便于回看检测是否偏位。
+
+    候选带 y 且已知拼图块尺寸时改画方框——方框是否正好套住缺口，肉眼一眼可判。
+    """
     try:
         img = cv2.imdecode(np.frombuffer(screenshot, dtype=np.uint8), cv2.IMREAD_COLOR)
         if img is None:
             return
-        h = img.shape[0]
+        h, w = img.shape[:2]
         for idx, c in enumerate(candidates):
             color = (0, 0, 255) if idx == 0 else (0, 165, 255)
             thickness = 2 if idx == 0 else 1
-            cv2.line(img, (int(c["x"]), 0), (int(c["x"]), h), color, thickness)
+            x = int(c["x"])
+            y = c.get("y")
+            if y is not None and tile_size > 0:
+                cv2.rectangle(
+                    img,
+                    (x, int(y)),
+                    (min(w - 1, x + tile_size - 1), min(h - 1, int(y) + tile_size - 1)),
+                    color,
+                    thickness,
+                )
+            else:
+                cv2.line(img, (x, 0), (x, h), color, thickness)
         cv2.imwrite(str(save_debug_path), img)
         logger.info(f"📸 已保存缺口检测调试图: {save_debug_path}")
     except Exception as e:
@@ -461,40 +614,60 @@ async def detect_gap(
     save_debug_path: Path | None = None,
     tile_rect: dict | None = None,
     bg_rect: dict | None = None,
+    gap_y: float | None = None,
+    exclude_x1: float = 0.0,
 ) -> tuple[int, float, str, list[dict]]:
-    """四层递进缺口检测: 高亮方块(带限) → 高亮方块(全图) → 模板匹配 → 边缘检测
+    """逐层递进缺口检测: 描边方框 → 高亮方块(带限) → 高亮方块(全图) → 模板匹配 → 边缘检测
 
     返回 (gap_x, confidence, method, candidates)。
-    candidates 是按可靠度排序的候选位置列表（每个为 {"x","method","conf"}）：
-    该站点首次滑动失败后会隐藏滑块，所以"首选就对"比"多试几次"更重要——
-    带限高亮若缺失/低分，全图高亮可作首选补位（实测失败样本中全图版本稳定命中真缺口）。
+    candidates 是按可靠度排序的候选位置列表（每个为 {"x","y","method","conf"}）：
+    该站点首次滑动失败后会隐藏滑块，所以"首选就对"比"多试几次"更重要。
+
+    坐标系约定：screenshot/gap_y/候选 x,y 全部是**背景图自然坐标**，
+    与渲染坐标的换算由调用方负责（背景图被 CSS 缩放时两者不同）。
+
+    gap_y 是缺口行（站点接口 /auth/captcha 直接给出）：
+    描边检测拿到它就从二维搜索降成一维，准确率远高于纯亮度判据。
+    exclude_x1 仅在"容器截图"兜底时传非 0（截图里含拼图块预览）。
     """
     candidates: list[dict] = []
 
-    # 策略 0: 高亮方块（带限，需要拼图块/背景图 DOM 位置）
+    # 策略 0: 描边方框（首选；缺口标记是画上去的 1px 纯白方框）
+    fr_x, fr_y, fr_score = detect_gap_by_frame_stroke(
+        screenshot, gap_y, int(slider_width), exclude_x1=exclude_x1,
+    )
+    if fr_score >= FRAME_STROKE_MIN_SCORE:
+        logger.info(f"✅ 描边方框命中: gap_x={fr_x}, y={fr_y}, score={fr_score:.1f}")
+        candidates.append({"x": fr_x, "y": fr_y, "method": "frame", "conf": fr_score})
+    else:
+        logger.info(f"⚠️ 描边方框低分 ({fr_score:.1f} < {FRAME_STROKE_MIN_SCORE})")
+
+    # 策略 1: 高亮方块（带限，需要拼图块/背景图 DOM 位置）
+    # prior_y 取缺口行中心，与 gap_y 同为背景图自然坐标，两者必须同一坐标系
+    prior_y = (gap_y + int(slider_width) / 2) if gap_y is not None else None
+
     if tile_rect and bg_rect:
         hl_x, hl_y, hl_score = detect_gap_by_highlight(
             screenshot,
-            int(tile_rect["width"]) or 52,
-            prior_y=(tile_rect["y"] + tile_rect["height"] / 2),
-            bg_render_h=bg_rect["height"],
+            int(slider_width) or 52,
+            prior_y=prior_y,
             tile_rect=tile_rect,
             bg_rect=bg_rect,
         )
         if hl_score >= HIGHLIGHT_MIN_CONF:
             logger.info(f"✅ 高亮方块(带限)命中: gap_x={hl_x}, y={hl_y}, score={hl_score:.1f}")
-            candidates.append({"x": hl_x, "method": "highlight", "conf": hl_score})
+            candidates.append({"x": hl_x, "y": hl_y, "method": "highlight", "conf": hl_score})
         else:
             logger.info(f"⚠️ 高亮方块(带限)低分 ({hl_score:.1f} < {HIGHLIGHT_MIN_CONF})")
 
-        # 策略 0b: 高亮方块（全图，去掉 prior_y 限制）作为独立候选补位
+        # 策略 1b: 高亮方块（全图，去掉 prior_y 限制）作为独立候选补位
         hf_x, hf_y, hf_score = detect_gap_by_highlight(
-            screenshot, int(tile_rect["width"]) or 52, prior_y=None,
+            screenshot, int(slider_width) or 52, prior_y=None,
             tile_rect=tile_rect, bg_rect=bg_rect,
         )
         if hf_score >= HIGHLIGHT_MIN_CONF and all(abs(hf_x - c["x"]) > 6 for c in candidates):
             logger.info(f"✅ 高亮方块(全图)候选: gap_x={hf_x}, y={hf_y}, score={hf_score:.1f}")
-            candidates.append({"x": hf_x, "method": "highlight_full", "conf": hf_score})
+            candidates.append({"x": hf_x, "y": hf_y, "method": "highlight_full", "conf": hf_score})
     else:
         # 缺 DOM 位置时仍做全图高亮（不做拼图块预览排除），覆盖 DOM 提取失败的情况
         hf_x, hf_y, hf_score = detect_gap_by_highlight(
@@ -502,11 +675,11 @@ async def detect_gap(
         )
         if hf_score >= HIGHLIGHT_MIN_CONF:
             logger.info(f"✅ 高亮方块(全图/无DOM)候选: gap_x={hf_x}, y={hf_y}, score={hf_score:.1f}")
-            candidates.append({"x": hf_x, "method": "highlight_full", "conf": hf_score})
+            candidates.append({"x": hf_x, "y": hf_y, "method": "highlight_full", "conf": hf_score})
         else:
             logger.info(f"⚠️ 高亮方块(全图/无DOM)低分 ({hf_score:.1f} < {HIGHLIGHT_MIN_CONF})")
 
-    # 策略 1: 模板匹配(有拼图块截图时)
+    # 策略 2: 模板匹配(有拼图块截图时)
     if tile_screenshot:
         logger.info("🔍 尝试模板匹配...")
         # ★ 防自匹配：拼图块图案与缺口图案相同，若不涂黑拼图块自身区域，
@@ -562,7 +735,7 @@ async def detect_gap(
                     f"⚠️ 模板匹配未采信 (conf={tm_conf:.2f} < {min_conf} 或位置漂移)"
                 )
 
-    # 策略 2: 边缘检测（始终计算，作为最后兜底候选）
+    # 策略 3: 边缘检测（始终计算，作为最后兜底候选）
     edge_x, edge_conf = detect_gap_by_edge(screenshot, slider_width)
     edge_method = "edge" if edge_conf >= 1.5 else "edge_lowconf"
     candidates.append({"x": edge_x, "method": edge_method, "conf": edge_conf})
@@ -577,10 +750,14 @@ async def detect_gap(
     primary = candidates[0]
     logger.info(
         "🎯 缺口候选(按可靠度): "
-        + " | ".join(f"{c['method']}@{c['x']}({c['conf']:.1f})" for c in candidates)
+        + " | ".join(
+            f"{c['method']}@{c['x']}" + (f",{c['y']}" if c.get("y") is not None else "")
+            + f"({c['conf']:.1f})"
+            for c in candidates
+        )
     )
     if save_debug_path:
-        _draw_candidates(screenshot, candidates, save_debug_path)
+        _draw_candidates(screenshot, candidates, save_debug_path, int(slider_width))
 
     return primary["x"], primary["conf"], primary["method"], candidates
 

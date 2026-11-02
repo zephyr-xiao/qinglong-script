@@ -12,12 +12,65 @@ import time
 
 from .config import GPTQTCOOL_SCREENSHOT_DIR, logger
 from .detect import (
+    detect_captcha_overlay,
     detect_gap,
     detect_slider_captcha,
     dismiss_overlays,
     extract_captcha_images,
     has_captcha_failure_hint,
 )
+
+
+# ====================== 滑动距离（纯函数，可单测） ======================
+
+def compute_slide_distance(
+    gap_x: float,
+    scale_x: float = 1.0,
+    max_x: float = 268.0,
+    offset: float = 0.0,
+) -> float:
+    """把缺口 x 换算成鼠标需要拖动的距离。
+
+    站点 JS（/js/slider-captcha.js）的语义：
+        curX = startLeft + (clientX - startClientX)   # startLeft 恒为 0
+        piece.style.left = curX + 'px'
+        提交 sliderX = round(curX)，curX 被 clamp 到 [0, width - pieceSize]
+    也就是说：**鼠标位移必须等于缺口 x**（拼图块预览固定在 left:0），
+    与滑块手柄自己的左边缘无关——手柄是 left:2px，早期版本按
+    "背景图左 + 缺口x - 手柄左" 计算会稳定少 2px。
+
+    参数:
+        gap_x: 缺口左边缘（背景图自然坐标）
+        scale_x: 背景图 渲染宽 / 原始宽（CSS 缩放时 != 1）
+        max_x: 站点上限 width - pieceSize
+        offset: 用于失败后的微调试探（渲染像素）
+    """
+    if max_x <= 5:
+        return 5.0
+    return max(5.0, min(float(max_x), gap_x * scale_x + offset))
+
+
+def resolve_gap_y(
+    tile_rect: dict | None,
+    bg_rect: dict | None,
+    net_y: float | None = None,
+    nat_per_render_y: float = 1.0,
+) -> float | None:
+    """确定缺口行（背景图自然坐标）。
+
+    两个来源：接口 /auth/captcha 的 y（渲染坐标，piece 的 top）与 DOM 换算值
+    （tile_rect.y - bg_rect.y）。必须减去背景图原点并乘以 自然/渲染 比例——
+    早期版本直接把屏幕坐标当图像坐标传下去，导致"带限扫描"静默退化成全图扫描。
+    两者偏差超过 3px 时以 DOM 为准（多半是抓到了上一张验证码的接口参数）。
+    """
+    dom_y = None
+    if tile_rect and bg_rect:
+        dom_y = tile_rect["y"] - bg_rect["y"]
+    if net_y is not None and (dom_y is None or abs(float(net_y) - dom_y) <= 3):
+        return float(net_y) * nat_per_render_y
+    if dom_y is not None:
+        return dom_y * nat_per_render_y
+    return None
 
 
 # ====================== 拟人化轨迹（纯函数，可单测） ======================
@@ -39,8 +92,10 @@ def generate_human_track(distance: float) -> list[dict]:
     total_time = 400 + random.random() * 400 + distance * 1.5
     total_time = max(300, min(1200, total_time))
 
-    # 轨迹点数量
-    num_points = max(10, min(25, int(distance / 8)))
+    # 轨迹点数量：每个点对应一次 CDP 鼠标事件，而该站点的验证码弹窗带
+    # backdrop-filter 模糊，每次重绘约 100ms——点太多会让整段拖动拖到 6 秒，
+    # 既不像人（真人 0.5~2s）又拖慢重试。8~14 个点兼顾像人与耗时。
+    num_points = max(8, min(14, int(distance / 12)))
 
     # 生成每个点的进度(0~1),使用幂函数模拟加速-减速
     for i in range(1, num_points + 1):
@@ -191,11 +246,18 @@ async def _resolve_slider_box(page, slider_handle):
     return None, None
 
 
-async def perform_slide(page, handle_box: dict, slide_distance: float) -> bool:
+async def perform_slide(
+    page,
+    handle_box: dict,
+    slide_distance: float,
+    checkin_state: dict | None = None,
+) -> bool:
     """执行拟人化滑动操作。
 
-    成功判据：滑动后验证码消失，且没有出现"验证失败/验证超时"提示。
-    只看"验证码消失"会被残留的失败提示骗过（反之亦然），故两者结合。
+    成功判据优先级：
+    1. 有 /portal/checkin 响应（checkin_state）→ 直接看服务端 code，这是权威裁决；
+    2. 否则看 DOM：验证码弹窗消失且没有出现"验证失败/超时/请完成人机验证"提示。
+       只看"验证码消失"会被残留的失败提示骗过（反之亦然），故两者结合。
     """
     if not handle_box:
         logger.info("⚠️ 滑块 bounding_box 为空,跳过本次滑动")
@@ -211,11 +273,11 @@ async def perform_slide(page, handle_box: dict, slide_distance: float) -> bool:
     # 初始停顿
     await asyncio.sleep(0.1 + random.random() * 0.2)
 
-    # 移动鼠标到滑块(带小幅随机)
+    # 移动鼠标到滑块(带小幅随机)；步数不宜多，每次 CDP 事件都要触发弹窗重绘
     await page.mouse.move(
         start_x + (random.random() - 0.5) * 2,
         start_y + (random.random() - 0.5) * 2,
-        steps=3 + random.randint(0, 3),
+        steps=2,
     )
     await asyncio.sleep(0.05 + random.random() * 0.1)
 
@@ -230,34 +292,32 @@ async def perform_slide(page, handle_box: dict, slide_distance: float) -> bool:
     for track in tracks:
         current_x += track["x"]
         current_y += track["y"]
-        await page.mouse.move(
-            current_x, current_y,
-            steps=1 + random.randint(0, 2)
-        )
+        await page.mouse.move(current_x, current_y, steps=1)
         await asyncio.sleep(track["delay"] / 1000.0)
 
-    # 释放前微调
-    final_jitter_x = (random.random() - 0.5) * 2
-    final_jitter_y = (random.random() - 0.5) * 2
-    await page.mouse.move(
-        end_x + final_jitter_x,
-        start_y + final_jitter_y,
-        steps=2 + random.randint(0, 2),
-    )
-    await asyncio.sleep(0.1 + random.random() * 0.2)
+    # 释放前对齐到精确终点：轨迹末段有过冲/回调，而站点提交的 sliderX 就是
+    # 释放瞬间的位移，差 1px 都可能被判失败，这里不再加随机抖动
+    await page.mouse.move(end_x, current_y, steps=1)
+    await asyncio.sleep(0.1 + random.random() * 0.15)
 
     # 释放
     await page.mouse.up()
 
     logger.info("✅ 滑块拖动完成,等待验证结果...")
 
+    # 1. 服务端裁决：pointerup 后前端会 POST /portal/checkin
+    if checkin_state is not None:
+        verdict = await _wait_server_verdict(checkin_state)
+        if verdict is not None:
+            return verdict
+
     async def _passed() -> bool:
-        if await has_captcha_failure_hint(page):
-            logger.info("❌ 页面出现验证失败/超时提示")
+        if await detect_captcha_overlay(page):
             return False
-        if not await detect_slider_captcha(page):
-            return True
-        return False
+        if await has_captcha_failure_hint(page):
+            logger.info("❌ 页面出现验证失败/超时/人机验证提示")
+            return False
+        return True
 
     await asyncio.sleep(1.5 + random.random() * 1.0)
     if await _passed():
@@ -280,7 +340,29 @@ async def perform_slide(page, handle_box: dict, slide_distance: float) -> bool:
     return False
 
 
-async def slide_with_retry(page, handle_box: dict, container_box) -> bool:
+async def _wait_server_verdict(checkin_state: dict, timeout: float = 12.0) -> bool | None:
+    """等 /portal/checkin 的服务端裁决。
+
+    返回 True/False 表示服务端已明确通过/拒绝；超时没等到请求返回 None，
+    由调用方回退到 DOM 判定（例如拖动没被前端识别时根本不会有请求）。
+    """
+    base_seq = int(checkin_state.get("seq", 0))
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if int(checkin_state.get("seq", 0)) > base_seq:
+            code = checkin_state.get("code")
+            message = checkin_state.get("message") or ""
+            if code == 0:
+                logger.info("✅ 服务端确认签到成功(code=0)")
+                return True
+            logger.info(f"❌ 服务端拒绝(code={code}): {message}")
+            return False
+        await asyncio.sleep(0.25)
+    logger.info("ℹ️ 未等到 /portal/checkin 响应,回退页面文本判定")
+    return None
+
+
+async def slide_with_retry(page, handle_box: dict, container_box, checkin_state=None) -> bool:
     """带重试的宽范围滑动(找不到容器或置信度极低时降级)"""
     max_width = (container_box["width"] - handle_box["width"] - 15) if container_box else 300
     distances: list[float] = []
@@ -295,7 +377,7 @@ async def slide_with_retry(page, handle_box: dict, container_box) -> bool:
         idx = random.randint(0, len(distances) - 1)
         dist = distances.pop(idx)
         logger.info(f"🔄 [阶段 B] 尝试 #{attempt + 1}: 滑动距离={dist:.0f}px")
-        if await perform_slide(page, handle_box, dist):
+        if await perform_slide(page, handle_box, dist, checkin_state):
             return True
         await asyncio.sleep(1.0 + random.random())
 
@@ -307,6 +389,7 @@ async def slide_with_retry(page, handle_box: dict, container_box) -> bool:
 
 # 各检测方法对应的首选偏移扫描范围：越可靠的方法范围越小
 _METHOD_MAX_OFFSET = {
+    "frame": 3,
     "highlight": 8,
     "highlight_full": 8,
     "template": 12,
@@ -315,15 +398,16 @@ _METHOD_MAX_OFFSET = {
 }
 
 
-async def handle_slider_captcha(page) -> bool:
-    """处理滑动验证码 - 以屏幕截图坐标系为基准,多候选 + 高密度微调
+async def handle_slider_captcha(page, captcha_state=None, checkin_state=None) -> bool:
+    """处理滑动验证码 - 描边定位 + 缺口行先验 + 多候选微调
 
     关键处理:
-    1. 始终优先使用 page.screenshot(clip=container_box) 作为缺口检测输入,
-       保证检测坐标与页面渲染 1:1。
-    2. 若只能拿到 DOM 原始背景图,则按 natural/rendered 比例换算 gap_x。
-    3. 检测完成后保存背景图、拼图块、带标记的检测图,便于定位问题。
-    4. 主候选失败后在 gap_x ±10px 内高密度微调;仍失败则改试其它候选位置
+    1. 缺口行 y 优先取站点接口 /auth/captcha 的返回值（拼图块 top），
+       DOM 换算值交叉校验后兜底——拿到 y 就能把二维搜索降成一维。
+    2. 检测源优先用 DOM 背景图（不含拼图块预览），只有拿不到时才退容器截图。
+    3. 滑动距离按站点语义 = 缺口 x（不是"背景图左 + 缺口x - 手柄左"）。
+    4. 滑动后以服务端 /portal/checkin 的 code 为准判定成败。
+    5. 主候选失败后在 gap_x 附近小幅微调;仍失败则改试其它候选位置
        （该站点首次滑动失败常隐藏滑块,所以"首选就对"最关键,备选是补救）。
     """
     try:
@@ -374,7 +458,7 @@ async def handle_slider_captcha(page) -> bool:
 
         if not container_box:
             logger.info("⚠️ 无法定位验证码容器,使用宽范围滑动")
-            return await slide_with_retry(page, handle_box, None)
+            return await slide_with_retry(page, handle_box, None, checkin_state)
         logger.info(
             f"🖼️ 容器: x={container_box['x']:.0f} y={container_box['y']:.0f} "
             f"w={container_box['width']:.0f} h={container_box['height']:.0f}"
@@ -410,25 +494,44 @@ async def handle_slider_captcha(page) -> bool:
             bg_rendered_size = (container_box["width"], container_box["height"])
             logger.info("⚠️ 未提取到 DOM 背景图,回退使用容器截图")
 
-        # 若 DOM 背景图为原始图且渲染尺寸与原始尺寸不一致,记录缩放比例
-        scale_x = 1.0
-        if captcha_images.get("background") and captcha_images.get("bg_rect"):
-            rendered_w, rendered_h = bg_rect["width"], bg_rect["height"]
-            natural_w, natural_h = captcha_images["bg_natural"] or (rendered_w, rendered_h)
-            if natural_w and rendered_w and abs(rendered_w - natural_w) > 1:
-                scale_x = rendered_w / natural_w
-                logger.info(
-                    f"🔍 背景图原始/渲染缩放: natural={natural_w}x{natural_h}, "
-                    f"rendered={rendered_w:.0f}x{rendered_h:.0f}, scale_x={scale_x:.3f}"
-                )
+        # 坐标换算：检测算法全部在"背景图自然坐标"下工作，
+        # nat_per_render_* 是自然/渲染比，scale_x 是它的倒数（滑动距离要用渲染像素）
+        rendered_w, rendered_h = bg_rect["width"], bg_rect["height"]
+        natural_w, natural_h = captcha_images["bg_natural"] or (rendered_w, rendered_h)
+        nat_per_render_x = natural_w / max(1.0, rendered_w)
+        nat_per_render_y = natural_h / max(1.0, rendered_h)
+        scale_x = rendered_w / max(1.0, natural_w)
+        if abs(scale_x - 1.0) > 0.01:
+            logger.info(
+                f"🔍 背景图原始/渲染缩放: natural={natural_w}x{natural_h}, "
+                f"rendered={rendered_w:.0f}x{rendered_h:.0f}, scale_x={scale_x:.3f}"
+            )
 
-        # 检测缺口(背景图坐标系),返回按可靠度排序的多候选
+        # 缺口行先验：接口给的是渲染坐标（piece 的 top），换算成自然坐标；
+        # 与 DOM 换算值偏差超过 3px 说明拿到的可能是上一张验证码，以 DOM 为准
+        net_y = (captcha_state or {}).get("y")
+        gap_y_nat = resolve_gap_y(
+            captcha_images.get("tile_rect"), bg_rect, net_y, nat_per_render_y
+        )
+        if gap_y_nat is not None:
+            logger.info(f"🎯 缺口行先验: y={gap_y_nat:.0f}(背景图自然坐标)")
+
+        # 检测缺口(背景图自然坐标系),返回按可靠度排序的多候选
         detect_debug_path = GPTQTCOOL_SCREENSHOT_DIR / f"captcha_detect_{ts}.png"
         # 缺口宽 = 拼图块宽（实验证明传滑块宽会偏 53px：缺口实际与拼图块等宽）
         slider_width = (
-            int(captcha_images["tile_rect"]["width"])
-            if captcha_images.get("tile_rect") else int(handle_box["width"])
+            max(8, int(round(captcha_images["tile_rect"]["width"] * nat_per_render_x)))
+            if captcha_images.get("tile_rect")
+            else int(handle_box["width"] * nat_per_render_x)
         )
+        # 容器截图兜底时拼图块预览也在图上，排除其区域，避免预览描边被当成缺口
+        exclude_x1 = 0.0
+        if not captcha_images.get("background") and captcha_images.get("tile_rect"):
+            exclude_x1 = (
+                captcha_images["tile_rect"]["x"] - bg_rect["x"]
+                + captcha_images["tile_rect"]["width"]
+            ) * nat_per_render_x
+
         gap_x, conf, method, candidates = await detect_gap(
             bg_for_detection,
             slider_width,
@@ -441,18 +544,16 @@ async def handle_slider_captcha(page) -> bool:
             save_debug_path=detect_debug_path,
             tile_rect=captcha_images.get("tile_rect"),
             bg_rect=bg_rect,
+            gap_y=gap_y_nat,
+            exclude_x1=exclude_x1,
         )
 
-        # 4. 基准滑动距离
-        # gap_x 是缺口左边缘在背景图自然坐标系中的 x 坐标，
-        # DOM 渲染存在缩放时换算为渲染坐标，再与屏幕坐标混算
-        max_dist = bg_rect["width"] - handle_box["width"] - 10
-
-        def clamp(d: float) -> float:
-            return max(5, min(max_dist, d))
+        # 4. 滑动距离基准
+        # 站点 maxX = 背景图宽 - 拼图块宽；鼠标位移本身必须等于缺口 x（见 compute_slide_distance）
+        max_dist = max(10.0, bg_rect["width"] - slider_width * scale_x)
 
         logger.info(
-            f"📏 首选 gap_x={gap_x}px, 背景图左={bg_rect['x']:.0f}px, "
+            f"📏 首选 gap_x={gap_x}px(自然坐标), 背景图左={bg_rect['x']:.0f}px, "
             f"滑块左={handle_box['x']:.0f}px, method={method}, confidence={conf:.2f}"
         )
 
@@ -474,9 +575,9 @@ async def handle_slider_captcha(page) -> bool:
                     continue
                 miss_streak = 0
                 slider_handle = fresh_loc or slider_handle
-                dist = clamp(bg_rect["x"] + base_x * scale_x - fresh_box["x"] + offset)
+                dist = compute_slide_distance(base_x, scale_x, max_dist, offset)
                 logger.info(f"🔄 {tag} 基准x={base_x} offset={offset:+d} → 滑动距离={dist:.0f}px")
-                if await perform_slide(page, fresh_box, dist):
+                if await perform_slide(page, fresh_box, dist, checkin_state):
                     logger.info(f"✅ {tag} 命中! (基准x={base_x}, offset={offset:+d})")
                     return True
                 await asyncio.sleep(0.6 + random.random() * 0.4)
@@ -527,9 +628,9 @@ async def handle_slider_captcha(page) -> bool:
                 continue
             miss_streak = 0
             slider_handle = fresh_loc or slider_handle
-            dist = clamp(int(bg_rect["width"] * ratio))
-            logger.info(f"🔄 纯滑块 {ratio * 100:.0f}%: 距离={dist}px")
-            if await perform_slide(page, fresh_box, dist):
+            dist = min(max_dist, float(bg_rect["width"] * ratio))
+            logger.info(f"🔄 纯滑块 {ratio * 100:.0f}%: 距离={dist:.0f}px")
+            if await perform_slide(page, fresh_box, dist, checkin_state):
                 logger.info(f"✅ 纯滑块 {ratio * 100:.0f}% 命中!")
                 return True
             await asyncio.sleep(0.6 + random.random() * 0.4)
@@ -551,7 +652,12 @@ async def handle_slider_captcha(page) -> bool:
         return False
 
 
-async def wait_and_handle_captcha_with_retry(page, max_rounds: int = 2) -> bool | None:
+async def wait_and_handle_captcha_with_retry(
+    page,
+    max_rounds: int = 2,
+    captcha_state=None,
+    checkin_state=None,
+) -> bool | None:
     """等待并处理验证码(多轮检测 + 重试)
 
     返回:
@@ -564,6 +670,14 @@ async def wait_and_handle_captcha_with_retry(page, max_rounds: int = 2) -> bool 
     """
     wait_per_round = 4.0
     seen_captcha = False
+
+    async def _captcha_still_pending() -> bool:
+        """弹窗还在才算"验证码未过"。
+
+        签到失败后页面会留下"请完成人机验证"的结果文案，弹窗早已关闭；
+        按文案判断会把它当成验证码还在，白白空转并误判本轮结果。
+        """
+        return await detect_captcha_overlay(page)
 
     for attempt in range(1, max_rounds + 1):
         logger.info(f"⏳ 第{attempt}/{max_rounds}轮:检测验证码或结果...")
@@ -580,13 +694,15 @@ async def wait_and_handle_captcha_with_retry(page, max_rounds: int = 2) -> bool 
 
         seen_captcha = True
         logger.info(f"🔐 第{attempt}轮检测到滑动验证码,开始处理...")
-        if await handle_slider_captcha(page):
+        if await handle_slider_captcha(page, captcha_state, checkin_state):
             logger.info("✅ 验证码验证成功")
             return True
 
         await asyncio.sleep(2.0 + random.random())
 
-        if not await detect_slider_captcha(page):
+        if await has_captcha_failure_hint(page):
+            logger.info("⚠️ 页面出现验证失败提示,判定本次验证码未通过")
+        elif not await _captcha_still_pending():
             logger.info("✅ 验证码已消失,疑似验证通过")
             return True
 

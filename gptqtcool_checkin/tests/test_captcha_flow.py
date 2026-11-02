@@ -23,6 +23,9 @@ class _FakePage:
     async def evaluate(self, _script):
         return None
 
+    async def inner_text(self, _selector):
+        return ""
+
     def locator(self, _selector):
         return _FakeLocator()
 
@@ -70,16 +73,33 @@ def test_captcha_passed_returns_true(monkeypatch, fast_sleep):
 
 
 def test_captcha_disappears_after_handle_returns_true(monkeypatch, fast_sleep):
-    # 第1轮检测到 → 处理返回 False → 随后验证码消失 → 视为通过
+    # 第1轮检测到 → 处理返回 False → 弹窗消失且无失败提示 → 视为通过
     monkeypatch.setattr(slider, "detect_slider_captcha", _async_seq([True, False]))
     monkeypatch.setattr(slider, "handle_slider_captcha", _async_seq([False]))
+    monkeypatch.setattr(slider, "detect_captcha_overlay", _async_seq([False]))
+    monkeypatch.setattr(slider, "has_captcha_failure_hint", _async_seq([False]))
     result = asyncio.run(slider.wait_and_handle_captcha_with_retry(_FakePage()))
     assert result is True
 
 
 def test_captcha_never_passes_returns_false(monkeypatch, fast_sleep):
-    # 验证码始终在、处理始终失败 → 多轮后判失败
+    # 验证码弹窗始终在、处理始终失败 → 多轮后判失败
     monkeypatch.setattr(slider, "detect_slider_captcha", _async_seq([True]))
     monkeypatch.setattr(slider, "handle_slider_captcha", _async_seq([False]))
+    monkeypatch.setattr(slider, "detect_captcha_overlay", _async_seq([True]))
+    result = asyncio.run(slider.wait_and_handle_captcha_with_retry(_FakePage()))
+    assert result is False
+
+
+def test_failure_hint_without_overlay_is_not_a_pass(monkeypatch, fast_sleep):
+    """回归：弹窗已关但页面留下"请完成人机验证"，不能被判成验证通过。
+
+    站点在签到失败后会把结果文案留在页面上，旧逻辑按文案判断"验证码仍在"，
+    既误判结果又空转；现在按弹窗判定 + 失败文案判定分开处理。
+    """
+    monkeypatch.setattr(slider, "detect_slider_captcha", _async_seq([True]))
+    monkeypatch.setattr(slider, "handle_slider_captcha", _async_seq([False]))
+    monkeypatch.setattr(slider, "detect_captcha_overlay", _async_seq([False]))
+    monkeypatch.setattr(slider, "has_captcha_failure_hint", _async_seq([True]))
     result = asyncio.run(slider.wait_and_handle_captcha_with_retry(_FakePage()))
     assert result is False
