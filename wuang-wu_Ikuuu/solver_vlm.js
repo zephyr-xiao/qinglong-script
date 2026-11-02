@@ -108,26 +108,37 @@ function extractJson(text) {
 // 推理模型会把思路也写进 token，故用一行"简洁推理"指令压住思考长度（否则容易撞 max_tokens 被截断）
 const BRIEF = '请用最简短的思路直接得出结论（推理不超过 6 行，不要复述题目）。';
 
-// 从站点提示语里取"要选几个"（如「选 3 个符合右图的图片」「请选出2个相同的」）；取不到返回 0
+// 从站点提示语里取"要选几个"；取不到返回 0
+// 站点改版后提示语会变成英文（Select 3 images with …），只认中文"选 N 个"会漏掉数量，
+// 导致提示词退化成"给出所有匹配格子"，模型容易多给或漏给
 function wantedCount(promptText) {
-  const m = /选[出取]?\s*(\d+)\s*个/.exec(promptText || '');
+  const text = promptText || '';
+  const m = /选[出取]?\s*(\d+)\s*个/.exec(text) || /select\s+(\d+)\s+images?/i.exec(text);
   return m ? Number(m[1]) : 0;
 }
 
-function buildPrompt(type, tplCount, size, promptText) {
+function buildPrompt(type, tplCount, size, promptText, grid) {
   const head = `上图是验证图（宽 ${size.w} 像素、高 ${size.h} 像素；红色网格线每 25 像素一条，边缘标注的数字就是像素坐标，`
     + '左上角为 (0,0)，x 向右增大，y 向下增大）。';
   const site = promptText ? `站点给出的提示语是「${promptText}」。\n` : '';
   if (type === 'nine') {
+    const cols = Math.max(1, Number(grid && grid.cols) || 3);
+    const rows = Math.max(1, Number(grid && grid.rows) || 3);
+    const gridDesc = cols === 3 && rows === 3
+      ? '验证图被均分为 3×3 九个格子（横为列 i=0..2 从左到右，纵为行 j=0..2 从上到下）。'
+      : `验证图被均分为 ${cols} 列 × ${rows} 行共 ${cols * rows} 个格子（横为列 i=0..${cols - 1} 从左到右，`
+        + `纵为行 j=0..${rows - 1} 从上到下）。`;
     const want = wantedCount(promptText);
     const pick = want > 0
-      ? `第 2 步：从匹配的格子中按与待找图案的相似度挑出 **${want} 个**（即使有更多看着相似的，也只给最像的这几个），给出它们的中心像素坐标（整图坐标，x 范围 0-${size.w}，y 范围 0-${size.h}）。\n`
-      : `第 2 步：给出所有匹配格子的中心像素坐标（整图坐标，x 范围 0-${size.w}，y 范围 0-${size.h}）。\n`;
+      ? `第 2 步：从匹配的格子中按与待找图案的相似度挑出 **${want} 个**（即使有更多看着相似的，也只给最像的这几个），`
+        + `给出它们各自**格子中心**的像素坐标（整图坐标，x 范围 0-${size.w}，y 范围 0-${size.h}）。\n`
+      : `第 2 步：给出所有匹配格子**格子中心**的像素坐标（整图坐标，x 范围 0-${size.w}，y 范围 0-${size.h}）。\n`;
     return `${head}\n图下方是待找图案 [1]。${site}`
-      + '验证图被均分为 3×3 九个格子（横为列 i=0..2 从左到右，纵为行 j=0..2 从上到下）。\n'
+      + `${gridDesc}\n`
       + '请分两步完成：\n'
-      + '第 1 步：逐格检查九个格子，指出每一格的内容以及是否与待找图案相同（注意区分相似但不同的物品）；\n'
+      + `第 1 步：逐格检查这 ${cols * rows} 个格子，指出每一格的内容以及是否与待找图案相同（注意区分相似但不同的物品）；\n`
       + pick
+      + '注意：同一格只能选一次；坐标要落在格子中心，不要给格内的偏移位置。\n'
       + `${BRIEF}\n`
       + '只输出 JSON（不要解释）：{"cells": [{"i": 0, "j": 0, "match": true, "x": 0, "y": 0}], "clicks": [[x1,y1],...]}';
   }
@@ -141,7 +152,7 @@ function buildPrompt(type, tplCount, size, promptText) {
 }
 
 // 用 headless Chromium 渲染合成图（复用 playwright：挑战图是 JPEG，浏览器解码/编码最省事）
-async function composeImage({ type, imagePath, tplPaths, imageSize }) {
+async function composeImage({ type, imagePath, tplPaths, imageSize, grid }) {
   const { chromium } = require('playwright');
   const dataUrl = (file) => {
     const buf = fs.readFileSync(file);
@@ -184,7 +195,7 @@ async function composeImage({ type, imagePath, tplPaths, imageSize }) {
     const page = await browser.newPage({ viewport: { width: Math.max(w + 40, 420), height: h + 260 } });
     await page.setContent(html, { waitUntil: 'load', timeout: 20000 });
     // 画网格（线在放大尺度上，标注用原始像素坐标）
-    await page.evaluate(({ imageSize, zoom }) => {
+    await page.evaluate(({ imageSize, zoom, grid }) => {
       const cv = document.getElementById('grid');
       const g = cv.getContext('2d');
       g.font = `${Math.round(11 * zoom / 3)}px sans-serif`;
@@ -204,7 +215,34 @@ async function composeImage({ type, imagePath, tplPaths, imageSize }) {
           g.fillText(String(y), 2, y * zoom + 12 * zoom / 3 + 2);
         }
       }
-    }, { imageSize, zoom: ZOOM });
+      // 九宫格题：把格子边界画粗，并在每格中心标注序号，避免模型把相邻格看成一格
+      if (grid && grid.cols > 1 && grid.rows > 1) {
+        g.lineWidth = Math.max(2, zoom / 2);
+        g.strokeStyle = 'rgba(0,220,255,0.95)';
+        for (let c = 0; c <= grid.cols; c++) {
+          const x = (imageSize.w * c) / grid.cols;
+          g.beginPath(); g.moveTo(x * zoom, 0); g.lineTo(x * zoom, imageSize.h * zoom); g.stroke();
+        }
+        for (let r = 0; r <= grid.rows; r++) {
+          const y = (imageSize.h * r) / grid.rows;
+          g.beginPath(); g.moveTo(0, y * zoom); g.lineTo(imageSize.w * zoom, y * zoom); g.stroke();
+        }
+        g.lineWidth = 1;
+        g.font = `bold ${Math.round(14 * zoom / 3)}px sans-serif`;
+        for (let r = 0; r < grid.rows; r++) {
+          for (let c = 0; c < grid.cols; c++) {
+            const cx = ((c + 0.5) * imageSize.w) / grid.cols;
+            const cy = ((r + 0.5) * imageSize.h) / grid.rows;
+            const label = String(r * grid.cols + c);
+            const tw = g.measureText(label).width;
+            g.fillStyle = 'rgba(0,0,0,0.55)';
+            g.fillRect(cx * zoom - tw / 2 - 3, cy * zoom - 9 * zoom / 3, tw + 6, 12 * zoom / 3);
+            g.fillStyle = '#00e5ff';
+            g.fillText(label, cx * zoom - tw / 2, cy * zoom + 1);
+          }
+        }
+      }
+    }, { imageSize, zoom: ZOOM, grid: grid || null });
     const el = await page.$('#wrap');
     return await el.screenshot({ type: 'png' });
   } finally {
@@ -607,7 +645,7 @@ async function main() {
     }
     try {
       const composed = await composeImage({
-        type: req.type, imagePath: req.imagePath, tplPaths, imageSize: size,
+        type: req.type, imagePath: req.imagePath, tplPaths, imageSize: size, grid: req.grid,
       });
       if (DEBUG) {
         const dir = path.join(__dirname, '_vlm_debug');
@@ -615,7 +653,7 @@ async function main() {
         fs.writeFileSync(path.join(dir, `${Date.now()}_${req.type || 'unknown'}.png`), composed);
         rotateDebugDir(dir);
       }
-      const prompt = buildPrompt(req.type, Math.max(1, tplPaths.length), size, req.promptText);
+      const prompt = buildPrompt(req.type, Math.max(1, tplPaths.length), size, req.promptText, req.grid);
       const results = [];
       for (let i = 0; i < VOTES; i++) {
         const parsed = await callModel(composed, prompt, i + 1);

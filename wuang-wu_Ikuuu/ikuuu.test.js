@@ -18,6 +18,8 @@ const {
   imageSize,
   extractSolverJson,
   normalizeClicks,
+  cellIndexForPoint,
+  clickImagePoint,
   solverUnavailable,
   solverFatal,
   isRetryableStatus,
@@ -926,4 +928,89 @@ test('resolveChromiumPath: 环境变量优先于自动探测', () => {
     if (saved === undefined) delete process.env.IKUUU_CHROMIUM_PATH;
     else process.env.IKUUU_CHROMIUM_PATH = saved;
   }
+});
+
+// ==========================================
+// 九宫格题（站点 2026-11 改版后的主流形式）
+// 多个 .geetest_item_img 共用一张精灵图、页面上没有 .geetest_bg。
+// 旧逻辑会退化成"窗口里第一个带背景图的元素"= 左上角第 0 格，
+// 于是模型给的三个点全部被映射进同一格 —— 2026-11-01 六轮全挂的根因。
+// ==========================================
+
+const GRID9 = { cols: 3, rows: 3 };
+const SPRITE9 = { w: 300, h: 261 };   // 实测精灵图尺寸（3×3 拼接）
+
+test('cellIndexForPoint: 精灵图坐标 → 格子序号', () => {
+  // 三只蝴蝶分别在第 1/2/6 格（2026-11-01 现场抓到的真题，人工按这三格点击站点判过）
+  assert.strictEqual(cellIndexForPoint(150, 43, SPRITE9, GRID9), 1);
+  assert.strictEqual(cellIndexForPoint(250, 43, SPRITE9, GRID9), 2);
+  assert.strictEqual(cellIndexForPoint(50, 217, SPRITE9, GRID9), 6);
+  // 中心格 / 右下角
+  assert.strictEqual(cellIndexForPoint(150, 130, SPRITE9, GRID9), 4);
+  assert.strictEqual(cellIndexForPoint(299, 260, SPRITE9, GRID9), 8);
+  // 越界与负数必须夹回有效格，不能算出负序号或 NaN
+  assert.strictEqual(cellIndexForPoint(-5, -5, SPRITE9, GRID9), 0);
+  assert.strictEqual(cellIndexForPoint(999, 999, SPRITE9, GRID9), 8);
+});
+
+test('cellIndexForPoint: 非 3×3 的格子数按 grid 计算', () => {
+  const size = { w: 200, h: 200 };
+  assert.strictEqual(cellIndexForPoint(10, 10, size, { cols: 2, rows: 2 }), 0);
+  assert.strictEqual(cellIndexForPoint(150, 10, size, { cols: 2, rows: 2 }), 1);
+  assert.strictEqual(cellIndexForPoint(150, 150, size, { cols: 2, rows: 2 }), 3);
+  // grid 缺失时按 3×3 兜底，不抛异常（200 宽三等分，x=100 落在中列）
+  assert.strictEqual(cellIndexForPoint(100, 20, size, null), 1);
+});
+
+function fakePage(calls) {
+  return {
+    viewportSize: () => ({ width: 1280, height: 900 }),
+    waitForTimeout: async () => {},
+    mouse: { move: async () => {}, down: async () => {}, up: async () => {} },
+    evaluate: async (fn, arg) => {
+      calls.push(arg);
+      // 与真实实现一致：整图布局返回不带 cell 字段的点
+      return arg.cell === null ? { x: 10, y: 20 } : { x: 10, y: 20, cell: arg.cell };
+    },
+  };
+}
+
+test('clickImagePoint: 九宫格按坐标折算格子，不会全落到第 0 格', async () => {
+  const calls = [];
+  const page = fakePage(calls);
+  const challenge = { layout: 'grid9', grid: GRID9, imageUrl: 'https://x/sprite.jpg', rect: { x: 0, y: 0, w: 300, h: 261 } };
+  const p1 = await clickImagePoint(page, challenge, 150, 43, SPRITE9);
+  const p2 = await clickImagePoint(page, challenge, 250, 43, SPRITE9);
+  const p3 = await clickImagePoint(page, challenge, 50, 217, SPRITE9);
+  assert.deepStrictEqual(calls.map((c) => c.cell), [1, 2, 6]);
+  assert.deepStrictEqual([p1.cell, p2.cell, p3.cell], [1, 2, 6]);
+});
+
+test('clickImagePoint: 整图布局走比例映射，不带格子语义', async () => {
+  const calls = [];
+  const page = fakePage(calls);
+  const challenge = { layout: 'single', grid: null, imageUrl: 'https://x/bg.jpg', rect: { x: 0, y: 0, w: 300, h: 200 } };
+  const pt = await clickImagePoint(page, challenge, 100, 50, { w: 300, h: 200 });
+  assert.strictEqual(calls[0].cell, null);      // 不进入格子分支
+  assert.strictEqual(calls[0].url, 'https://x/bg.jpg'); // 仍按背景图 URL 定位元素
+  assert.strictEqual(pt.cell, undefined);
+});
+
+test('wantedCount: 站点改版后的英文提示语也要取到数量', () => {
+  assert.strictEqual(wantedCount('Select  3  images with'), 3);  // 现场真实文案（双空格）
+  assert.strictEqual(wantedCount('Select 2 images with'), 2);
+  assert.strictEqual(wantedCount('select 4 image'), 4);
+  assert.strictEqual(wantedCount('Select images with'), 0);
+});
+
+test('buildPrompt: 九宫格按实际行列数描述，并要求给格子中心', () => {
+  const p3 = buildPrompt('nine', 1, SPRITE9, 'Select  3  images with', GRID9);
+  assert.match(p3, /3×3 九个格子/);
+  assert.match(p3, /\*\*3 个\*\*/);            // 数量取自英文提示语
+  assert.match(p3, /格子中心/);                  // 明确要格子中心，不要格内偏移
+  assert.match(p3, /同一格只能选一次/);
+
+  const p12 = buildPrompt('nine', 1, { w: 400, h: 300 }, '选 4 个', { cols: 4, rows: 3 });
+  assert.match(p12, /4 列 × 3 行共 12 个格子/);
+  assert.match(p12, /\*\*4 个\*\*/);
 });
