@@ -50,7 +50,7 @@ task newapi_checkin/newapi_checkin.py
 
 | key | 名称 | 站点地址 | 认证方式 |
 |---|---|---|---|
-| `api456` | 可萌中转站 | https://api456.me | New-Api-User Header + Session Cookie |
+| `api456` | 可萌中转站 | https://api456.me | Bearer Token（站点已升级 New API 新版 JWT 鉴权） |
 | `gemai` | 哈基米 API 站 | https://api.gemai.cc | New-Api-User Header |
 | `dzzi` | DZZI.AI（大肘子API） | https://api.dzzi.ai | Bearer Token |
 

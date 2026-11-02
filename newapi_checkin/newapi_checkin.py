@@ -7,7 +7,7 @@ cron: 8 8 * * *
 适配青龙面板 - 仅依赖 requests + 标准库
 
 支持站点：
-  - 可萌中转站      (api456.me, New API)               New-Api-User Header + Session Cookie
+  - 可萌中转站      (api456.me, New API)               Bearer Token
   - 哈基米 API 站   (api.gemai.cc, New API)            New-Api-User Header
   - DZZI.AI 大肘子API (api.dzzi.ai, New API)            Bearer Token
   - 自定义任意 API 站                                    通过 QZD_CUSTOM JSON 配置
@@ -104,13 +104,16 @@ SITE_PRESETS = {
             "login_method": "POST",
             "login_body_template": '{"username": "{{username}}", "password": "{{password}}"}',
             "login_content_type": "application/json",
-            "token_path": "data.id",
+            # 站点已升级到 New API 新版（JWT 鉴权）：登录响应为 data.access_token，
+            # 旧版 data.id + New-Api-User 头会返回 401 AUTH_UNAUTHORIZED
+            "token_path": "data.access_token",
+            "token_expires_path": "data.access_expires_at",
             "signin_url": "https://api456.me/api/user/checkin",
             "signin_method": "POST",
             "signin_body": "{}",
             "signin_content_type": "application/json",
-            "auth_header_name": "New-Api-User",
-            "auth_header_template": "{{token}}",
+            "auth_header_name": "Authorization",
+            "auth_header_template": "Bearer {{token}}",
             "success_field": "success",
             "message_field": "message",
             "quota_info_url": "https://api456.me/api/user/self",
@@ -312,7 +315,7 @@ def _build_cache_payload(session, config: dict, token: str, login_data) -> dict:
     """
     构造三合一缓存内容：token + 会话 Cookie 快照 + 可选过期时间。
 
-    session Cookie 对 New API 传统版（api456/gemai）是必需凭证，
+    session Cookie 对 New API 传统版（gemai）是必需凭证，
     只存 token 的旧格式会导致缓存命中后仍要重新登录。
     """
     payload = {"token": token, "cookies": _snapshot_cookies(session)}
