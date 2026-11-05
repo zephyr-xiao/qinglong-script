@@ -1,8 +1,8 @@
 # 尚香书苑签到 - 青龙面板脚本
 
-自动完成尚香书苑论坛（Discuz! X3.5，主域名不定期更换，当前为 sxsy33.com）`k_misign` 插件的每日签到。
+自动完成尚香书苑论坛（Discuz! X3.5，主域名不定期更换，当前为 sxsy33.com）每日签到。
 
-该站**登录强制图片验证码**，且 k_misign 签到还叠加了一道**算术验证**（"签到验证：9 + 15 = ?"），两道都能自动通过，无需人工介入。
+站点 2026-11-05 把签到插件从 `k_misign` 换成了自研的 `sx_signin`（旧地址 `plugin.php?id=k_misign:sign` 现在返回「插件不存在或已关闭」）。新插件签到页内嵌 `window.SIGNIN` 配置，签到需要提交 **4 位图形验证码**，脚本用 ddddocr 本地识别后调 JSON 接口完成签到。
 
 ## 特性
 
@@ -10,10 +10,10 @@
 - **域名自动发现**：站点换主域名后自动切换，不用改代码（见下节）
 - **默认直连**：本站国内可达，脚本不读全局 `HTTPS_PROXY`（走境外代理反而会被 Cloudflare 当数据中心 IP 发质询）；需要时用 `SXSY_PROXY` 显式指定
 - 账密模式自动识别登录验证码：本地 **ddddocr** OCR（识别错自动换图重试，最多 3 次）
+- 签到图形验证码同样用 ddddocr 识别，识别错自动换图重试（最多 3 次）
 - 登录 Cookie JSON 缓存复用：缓存有效完全不走登录流程，失效自动重登
-- 签到算术验证自动计算（支持 `+ - × ÷`）
-- 已签到自动跳过（以签到页有无 `JD_sign` 按钮为准，幂等可重复执行）
-- 签到后输出统计：连续天数 / 等级 / 积分奖励 / 累计天数
+- 已签到自动跳过（以签到页 `window.SIGNIN.signed` 为准，幂等可重复执行）
+- 签到后输出统计：连续天数 / 累计天数 / 本次奖励
 - 站点瞬时故障自动重试：Cloudflare 520~526（本站常见 522 回源超时）、网关 5xx 与网络异常都会退避重试，重试仍失败才报错
 - Cloudflare 人机质询（403 `Just a moment...`）单独识别：按出口 IP 风控处理，不清 Cookie 缓存、不空耗登录重试，报错直接说明与账号密码无关
 - 不误判登录态：论坛首页拿不到正常页面时保留 Cookie 缓存继续签到，不会因为一次 522 就清空缓存去重登
@@ -25,33 +25,45 @@
 | 方式 | 环境变量 | 优点 | 注意 |
 |---|---|---|---|
 | 账号密码 | `SXSY_ACCOUNTS` 格式 `用户名#密码` | 免维护，Cookie 失效自动重登 | 需安装 `ddddocr` 依赖 |
-| Cookie 直签 | `SXSY_ACCOUNTS` 直接填整段 Cookie（不含 `#`） | 不需要 ddddocr | Cookie 过期需手动重新抓取 |
+| Cookie 直签 | `SXSY_ACCOUNTS` 直接填整段 Cookie（不含 `#`） | 不需要登录验证码 | 需安装 `ddddocr`（签到验证码要用）；Cookie 过期需手动重新抓取 |
 
 两种格式都填在 `SXSY_ACCOUNTS` 一个变量里，脚本按是否含 `#` 自动区分。
 
 > 登录验证码识别连续 3 次失败会放弃并提示改用 Cookie 模式（避免反复触发站点风控）。
-> 账号密码错误属于致命错误，**不会自动重试**。
+> 账号密码错误属于致命错误，**不会自动重试**；站点限流文案「密码错误次数过多，请 15 分钟后重新登录」同样按致命错误处理。
 
-## 接口流程（2026-09-29 实测）
+## 接口流程（2026-11-06 实测）
 
 ### 登录（仅账密模式）
 
 | 步骤 | 请求 | 说明 |
 |---|---|---|
-| 1 | `GET member.php?mod=logging&action=login` | 取 `formhash` 与验证码入口 `idhash`（当前固定为 `cS`） |
+| 1 | `GET member.php?mod=logging&action=login` | 取 `formhash`、表单 `loginhash` 与验证码入口 `idhash`（当前固定为 `cS`） |
 | 2 | `GET misc.php?mod=seccode&action=update&idhash=<x>&modid=member::logging&inajax=1` | 返回 JS，内含真实 `seccodehash` |
 | 3 | `GET misc.php?mod=seccode&update=<随机>&idhash=<x>` | 验证码 PNG，送 ddddocr 识别 |
-| 4 | `POST member.php?mod=logging&action=login&loginsubmit=yes` | body 含账密 + `seccodehash` / `seccodemodid` / `seccodeverify` 三件套；响应含 `succeedhandle` 即成功 |
+| 4 | `POST member.php?mod=logging&action=login&loginsubmit=yes&loginhash=<x>` | body 含账密 + `seccodehash` / `seccodemodid` / `seccodeverify` 三件套；响应含 `succeedhandle` 或会话出现 `*_auth` Cookie 即成功 |
 
-### 签到（k_misign）
+> 判定登录成功**不能**只看 `succeedlocation`：登录页模板里也有这个元素，登录失败被原样返回时会误判成功。
+
+### 签到（sx_signin）
 
 | 步骤 | 请求 | 说明 |
 |---|---|---|
-| 1 | `GET plugin.php?id=k_misign:sign` | 有 `id="JD_sign"` 按钮 → 今天未签；无按钮且有 `lxdays` 统计 → 已签（幂等跳过）；被跳转登录页 → 登录态失效 |
-| 2 | `GET plugin.php?id=k_misign:sign&operation=qiandao&formhash=<fh>&format=text` | 返回算术验证题 XML（`var q="签到验证：A - B = ?"`） |
-| 3 | `GET ...&mathverify_answer=<计算结果>` | 答对即完成签到，返回结果 XML |
+| 1 | `GET plugin.php?id=sx_signin:index` | 解析内嵌 `window.SIGNIN`：`signed=1` 即今天已签（幂等跳过），`ajax` / `formhash` / `captchaUrl` 都在里面 |
+| 2 | `GET plugin.php?id=sx_signin:captcha&t=<毫秒>` | 4 位图形验证码（100×36），送 ddddocr 识别 |
+| 3 | `POST plugin.php?id=sx_signin:ajax` | form-urlencoded `op=signin&formhash=<fh>&seccode=<code>`；返回 JSON：`code=0` 成功（带 `credit/streak/total`）、`code=2` 今天已签、`code=11` 验证码错误 |
+| 4 | 再 `GET` 一次签到页 | 以 `window.SIGNIN.signed == 1` 为最终判据 |
 
-签到最终状态以**回查签到页 `JD_sign` 是否消失**为准（接口返回文案因插件版本而异，不作判据）。回查页本身拿不到时，只有接口文案明确含"已签到/签到成功"才判成功，并标注"回查页暂不可用"。
+签到最终状态以**回查签到页 `signed` 是否为 1** 为准（接口文案因插件版本而异，不作唯一判据）。回查页本身拿不到时，只有接口 `code=0` 才判成功，并标注"回查页暂不可用"。
+
+### 登录态判定
+
+签到页与接口响应都要区分「已登录」和「被踢回登录页」：
+
+- 登录页：页面含 `id="loginform_` 或 `discuz_uid = '0'`
+- 已登录：页面含非 0 的 `discuz_uid`
+
+**不要用 `member.php?mod=logging` 子串判断**：已登录页面的「退出」链接正是 `member.php?mod=logging&action=logout`，2026-11-05 的失败就是被这个子串误判成"登录态失效"，导致清 Cookie 重登后仍然报同样的错。
 
 ## 域名自动发现
 
@@ -135,13 +147,13 @@ curl -x http://<代理地址>:7890 -s -o /dev/null -w 'proxy:  %{http_code}\n' '
 青龙面板 →「依赖管理」→「Python」：
 
 - `requests`（必装）
-- `ddddocr`（账密模式必装；只用 Cookie 模式可不装）
+- `ddddocr`（必装：登录验证码与签到图形验证码都要识别）
 
 ## 本地测试
 
 ```bash
 cd sxsy45_checkin
-python -m unittest discover -s tests -v   # 85 个离线单测，不发真实请求
+python -m unittest discover -s tests -v   # 96 个离线单测，不发真实请求
 
 # 真实干跑
 SXSY_ACCOUNTS="用户名#密码" SXSY_NOTIFY=false python sxsy45_checkin.py

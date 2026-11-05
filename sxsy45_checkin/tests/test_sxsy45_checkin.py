@@ -2,6 +2,7 @@
 """sxsy45_checkin 单元测试（纯函数 + mock 分支判定，不发真实请求）"""
 import contextlib
 import io
+import json
 import os
 import sys
 import types
@@ -20,50 +21,102 @@ except SystemExit:
     import sxsy45_checkin as msc
 
 
-# ---------- 实测样本（2026-09-29 真机抓取） ----------
-SAMPLE_JD_SIGN_HREF = (
-    '<a id="JD_sign" href="plugin.php?id=k_misign:sign&operation=qiandao'
-    '&formhash=9a17bb38&format=text" onclick="ajaxget(this.href, \'k_misign_sign_tip\','
-    ' \'\', \'\', \'\', \'kMisignPcAfterSign();\');return false;" class="btn J_chkitot">'
-)
-SAMPLE_STATS = ('<input type="hidden" id="lxdays" value="1" />'
-                '<input type="hidden" id="lxlevel" value="2" />'
-                '<input type="hidden" id="lxreward" value="2" />'
-                '<input type="hidden" id="lxtdays" value="5" />')
-SAMPLE_MATH_Q_ADD = '<div>var q="签到验证：9 + 15 = ?";var a=prompt(q,"");</div>'
-SAMPLE_MATH_Q_SUB = '<div>var q="签到验证：12 - 2 = ?";var a=prompt(q,"");</div>'
-SAMPLE_MATH_Q_MUL = '<div>var q="签到验证：7 × 6 = ?";var a=prompt(q,"");</div>'
-SAMPLE_RESULT_XML = '<?xml version="1.0" encoding="utf-8"?>\r\n<root><![CDATA[已签到]]></root>'
+# ---------- 实测样本（2026-11-06 真机抓取，sx_signin 插件） ----------
+def _signin_page(signed=0, formhash="414fc3f0", streak=32, total=37):
+    """构造签到页样本：结构与真实页面一致（window.SIGNIN 配置 + 统计数字）。"""
+    cfg = {
+        "ajax": "https://sxsy33.com/plugin.php?id=sx_signin:ajax",
+        "formhash": formhash,
+        "signed": signed,
+        "captcha": 1,
+        "captchaUrl": "https://sxsy33.com/plugin.php?id=sx_signin:captcha",
+    }
+    return ('<p class="signin-status-text" id="signin-status-text">今日未签到</p>'
+            f'<span class="num" id="signin-streak">{streak}</span>'
+            f'<span class="num" id="signin-total">{total}</span>'
+            f'<script type="text/javascript">window.SIGNIN = {json.dumps(cfg)};</script>')
 
 
-class TestSolveMath(unittest.TestCase):
-    """算术验证题解析（k_misign mathverify）"""
+# 登录页模板里也有 succeedlocation，登录成功判定不能只看它
+SAMPLE_LOGIN_PAGE = ('<form id="loginform_LNX0i" action="member.php?mod=logging&action=login'
+                     '&loginsubmit=yes&loginhash=LNX0i">'
+                     '<input type="hidden" name="formhash" value="9a17bb38" />'
+                     '</form><p id="succeedlocation" class="alert_btnleft"></p>')
 
-    def test_add(self):
-        self.assertEqual(msc.solve_math("签到验证：9 + 15 = ?"), 24)
+# 已登录页面：退出链接同样命中 "member.php?mod=logging" 子串
+SAMPLE_LOGGED_IN_PAGE = (
+    '<a href="member.php?mod=logging&amp;action=logout&amp;formhash=bc7adba7">退出</a>'
+    "<script>var discuz_uid = '534151';</script>")
 
-    def test_sub(self):
-        self.assertEqual(msc.solve_math("签到验证：12 - 2 = ?"), 10)
+SAMPLE_SECCODE_UPDATE = '<input type="hidden" name="seccodehash" type="hidden" value="S12ab" />'
 
-    def test_sub_negative(self):
-        self.assertEqual(msc.solve_math("签到验证：2 - 5 = ?"), -3)
 
-    def test_mul_fullwidth(self):
-        self.assertEqual(msc.solve_math("签到验证：7 × 6 = ?"), 42)
+class TestParseSigninConfig(unittest.TestCase):
+    """window.SIGNIN 配置解析：签到流程的 formhash/ajax/验证码开关都来自这里。"""
 
-    def test_div_even(self):
-        self.assertEqual(msc.solve_math("签到验证：8 ÷ 2 = ?"), 4)
+    def test_valid(self):
+        cfg = msc.parse_signin_config(_signin_page())
+        self.assertEqual(cfg["formhash"], "414fc3f0")
+        self.assertEqual(cfg["signed"], 0)
+        self.assertTrue(cfg["captchaUrl"].endswith("sx_signin:captcha"))
 
-    def test_div_uneven_returns_float(self):
-        self.assertEqual(msc.solve_math("签到验证：7 ÷ 2 = ?"), 3.5)
+    def test_missing_returns_empty(self):
+        self.assertEqual(msc.parse_signin_config("<html>插件不存在或已关闭</html>"), {})
 
-    def test_div_by_zero(self):
-        self.assertIsNone(msc.solve_math("签到验证：5 ÷ 0 = ?"))
+    def test_bad_json_returns_empty(self):
+        self.assertEqual(msc.parse_signin_config("window.SIGNIN = {oops};"), {})
 
-    def test_garbage_returns_none(self):
-        self.assertIsNone(msc.solve_math("签到验证：abc = ?"))
-        self.assertIsNone(msc.solve_math(""))
-        self.assertIsNone(msc.solve_math(None))
+    def test_non_dict_json_returns_empty(self):
+        self.assertEqual(msc.parse_signin_config("window.SIGNIN = [1,2];"), {})
+
+    def test_empty_input(self):
+        self.assertEqual(msc.parse_signin_config(""), {})
+        self.assertEqual(msc.parse_signin_config(None), {})
+
+
+class TestIsLoginPage(unittest.TestCase):
+    """登录态判据回归：已登录页面的「退出」链接不得被当成登录页。"""
+
+    def test_logged_in_page_with_logout_link(self):
+        self.assertFalse(msc.is_login_page(SAMPLE_LOGGED_IN_PAGE))
+
+    def test_guest_login_form(self):
+        self.assertTrue(msc.is_login_page(SAMPLE_LOGIN_PAGE))
+
+    def test_guest_uid_zero(self):
+        self.assertTrue(msc.is_login_page("discuz_uid = '0'"))
+
+    def test_normal_page(self):
+        self.assertFalse(msc.is_login_page("<html><title>每日签到 - 尚香书苑</title></html>"))
+
+    def test_empty(self):
+        self.assertFalse(msc.is_login_page(""))
+
+
+class TestHasAuthCookie(unittest.TestCase):
+    """Discuz 的 *_auth Cookie 是登录成功的确定信号。"""
+
+    class _Cookie:
+        def __init__(self, name, value):
+            self.name, self.value = name, value
+
+    def _session(self, cookies):
+        s = mock.MagicMock()
+        s.cookies = cookies
+        return s
+
+    def test_auth_cookie_present(self):
+        self.assertTrue(msc.has_auth_cookie(
+            self._session([self._Cookie("u52q_2132_saltkey", "K"),
+                           self._Cookie("u52q_2132_auth", "V")])))
+
+    def test_no_auth_cookie(self):
+        self.assertFalse(msc.has_auth_cookie(
+            self._session([self._Cookie("u52q_2132_saltkey", "K")])))
+
+    def test_empty_auth_value_ignored(self):
+        self.assertFalse(msc.has_auth_cookie(
+            self._session([self._Cookie("u52q_2132_auth", "")])))
 
 
 class TestParseCredentials(unittest.TestCase):
@@ -116,150 +169,209 @@ class TestMask(unittest.TestCase):
 
 class TestFetchSignStats(unittest.TestCase):
     def test_full(self):
-        stats = msc.fetch_sign_stats(SAMPLE_STATS)
-        self.assertIn("连续 1 天", stats)
-        self.assertIn("Lv.2", stats)
-        self.assertIn("积分+2", stats)
-        self.assertIn("累计 5 天", stats)
+        stats = msc.fetch_sign_stats(_signin_page(streak=32, total=37))
+        self.assertIn("连续 32 天", stats)
+        self.assertIn("累计 37 天", stats)
 
     def test_empty(self):
         self.assertEqual(msc.fetch_sign_stats("<html></html>"), "")
 
 
-class TestMathQuestionExtraction(unittest.TestCase):
-    """从实测 XML 返回中提取算术题再求解的完整链路"""
-
-    def test_add_roundtrip(self):
-        q = msc.re.search(r'var q="([^"]*)"', SAMPLE_MATH_Q_ADD).group(1)
-        self.assertEqual(msc.solve_math(q), 24)
-
-    def test_sub_roundtrip(self):
-        q = msc.re.search(r'var q="([^"]*)"', SAMPLE_MATH_Q_SUB).group(1)
-        self.assertEqual(msc.solve_math(q), 10)
-
-    def test_mul_roundtrip(self):
-        q = msc.re.search(r'var q="([^"]*)"', SAMPLE_MATH_Q_MUL).group(1)
-        self.assertEqual(msc.solve_math(q), 42)
-
-
-class TestCdataExtraction(unittest.TestCase):
-    def test_result_xml(self):
-        cdata = msc.re.search(r"<!\[CDATA\[(.*?)\]\]>", SAMPLE_RESULT_XML, msc.re.S)
-        self.assertEqual(cdata.group(1).strip(), "已签到")
-
-
 class TestDoSigninBranches(unittest.TestCase):
-    """do_signin 状态判定分支（mock 网络层）"""
+    """do_signin 状态判定分支（mock 网络层，sx_signin 插件）"""
 
-    def _make_session(self):
+    def _session(self):
         s = mock.MagicMock()
         s._timeout = 30
         return s
 
+    @staticmethod
+    def _json_resp(payload, status=200):
+        r = mock.MagicMock(status_code=status, text=json.dumps(payload, ensure_ascii=False))
+        r.json.return_value = payload
+        return r
+
+    @staticmethod
+    def _html_resp(html, status=200):
+        r = mock.MagicMock(status_code=status, text=html)
+        r.json.side_effect = ValueError("not json")
+        return r
+
+    def _run(self, pages, post_resp=None, captcha="ab12"):
+        """pages: _get_sign_page 依次返回的 (html, err) 列表"""
+        session = self._session()
+        session.post.return_value = post_resp or self._json_resp({"code": 0, "data": {}})
+        with mock.patch.object(msc, "_get_sign_page", side_effect=pages), \
+             mock.patch.object(msc, "_sign_captcha_code", return_value=captcha), \
+             mock.patch.object(msc.time, "sleep"):
+            return msc.do_signin(session, ocr=mock.MagicMock())
+
     def test_already_signed(self):
-        """已签页面：无 JD_sign、有 lxdays -> signed_today"""
-        with mock.patch.object(msc, "_get_sign_page", return_value=(SAMPLE_STATS, "")):
-            r = msc.do_signin(self._make_session())
+        """signed=1 -> 幂等跳过"""
+        r = self._run([(_signin_page(signed=1, streak=1, total=38), "")])
         self.assertEqual(r["state"], "signed_today")
         self.assertEqual(r["message"], "今日已签到")
-        self.assertIn("累计 5 天", r["stats"])
+        self.assertIn("累计 38 天", r["stats"])
+
+    def test_success_flow(self):
+        """未签 -> 验证码 -> code 0 -> 回查 signed=1 -> success"""
+        payload = {"code": 0, "msg": "签到成功",
+                   "data": {"signed": 1, "streak": 33, "total": 38, "credit": 1}}
+        r = self._run([(_signin_page(), ""), (_signin_page(signed=1, streak=33, total=38), "")],
+                      post_resp=self._json_resp(payload))
+        self.assertEqual(r["state"], "success")
+        self.assertIn("本次奖励 +1", r["message"])
+        self.assertIn("累计 38 天", r["stats"])
+
+    def test_captcha_error_retries_then_succeeds(self):
+        """code=11 换图重试，第二次成功"""
+        session = self._session()
+        session.post.side_effect = [
+            self._json_resp({"code": 11, "msg": "验证码错误"}),
+            self._json_resp({"code": 0, "msg": "签到成功", "data": {"streak": 33, "total": 38}}),
+        ]
+        with mock.patch.object(msc, "_get_sign_page",
+                               side_effect=[(_signin_page(), ""),
+                                            (_signin_page(signed=1, streak=33, total=38), "")]), \
+             mock.patch.object(msc, "_sign_captcha_code", return_value="ab12"), \
+             mock.patch.object(msc.time, "sleep"):
+            r = msc.do_signin(session, ocr=mock.MagicMock())
+        self.assertEqual(r["state"], "success")
+        self.assertEqual(session.post.call_count, 2)
+
+    def test_captcha_always_wrong_fails(self):
+        session = self._session()
+        session.post.return_value = self._json_resp({"code": 11, "msg": "验证码错误"})
+        with mock.patch.object(msc, "_get_sign_page", return_value=(_signin_page(), "")), \
+             mock.patch.object(msc, "_sign_captcha_code", return_value="ab12"), \
+             mock.patch.object(msc.time, "sleep"):
+            r = msc.do_signin(session, ocr=mock.MagicMock())
+        self.assertEqual(r["state"], "failed")
+        self.assertIn("验证码识别错误", r["message"])
+        self.assertEqual(session.post.call_count, msc.SIGN_CAPTCHA_TRIES)
+
+    def test_code_2_already_signed(self):
+        r = self._run([(_signin_page(), ""), (_signin_page(signed=1), "")],
+                      post_resp=self._json_resp({"code": 2, "msg": "今天已经签到过了"}))
+        self.assertEqual(r["state"], "signed_today")
+        self.assertIn("今日已签到", r["message"])
+
+    def test_other_code_fails(self):
+        r = self._run([(_signin_page(), "")],
+                      post_resp=self._json_resp({"code": 5, "msg": "签到功能已关闭"}))
+        self.assertEqual(r["state"], "failed")
+        self.assertIn("签到功能已关闭", r["message"])
+
+    def test_no_signin_config(self):
+        """旧插件页面/结构变化 -> 明确报结构变化，而不是误判登录失效"""
+        r = self._run([("<html><title>提示信息 - 尚香书苑</title>插件不存在或已关闭</html>", "")])
+        self.assertEqual(r["state"], "failed")
+        self.assertIn("结构变化", r["message"])
 
     def test_cookie_dead(self):
-        """被踢回登录页：无 JD_sign、无统计、含登录链接 -> failed 失效"""
-        html = '<a href="member.php?mod=logging&action=login">登录</a>'
-        with mock.patch.object(msc, "_get_sign_page", return_value=(html, "")):
-            r = msc.do_signin(self._make_session())
+        r = self._run([(SAMPLE_LOGIN_PAGE, "")])
         self.assertEqual(r["state"], "failed")
         self.assertIn("登录态失效", r["message"])
 
-    def test_unknown_page(self):
-        """无 JD_sign 无统计无登录链接 -> failed 结构变化"""
-        with mock.patch.object(msc, "_get_sign_page", return_value=("<html>x</html>", "")):
-            r = msc.do_signin(self._make_session())
+    def test_logged_in_page_with_logout_link_not_dead(self):
+        """回归：已登录页面含退出链接时不得判登录失效（2026-11-05 故障根因）"""
+        r = self._run([(SAMPLE_LOGGED_IN_PAGE, "")])
         self.assertEqual(r["state"], "failed")
-        self.assertIn("无签到按钮", r["message"])
-
-    def test_success_flow(self):
-        """未签 -> 出题 -> 答对 -> 回查 JD_sign 消失 -> success"""
-        session = self._make_session()
-        resp_q = mock.MagicMock(text=SAMPLE_MATH_Q_ADD, status_code=200)
-        resp_ok = mock.MagicMock(text=SAMPLE_RESULT_XML, status_code=200)
-        # 注意：第一次页面要同时含 JD_sign 完整 href（含 formhash 提取）
-        sign_pages = [(SAMPLE_JD_SIGN_HREF + SAMPLE_STATS, ""), (SAMPLE_STATS, "")]
-        with mock.patch.object(msc, "_get_sign_page", side_effect=sign_pages), \
-             mock.patch.object(msc, "get_retry", side_effect=[(resp_q, ""), (resp_ok, "")]):
-            r = msc.do_signin(session)
-        self.assertEqual(r["state"], "success")
-        self.assertIn("签到成功", r["message"])
-        self.assertIn("累计 5 天", r["stats"])
-
-    def test_wrong_answer_still_signed(self):
-        """答错（回查 JD_sign 仍在）-> failed"""
-        session = self._make_session()
-        resp_q = mock.MagicMock(text=SAMPLE_MATH_Q_SUB, status_code=200)
-        resp_re = mock.MagicMock(text='<div>var q="签到验证：3 + 4 = ?";</div>', status_code=200)
-        page_with_btn = SAMPLE_JD_SIGN_HREF + SAMPLE_STATS
-        with mock.patch.object(msc, "_get_sign_page",
-                               side_effect=[(page_with_btn, ""), (page_with_btn, "")]), \
-             mock.patch.object(msc, "get_retry", side_effect=[(resp_q, ""), (resp_re, "")]):
-            r = msc.do_signin(session)
-        self.assertEqual(r["state"], "failed")
-        self.assertIn("签到未生效", r["message"])
-
-    def test_no_math_question(self):
-        """首次请求无算术题（站点关闭验证/改版）-> failed 并带原始返回"""
-        session = self._make_session()
-        resp_plain = mock.MagicMock(text="<root><![CDATA[非法请求]]></root>", status_code=200)
-        page_with_btn = SAMPLE_JD_SIGN_HREF + SAMPLE_STATS
-        with mock.patch.object(msc, "_get_sign_page",
-                               side_effect=[(page_with_btn, ""), (page_with_btn, "")]), \
-             mock.patch.object(msc, "get_retry", return_value=(resp_plain, "")):
-            r = msc.do_signin(session)
-        self.assertEqual(r["state"], "failed")
-        self.assertIn("未返回算术验证题", r["message"])
+        self.assertNotIn("登录态失效", r["message"])
+        self.assertIn("结构变化", r["message"])
 
     def test_sign_page_unavailable(self):
-        """签到页重试后仍不可用 -> failed 且消息带错误原因"""
-        with mock.patch.object(msc, "_get_sign_page",
-                               return_value=("", "HTTP 522「sxsy45.com | 522: Connection timed out」")):
-            r = msc.do_signin(self._make_session())
+        r = self._run([("", "HTTP 522「sxsy45.com | 522: Connection timed out」")])
         self.assertEqual(r["state"], "failed")
         self.assertIn("签到页请求失败", r["message"])
         self.assertIn("522", r["message"])
 
-    def test_recheck_unavailable_trusts_result_text(self):
-        """签到成功但回查页 522：接口文案含'已签到'才判成功，并标注未复核"""
-        session = self._make_session()
-        resp_q = mock.MagicMock(text=SAMPLE_MATH_Q_ADD, status_code=200)
-        resp_ok = mock.MagicMock(text=SAMPLE_RESULT_XML, status_code=200)
-        page_with_btn = SAMPLE_JD_SIGN_HREF + SAMPLE_STATS
-        with mock.patch.object(msc, "_get_sign_page",
-                               side_effect=[(page_with_btn, ""), ("", "HTTP 522")]), \
-             mock.patch.object(msc, "get_retry", side_effect=[(resp_q, ""), (resp_ok, "")]):
-            r = msc.do_signin(session)
+    def test_recheck_unavailable(self):
+        """接口 code 0 但回查页 522：判成功并标注未复核"""
+        payload = {"code": 0, "data": {"streak": 33, "total": 38}}
+        r = self._run([(_signin_page(), ""), ("", "HTTP 522")],
+                      post_resp=self._json_resp(payload))
         self.assertEqual(r["state"], "success")
         self.assertIn("回查页暂不可用", r["message"])
 
-    def test_recheck_unavailable_unknown_result_fails(self):
-        """回查失败且接口文案无法确认 -> failed，不能误报成功"""
-        session = self._make_session()
-        resp_q = mock.MagicMock(text=SAMPLE_MATH_Q_ADD, status_code=200)
-        resp_plain = mock.MagicMock(text="<root><![CDATA[非法请求]]></root>", status_code=200)
-        page_with_btn = SAMPLE_JD_SIGN_HREF + SAMPLE_STATS
-        with mock.patch.object(msc, "_get_sign_page",
-                               side_effect=[(page_with_btn, ""), ("", "HTTP 522")]), \
-             mock.patch.object(msc, "get_retry", side_effect=[(resp_q, ""), (resp_plain, "")]):
-            r = msc.do_signin(session)
+    def test_recheck_still_unsigned(self):
+        """接口 code 0 但回查仍 signed=0：不能误报成功"""
+        r = self._run([(_signin_page(), ""), (_signin_page(signed=0), "")],
+                      post_resp=self._json_resp({"code": 0, "data": {"streak": 33}}))
         self.assertEqual(r["state"], "failed")
-        self.assertIn("未确认", r["message"])
+        self.assertIn("回查仍未签到", r["message"])
+
+    def test_non_json_login_redirect(self):
+        """接口返回登录页 HTML（掉登录）-> 登录态失效"""
+        r = self._run([(_signin_page(), "")], post_resp=self._html_resp(SAMPLE_LOGIN_PAGE))
+        self.assertEqual(r["state"], "failed")
+        self.assertIn("登录态失效", r["message"])
+
+    def test_non_json_other(self):
+        r = self._run([(_signin_page(), "")],
+                      post_resp=self._html_resp("<html><title>403 Forbidden</title></html>", 403))
+        self.assertEqual(r["state"], "failed")
+        self.assertIn("非 JSON", r["message"])
+
+    def test_missing_formhash(self):
+        page = ('<script>window.SIGNIN = {"ajax":"https://x/plugin.php?id=sx_signin:ajax",'
+                '"signed":0};</script>')
+        r = self._run([(page, "")])
+        self.assertEqual(r["state"], "failed")
+        self.assertIn("formhash", r["message"])
+
+    def test_missing_ocr(self):
+        """ddddocr 缺失时给出明确提示，不空跑"""
+        session = self._session()
+        with mock.patch.object(msc, "_get_sign_page", return_value=(_signin_page(), "")), \
+             mock.patch.object(msc, "get_ocr", return_value=None):
+            r = msc.do_signin(session, ocr=None)
+        self.assertEqual(r["state"], "failed")
+        self.assertIn("ddddocr", r["message"])
 
 
-class TestJdSignFormhashExtraction(unittest.TestCase):
-    def test_real_href(self):
-        m = msc.re.search(
-            r'id="JD_sign"\s+href="plugin\.php\?id=k_misign:sign&operation=qiandao'
-            r'&formhash=([a-f0-9]+)&format=text"', SAMPLE_JD_SIGN_HREF)
-        self.assertEqual(m.group(1), "9a17bb38")
+class TestLoginSuccessDetection(unittest.TestCase):
+    """登录成功判定：登录页模板也含 succeedlocation，必须看 succeedhandle 或 auth Cookie。"""
+
+    class _Cookie:
+        def __init__(self, name, value):
+            self.name, self.value = name, value
+
+    def _run(self, post_resp, cookies=None):
+        session = mock.MagicMock()
+        session._timeout = 30
+        session.cookies = list(cookies or [])
+        session.post.return_value = post_resp
+        page = mock.MagicMock(status_code=200, text=SAMPLE_LOGIN_PAGE, headers={})
+        upd = mock.MagicMock(status_code=200, text=SAMPLE_SECCODE_UPDATE, headers={})
+
+        def fake_get(sess, url, **kw):
+            return (upd, "") if "misc.php" in url else (page, "")
+
+        with mock.patch.object(msc, "get_retry", side_effect=fake_get), \
+             mock.patch.object(msc, "_ocr", return_value="abcd"), \
+             mock.patch.object(msc.time, "sleep"):
+            return msc.discuz_login(session, "exampleuser", "pw123", ocr=mock.MagicMock())
+
+    def test_login_page_with_succeedlocation_is_not_success(self):
+        """登录页被原样返回（只有 succeedlocation）不得判成功"""
+        resp = mock.MagicMock(status_code=200, text=SAMPLE_LOGIN_PAGE, headers={})
+        ok, msg = self._run(resp)
+        self.assertFalse(ok)
+        self.assertIn("登录失败", msg)
+
+    def test_succeedhandle_is_success(self):
+        resp = mock.MagicMock(
+            status_code=200,
+            text="<script>succeedhandle_login('https://sxsy33.com/forum.php')</script>",
+            headers={})
+        ok, _ = self._run(resp)
+        self.assertTrue(ok)
+
+    def test_auth_cookie_is_success(self):
+        resp = mock.MagicMock(status_code=200, text="<html>正在跳转</html>", headers={})
+        ok, _ = self._run(resp, cookies=[self._Cookie("u52q_2132_auth", "V")])
+        self.assertTrue(ok)
 
 
 class TestSiteErrorDetection(unittest.TestCase):
@@ -446,6 +558,7 @@ class TestRunOneAccountKeepsCacheOnChallenge(unittest.TestCase):
         cached = {"exampleuser": {"cookies": "u52q_2132_saltkey=K; u52q_2132_auth=V"}}
         with mock.patch.object(msc, "read_cookie_cache", return_value=cached), \
              mock.patch.object(msc, "check_cookie_valid", return_value=None), \
+             mock.patch.object(msc, "get_ocr", return_value=mock.MagicMock()), \
              mock.patch.object(msc, "discuz_login") as login, \
              mock.patch.object(msc, "do_signin", return_value={
                  "state": "failed",
@@ -468,7 +581,7 @@ class TestLoginChallengeAbort(unittest.TestCase):
         with mock.patch.dict(sys.modules, {"ddddocr": stub}), \
              mock.patch.object(msc, "get_retry", return_value=(None, err)) as mocked_get, \
              mock.patch.object(msc.time, "sleep"):
-            ok, msg = msc.discuz_login(session, "exampleuser", "pw123")
+            ok, msg = msc.discuz_login(session, "exampleuser", "pw123", ocr=mock.MagicMock())
         self.assertFalse(ok)
         self.assertIn(msc.CF_CHALLENGE_MARK, msg)
         self.assertIn("出口 IP", msg)
@@ -490,7 +603,7 @@ class TestLoginChallengeAbort(unittest.TestCase):
              mock.patch.object(msc, "get_retry",
                                side_effect=[(login_page, ""), (None, err)]), \
              mock.patch.object(msc.time, "sleep"):
-            ok, msg = msc.discuz_login(session, "exampleuser", "pw123")
+            ok, msg = msc.discuz_login(session, "exampleuser", "pw123", ocr=mock.MagicMock())
         self.assertFalse(ok)
         self.assertIn("验证码接口被拦截", msg)
         session.post.assert_not_called()
@@ -517,7 +630,7 @@ class TestLoginChallengeAbort(unittest.TestCase):
                                side_effect=[(login_page, ""), (seccode_update, "")]), \
              mock.patch.object(msc, "_ocr", return_value="abcd"), \
              mock.patch.object(msc.time, "sleep"):
-            ok, msg = msc.discuz_login(session, "exampleuser", "pw123")
+            ok, msg = msc.discuz_login(session, "exampleuser", "pw123", ocr=mock.MagicMock())
         self.assertFalse(ok)
         self.assertIn("登录接口被拦截", msg)
         self.assertEqual(session.post.call_count, 1)
@@ -771,16 +884,21 @@ class TestApplyBase(unittest.TestCase):
     """切换域名后所有派生 URL 必须同步，否则仍会打到旧域名。"""
 
     def test_derived_urls_follow_base(self):
-        saved = (msc.BASE, msc.SIGN_URL, msc.LOGIN_URL, msc.FORUM_URL)
+        saved = (msc.BASE, msc.SIGN_URL, msc.SIGN_AJAX_URL, msc.SIGN_CAPTCHA_URL,
+                 msc.LOGIN_URL, msc.FORUM_URL)
         try:
             msc.apply_base("https://sxsy33.com/")
             self.assertEqual(msc.BASE, "https://sxsy33.com")
-            self.assertEqual(msc.SIGN_URL, "https://sxsy33.com/plugin.php?id=k_misign:sign")
+            self.assertEqual(msc.SIGN_URL, "https://sxsy33.com/plugin.php?id=sx_signin:index")
+            self.assertEqual(msc.SIGN_AJAX_URL, "https://sxsy33.com/plugin.php?id=sx_signin:ajax")
+            self.assertEqual(msc.SIGN_CAPTCHA_URL,
+                             "https://sxsy33.com/plugin.php?id=sx_signin:captcha")
             self.assertEqual(msc.LOGIN_URL,
                              "https://sxsy33.com/member.php?mod=logging&action=login")
             self.assertEqual(msc.FORUM_URL, "https://sxsy33.com/forum.php")
         finally:
-            msc.BASE, msc.SIGN_URL, msc.LOGIN_URL, msc.FORUM_URL = saved
+            (msc.BASE, msc.SIGN_URL, msc.SIGN_AJAX_URL, msc.SIGN_CAPTCHA_URL,
+             msc.LOGIN_URL, msc.FORUM_URL) = saved
 
 
 if __name__ == "__main__":
