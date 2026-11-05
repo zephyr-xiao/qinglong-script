@@ -3,11 +3,11 @@
 new Env('尚香书苑签到');
 cron: 23 8 * * *
 
-尚香书苑 Discuz! X3.5 论坛 k_misign 插件每日签到。
+尚香书苑 Discuz! X3.5 论坛每日签到（站点自研插件 sx_signin，2026-11-05 起替代已下线的 k_misign）。
 站点主域名不定期更换（旧域名 301 到"最新地址"导航页），脚本启动时自动探测可用域名：
 先试内置候选，再解析导航页里站点自维护的最新域名。
 登录强制图片验证码（Discuz seccode，idhash 固定为 cS），本地 ddddocr 自动识别；
-k_misign 签到需通过算术验证（"签到验证：A - B = ?"），脚本解析后自动计算二次请求；
+签到页内嵌 window.SIGNIN 配置，取 4 位图形验证码识别后 POST 到 sx_signin:ajax 换 JSON；
 登录 Cookie JSON 缓存复用，失效自动重新登录。
 网络默认直连（本站国内可达，走境外代理会被 Cloudflare 当数据中心 IP 发人机质询）；
 站点偶发 Cloudflare 522（回源超时）等瞬时错误页会自动退避重试，不会误判成改版或掉登录；
@@ -22,7 +22,7 @@ Cloudflare 人机质询页（403 "Just a moment..."）单独识别，按出口 I
   SXSY_DEBUG             true/false 调试模式，默认 false
   SXSY_PROXY             HTTP 代理（可选）；**默认直连**，不读全局 HTTPS_PROXY。
                          填 URL 走代理，填 direct/none/off 同样强制直连
-依赖：requests 必装；ddddocr 仅账密登录时需要（Cookie 模式无需安装）
+依赖：requests 必装；ddddocr 两种模式都需要（登录与签到验证码都要识别）
 作者: zephyr_xiao
 """
 import json
@@ -33,7 +33,6 @@ import time
 import traceback
 from datetime import datetime
 from pathlib import Path
-from urllib.parse import quote
 
 try:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -97,7 +96,11 @@ SITE_NAME = "尚香书苑"
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
 MODID = "member::logging"       # Discuz seccode 的 modid
-SIGN_URL = f"{BASE}/plugin.php?id=k_misign:sign"
+# 2026-11-05 站点把签到插件从 k_misign 换成自研 sx_signin：
+# 旧地址 plugin.php?id=k_misign:sign 现在返回「插件不存在或已关闭」，不要回退。
+SIGN_URL = f"{BASE}/plugin.php?id=sx_signin:index"
+SIGN_AJAX_URL = f"{BASE}/plugin.php?id=sx_signin:ajax"
+SIGN_CAPTCHA_URL = f"{BASE}/plugin.php?id=sx_signin:captcha"
 LOGIN_URL = f"{BASE}/member.php?mod=logging&action=login"
 FORUM_URL = f"{BASE}/forum.php"
 
@@ -106,7 +109,9 @@ COOKIE_CACHE = Path(__file__).resolve().parent / "sxsy45_cookie.json"
 LOGIN_MAX_TRIES = 3             # 验证码 OCR 识别重试上限（含首次）
 
 # 致命登录错误关键词：出现即停止重试（避免反复触发风控/封禁计数）
-_LOGIN_FATAL_KEYWORDS = ("密码错误", "密码不正确", "登录失败次数过多", "账户被", "帐号被", "被锁定", "被禁止")
+_LOGIN_FATAL_KEYWORDS = ("密码错误", "密码不正确", "登录失败次数过多", "密码错误次数过多",
+                         "账户被", "帐号被", "被锁定", "被禁止")
+SIGN_CAPTCHA_TRIES = 3          # 签到图形验证码识别重试上限（含首次）
 
 # 站点间歇性返回 Cloudflare 522（回源超时）等错误页，属于瞬时故障：
 # 必须退避重试，不能当成"Cookie 失效"或"站点改版"，否则会白白丢掉有效会话。
@@ -183,38 +188,29 @@ def mask(s: str) -> str:
     return s[:2] + "*" * max(1, len(s) - 4) + s[-2:]
 
 
-def solve_math(question: str):
-    """解析 k_misign 算术验证题 '签到验证：9 + 15 = ?'，返回整数答案；解析失败返回 None。"""
-    m = re.search(r"(\d+)\s*([+\-×xX*/÷])\s*(\d+)", question or "")
+def parse_signin_config(html: str) -> dict:
+    """解析签到页内嵌的 window.SIGNIN 配置；找不到或不是合法 JSON 时返回 {}。
+
+    插件把 ajax 地址、formhash、今日是否已签、验证码开关都放在这个对象里，
+    比从 HTML 结构里抠按钮可靠得多（旧插件改版时正是靠按钮 id 判定的，很容易失效）。
+    """
+    m = re.search(r"window\.SIGNIN\s*=\s*(\{.*?\});", html or "", re.S)
     if not m:
-        return None
-    a, op, b = int(m.group(1)), m.group(2), int(m.group(3))
-    if op == "+":
-        return a + b
-    if op == "-":
-        return a - b
-    if op in ("×", "x", "X", "*"):
-        return a * b
-    if op in ("÷", "/"):
-        if b == 0:
-            return None
-        return a // b if a % b == 0 else a / b
-    return None
+        return {}
+    try:
+        cfg = json.loads(m.group(1))
+    except (ValueError, TypeError):
+        return {}
+    return cfg if isinstance(cfg, dict) else {}
 
 
 def fetch_sign_stats(html: str) -> str:
-    """从签到页提取统计（连续天数/等级/奖励/累计天数），无统计返回空串。"""
+    """从签到页提取统计（连续/累计签到天数），无统计返回空串。"""
     parts = []
-    m = re.search(r'id="lxdays"\s+value="(\d+)"', html)
+    m = re.search(r'id="signin-streak"[^>]*>(\d+)<', html or "")
     if m:
         parts.append(f"连续 {m.group(1)} 天")
-    m = re.search(r'id="lxlevel"\s+value="(\d+)"', html)
-    if m:
-        parts.append(f"Lv.{m.group(1)}")
-    m = re.search(r'id="lxreward"\s+value="(\d+)"', html)
-    if m:
-        parts.append(f"积分+{m.group(1)}")
-    m = re.search(r'id="lxtdays"\s+value="(\d+)"', html)
+    m = re.search(r'id="signin-total"[^>]*>(\d+)<', html or "")
     if m:
         parts.append(f"累计 {m.group(1)} 天")
     return "  │  ".join(parts)
@@ -359,9 +355,11 @@ def get_retry(session: requests.Session, url: str, headers: dict = None,
 # 看着像改版或风控，实际只是域名换了。运行前先探测可用域名，避免整轮签到白跑。
 def apply_base(base: str) -> None:
     """切换站点根地址，并同步所有派生 URL。"""
-    global BASE, SIGN_URL, LOGIN_URL, FORUM_URL
+    global BASE, SIGN_URL, SIGN_AJAX_URL, SIGN_CAPTCHA_URL, LOGIN_URL, FORUM_URL
     BASE = base.rstrip("/")
-    SIGN_URL = f"{BASE}/plugin.php?id=k_misign:sign"
+    SIGN_URL = f"{BASE}/plugin.php?id=sx_signin:index"
+    SIGN_AJAX_URL = f"{BASE}/plugin.php?id=sx_signin:ajax"
+    SIGN_CAPTCHA_URL = f"{BASE}/plugin.php?id=sx_signin:captcha"
     LOGIN_URL = f"{BASE}/member.php?mod=logging&action=login"
     FORUM_URL = f"{BASE}/forum.php"
 
@@ -503,6 +501,53 @@ def write_cookie_cache(username: str, cookie_str: str):
 
 
 # ---------------- 登录层 ----------------
+_OCR_INSTANCE = None
+_OCR_READY = False
+
+
+def get_ocr():
+    """懒加载 ddddocr 实例；库缺失或初始化失败返回 None。
+
+    登录（Discuz seccode）和签到（sx_signin 4 位图形码）都要用它，
+    所以做成进程内单例，多账号不重复初始化。
+    """
+    global _OCR_INSTANCE, _OCR_READY
+    if _OCR_READY:
+        return _OCR_INSTANCE
+    _OCR_READY = True
+    try:
+        import ddddocr
+    except ImportError:
+        _OCR_INSTANCE = None
+    else:
+        try:
+            _OCR_INSTANCE = ddddocr.DdddOcr(old=False)
+        except Exception as e:
+            print(f"⚠️ ddddocr 初始化失败: {e}")
+            _OCR_INSTANCE = None
+    return _OCR_INSTANCE
+
+
+def has_auth_cookie(session: requests.Session) -> bool:
+    """会话里出现 Discuz 的 *_auth Cookie 才算真正登录成功。
+
+    Discuz 登录页与登录成功页都含 succeedlocation 模板元素，用它判成功会把
+    "登录页被原样返回"误判成成功；auth Cookie 是服务端下发的确定信号。
+    """
+    return any(c.name.endswith("_auth") and c.value for c in session.cookies)
+
+
+def is_login_page(html: str) -> bool:
+    """页面是否为登录页 / 未登录状态。
+
+    不能用 'member.php?mod=logging' 子串判断：已登录页面的「退出」链接正是
+    member.php?mod=logging&action=logout，会被误伤（2026-11-05 失败就是这个原因）。
+    """
+    if not html:
+        return False
+    return 'id="loginform_' in html or bool(re.search(r"discuz_uid\s*=\s*'0'", html))
+
+
 def check_cookie_valid(session: requests.Session, debug: bool = False):
     """GET forum.php 判登录态：discuz_uid > 0 即有效。
 
@@ -538,13 +583,13 @@ def _ocr(session: requests.Session, idhash: str, ocr, debug: bool) -> str:
 
 
 def discuz_login(session: requests.Session, username: str, password: str,
-                 debug: bool = False) -> tuple:
+                 debug: bool = False, ocr=None) -> tuple:
     """账密登录（含 seccode OCR）。返回 (是否成功, 消息)。成功时会话已带登录 Cookie。"""
-    try:
-        import ddddocr
-        ocr = ddddocr.DdddOcr(old=False)
-    except ImportError:
-        return False, "缺少 ddddocr 库：账密登录需要它识别验证码，请在「依赖管理」-「Python」安装 ddddocr（或改用 Cookie 模式）"
+    if ocr is None:
+        ocr = get_ocr()
+    if ocr is None:
+        return False, ("缺少 ddddocr 库：登录与签到都需要识别图形验证码，"
+                       "请在「依赖管理」-「Python」安装 ddddocr（或改用 Cookie 模式）")
 
     login_referer = LOGIN_URL
     last_reason = "未知原因"
@@ -630,7 +675,8 @@ def discuz_login(session: requests.Session, username: str, password: str,
             return False, f"登录请求失败: {e}"
 
         body = r2.text
-        if "succeedhandle" in body or "succeedlocation" in body:
+        # succeedlocation 在登录页模板里也有，不能单独作成功判据（会误判）
+        if "succeedhandle" in body or has_auth_cookie(session):
             return True, "登录成功"
 
         if is_cf_challenge(r2):
@@ -674,84 +720,145 @@ def _get_sign_page(session: requests.Session, debug: bool = False) -> tuple:
     return r.text, ""
 
 
-def do_signin(session: requests.Session, debug: bool = False) -> dict:
+def _sign_captcha_code(session: requests.Session, cfg: dict, ocr, debug: bool = False) -> str:
+    """下载签到图形验证码并识别一次，返回识别文本；拿不到图返回空串（交给重试）。"""
+    url = cfg.get("captchaUrl") or SIGN_CAPTCHA_URL
+    r, err = get_retry(session, f"{url}&t={int(time.time() * 1000)}",
+                       headers={"Referer": SIGN_URL}, debug=debug,
+                       label="签到验证码", tries=2)
+    if r is None:
+        print(f"    ⚠️ 签到验证码暂时不可用（{err}）")
+        return ""
+    if debug:
+        print(f"    [debug] 签到验证码 HTTP {r.status_code}, {len(r.content)}B")
+    try:
+        return (ocr.classification(r.content) or "").strip()
+    except Exception as e:
+        print(f"    ⚠️ 签到验证码识别异常: {e}")
+        return ""
+
+
+def _signin_result_text(data: dict) -> str:
+    """把接口返回的 data 拼成一行摘要（本次奖励 / 连续 / 累计）。"""
+    parts = []
+    if data.get("credit") is not None:
+        parts.append(f"本次奖励 +{data['credit']}")
+    if data.get("streak") is not None:
+        parts.append(f"连续 {data['streak']} 天")
+    if data.get("total") is not None:
+        parts.append(f"累计 {data['total']} 天")
+    return " / ".join(parts) or "接口返回成功"
+
+
+def do_signin(session: requests.Session, debug: bool = False, ocr=None) -> dict:
     """
-    k_misign 签到。流程（均为实测）：
-      1. GET 签到页：有 id="JD_sign" -> 今天未签；无 -> 已签/未登录
-      2. GET ...&operation=qiandao&formhash=<fh>&format=text -> 算术题 XML
-      3. 计算答案后 GET ...&mathverify_answer=<ans> -> 结果 XML（CDATA 文本）
-      4. 回查签到页确认 JD_sign 消失
+    sx_signin 签到（2026-11-05 起站点自研插件，替代已下线的 k_misign）。流程（均实测）：
+      1. GET 签到页，解析 window.SIGNIN；signed=1 说明今天已签，幂等跳过
+      2. GET captchaUrl 取 4 位图形验证码，ddddocr 识别
+      3. POST ajax（op=signin&formhash=..&seccode=..）-> JSON
+         code=0 成功 / code=2 今天已签 / code=11 验证码错误（换图重试）
+      4. 回查签到页 signed=1 作为最终判据
     返回 {"state": signed_today|success|failed, "message": str, "stats": str}
     """
     html, err = _get_sign_page(session, debug)
     if not html:
         return {"state": "failed", "message": f"签到页请求失败：{err}", "stats": ""}
 
-    if 'id="JD_sign"' not in html:
-        # 无签到按钮：区分「已签」与「Cookie 失效被踢回登录页」
-        if re.search(r'id="lxdays"\s+value="\d+"', html):
-            return {"state": "signed_today", "message": "今日已签到", "stats": fetch_sign_stats(html)}
-        if "member.php?mod=logging" in html or re.search(r"discuz_uid\s*=\s*'0'", html):
-            return {"state": "failed", "message": "登录态失效（签到页被跳转登录）", "stats": ""}
-        return {"state": "failed", "message": "签到页无签到按钮且无统计信息（页面结构可能变化）", "stats": ""}
+    if is_login_page(html):
+        return {"state": "failed", "message": "登录态失效（签到页被跳转登录）", "stats": ""}
 
-    m = re.search(
-        r'id="JD_sign"\s+href="plugin\.php\?id=k_misign:sign&operation=qiandao'
-        r'&formhash=([a-f0-9]+)&format=text"', html)
-    if not m:
-        return {"state": "failed", "message": "未解析到 JD_sign 签到链接", "stats": ""}
-    formhash = m.group(1)
-
-    sign_headers = {"Referer": SIGN_URL, "X-Requested-With": "XMLHttpRequest"}
-    r, err = get_retry(
-        session,
-        f"{SIGN_URL}&operation=qiandao&formhash={formhash}&format=text",
-        headers=sign_headers, debug=debug, label="签到接口", tries=2)
-    if r is None:
-        return {"state": "failed", "message": f"签到接口请求失败：{err}", "stats": ""}
-
-    # 第一次返回：算术题（站点开启 mathverify 时）；部分站点关闭验证时直接返回结果
-    q = re.search(r'var q="([^"]*)"', r.text)
-    if not q:
-        cdata = re.search(r"<!\[CDATA\[(.*?)\]\]>", r.text, re.S)
-        text = cdata.group(1).strip() if cdata else r.text[:150]
-        page, _ = _get_sign_page(session, debug)
+    cfg = parse_signin_config(html)
+    if not cfg:
         return {"state": "failed",
-                "message": f"签到接口未返回算术验证题，原始返回: {text[:100]}",
-                "stats": fetch_sign_stats(page)}
-
-    answer = solve_math(q.group(1))
-    if answer is None:
-        return {"state": "failed", "message": f"算术验证题解析失败: {q.group(1)[:50]}", "stats": ""}
-    if debug:
-        print(f"    [debug] 算术题: {q.group(1)} -> {answer}")
-
-    r2, err = get_retry(
-        session,
-        f"{SIGN_URL}&operation=qiandao&formhash={formhash}&format=text"
-        f"&mathverify_answer={quote(str(answer))}",
-        headers=sign_headers, debug=debug, label="签到确认接口", tries=2)
-    if r2 is None:
-        return {"state": "failed", "message": f"签到确认请求失败：{err}", "stats": ""}
-
-    cdata = re.search(r"<!\[CDATA\[(.*?)\]\]>", r2.text, re.S)
-    result_text = cdata.group(1).strip() if cdata else r2.text[:150]
-
-    # 以页面回查为准做最终状态判定（返回文本因插件版本而异，不可靠）
-    html2, recheck_err = _get_sign_page(session, debug)
-    if not html2:
-        # 回查页拿不到时不能直接当成功：接口文案确认过才算，否则如实报未确认
-        if any(k in result_text for k in ("已签到", "签到成功")):
-            return {"state": "success",
-                    "message": f"签到成功（{result_text[:40]}，回查页暂不可用）", "stats": ""}
-        return {"state": "failed",
-                "message": f"签到结果未确认（{result_text[:60]}；回查失败: {recheck_err}）",
+                "message": f"签到页结构变化：未找到 SIGNIN 配置（标题「{page_title(html) or '无'}」）",
                 "stats": ""}
-    stats = fetch_sign_stats(html2)
-    if 'id="JD_sign"' not in html2:
-        return {"state": "success", "message": f"签到成功（{result_text[:40]}）", "stats": stats}
-    # JD_sign 仍在：答案错误（插件会重新出题）或其他失败
-    return {"state": "failed", "message": f"签到未生效，接口返回: {result_text[:100]}", "stats": stats}
+    if cfg.get("signed"):
+        return {"state": "signed_today", "message": "今日已签到", "stats": fetch_sign_stats(html)}
+
+    formhash = cfg.get("formhash") or ""
+    if not formhash:
+        return {"state": "failed", "message": "签到页未提供 formhash（插件可能改版）", "stats": ""}
+
+    if ocr is None:
+        ocr = get_ocr()
+    if ocr is None:
+        return {"state": "failed",
+                "message": "缺少 ddddocr 库：签到需要识别图形验证码，请在「依赖管理」-「Python」安装 ddddocr",
+                "stats": ""}
+
+    ajax = cfg.get("ajax") or SIGN_AJAX_URL
+    last_reason = "未知原因"
+    for attempt in range(1, SIGN_CAPTCHA_TRIES + 1):
+        code = _sign_captcha_code(session, cfg, ocr, debug)
+        if not code:
+            last_reason = "验证码图片获取失败或识别为空"
+            print(f"    ⚠️ 第 {attempt}/{SIGN_CAPTCHA_TRIES} 次{last_reason}"
+                  + ("，重试..." if attempt < SIGN_CAPTCHA_TRIES else ""))
+            time.sleep(1)
+            continue
+
+        try:
+            r = session.post(
+                ajax,
+                data={"op": "signin", "formhash": formhash, "seccode": code},
+                headers={"Referer": SIGN_URL,
+                         "X-Requested-With": "XMLHttpRequest",
+                         "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8"},
+                timeout=session._timeout,
+            )
+        except Exception as e:
+            return {"state": "failed", "message": f"签到接口请求失败: {e}", "stats": ""}
+
+        if debug:
+            print(f"    [debug] 签到接口 HTTP {r.status_code}: {r.text[:200]}")
+        try:
+            res = r.json()
+        except ValueError:
+            # 掉登录或被 WAF 拦时返回的是 HTML，按页面内容如实分类
+            if is_login_page(r.text):
+                return {"state": "failed", "message": "登录态失效（签到接口被跳转登录）", "stats": ""}
+            return {"state": "failed",
+                    "message": (f"签到接口返回非 JSON（HTTP {r.status_code}"
+                                f"，标题「{page_title(r.text) or '无'}」）"),
+                    "stats": ""}
+        if not isinstance(res, dict):
+            return {"state": "failed",
+                    "message": f"签到接口返回格式异常: {str(res)[:100]}", "stats": ""}
+
+        code_no = res.get("code")
+        data = res.get("data") or {}
+        detail = _signin_result_text(data)
+
+        if code_no == 0:
+            html2, _ = _get_sign_page(session, debug)
+            if not html2:
+                # 回查页拿不到时不能直接当成功：接口明确返回成功才算，并标注未复核
+                return {"state": "success",
+                        "message": f"签到成功（{detail}，回查页暂不可用）", "stats": ""}
+            if parse_signin_config(html2).get("signed"):
+                return {"state": "success", "message": f"签到成功（{detail}）",
+                        "stats": fetch_sign_stats(html2)}
+            return {"state": "failed",
+                    "message": f"签到接口返回成功但回查仍未签到（{detail}）",
+                    "stats": fetch_sign_stats(html2)}
+
+        if code_no == 2:
+            html2, _ = _get_sign_page(session, debug)
+            return {"state": "signed_today",
+                    "message": f"今日已签到（{res.get('msg') or '接口提示已签到'}）",
+                    "stats": fetch_sign_stats(html2 or html)}
+
+        if code_no == 11:
+            last_reason = f"验证码识别错误（{res.get('msg') or 'code=11'}）"
+            print(f"    ⚠️ 第 {attempt}/{SIGN_CAPTCHA_TRIES} 次{last_reason}"
+                  + ("，换图重试..." if attempt < SIGN_CAPTCHA_TRIES else ""))
+            time.sleep(1)
+            continue
+
+        last_reason = f"接口返回 code={code_no}：{res.get('msg') or '无提示'}"
+        break
+
+    return {"state": "failed", "message": f"签到失败（{last_reason}）", "stats": ""}
 
 
 # ---------------- 单账号执行 ----------------
