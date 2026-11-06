@@ -66,6 +66,14 @@ SAMPLE_LOGIN_WELCOME = ("$('succeedlocation').innerHTML = '欢迎您回来，"
                         "现在将转入登录前页面';</script>")
 
 
+class FakeHTTPError(Exception):
+    """模拟 requests.HTTPError：带 response.status_code，供瞬时错误判定使用。"""
+
+    def __init__(self, status_code):
+        super().__init__(f"HTTP {status_code}")
+        self.response = types.SimpleNamespace(status_code=status_code)
+
+
 class FakeResponse:
     def __init__(self, text, status_code=200):
         self.text = text
@@ -73,20 +81,29 @@ class FakeResponse:
 
     def raise_for_status(self):
         if self.status_code >= 400:
-            raise RuntimeError(f"HTTP {self.status_code}")
+            raise FakeHTTPError(self.status_code)
 
 
 class FakeSession:
-    """按顺序返回预置响应；只剩一条时反复返回它。记录请求过的 URL。"""
+    """按顺序返回预置响应；只剩一条时反复返回它。记录请求过的 URL。
+
+    元素可以是文本（默认 200）或 FakeResponse（指定状态码）。
+    """
 
     def __init__(self, *texts):
         self._texts = list(texts)
         self.calls = []
 
-    def get(self, url, **kwargs):
+    def _next(self, url):
         self.calls.append(url)
-        text = self._texts[0] if len(self._texts) == 1 else self._texts.pop(0)
-        return FakeResponse(text)
+        item = self._texts[0] if len(self._texts) == 1 else self._texts.pop(0)
+        return item if isinstance(item, FakeResponse) else FakeResponse(item)
+
+    def get(self, url, **kwargs):
+        return self._next(url)
+
+    def post(self, url, **kwargs):
+        return self._next(url)
 
 
 def _ok(host):
@@ -148,12 +165,46 @@ class TestMaskEmail(unittest.TestCase):
         self.assertEqual(msc.mask_email(""), "未知")
 
 
+class TestResolveProxy(unittest.TestCase):
+    """代理优先级：脚本专属变量 > 青龙全局代理 > 直连。"""
+
+    def _resolve(self, env, *keys):
+        with mock.patch.dict(os.environ, env, clear=True):
+            return msc.resolve_proxy(*keys)
+
+    def test_specific_wins_over_global(self):
+        proxy, source = self._resolve(
+            {"SIJISHE_PROXY": "http://specific:1", "HTTPS_PROXY": "http://global:2"},
+            "SIJISHE_PROXY")
+        self.assertEqual((proxy, source), ("http://specific:1", "SIJISHE_PROXY"))
+
+    def test_global_used_when_specific_empty(self):
+        proxy, source = self._resolve({"HTTPS_PROXY": "http://global:2"}, "SIJISHE_PROXY")
+        self.assertEqual((proxy, source), ("http://global:2", "HTTPS_PROXY"))
+
+    def test_lowercase_global_key(self):
+        proxy, source = self._resolve({"http_proxy": "http://global:3"}, "SIJISHE_PROXY")
+        self.assertEqual(proxy, "http://global:3")
+        # Windows 的 os.environ 大小写不敏感，命中的变量名可能是任一写法
+        self.assertIn(source, ("HTTP_PROXY", "http_proxy"))
+
+    def test_none_configured(self):
+        self.assertEqual(self._resolve({}, "SIJISHE_PROXY"), ("", ""))
+
+    def test_mask_proxy_hides_credentials(self):
+        self.assertEqual(msc.mask_proxy("http://user:pass@host:7890"), "http://***@host:7890")
+        self.assertEqual(msc.mask_proxy("http://127.0.0.1:7890"), "http://127.0.0.1:7890")
+        self.assertEqual(msc.mask_proxy(""), "")
+
+
 class TestHostCandidates(unittest.TestCase):
     def test_known_hosts_excludes_dead_domains(self):
-        for dead in ("xsijishe.ink", "sjslt.cc", "sjs47.com"):
+        # 退役域名（301 到发布页 / TLS 握手失败）不能留在候选里，否则白耗一轮请求
+        for dead in ("xsijishe.ink", "sjslt.cc", "sjs47.com",
+                     "sjs96.com", "sjs66.com", "dlsjs.com"):
             self.assertNotIn(dead, msc.KNOWN_HOSTS)
-        for alive in ("xsijishe.net", "dlsjs.net", "sjs96.com", "dlsjs.com",
-                      "sjs66.net", "xsijishe.com", "sjs66.com"):
+            self.assertIn(dead, msc.DEAD_HOSTS)
+        for alive in ("xsijishe.net", "dlsjs.net", "sjs66.net", "xsijishe.com"):
             self.assertIn(alive, msc.KNOWN_HOSTS)
 
     def test_get_hosts_manual_override(self):
@@ -207,6 +258,89 @@ class TestParseLoginWelcome(unittest.TestCase):
         self.assertEqual(msc.parse_login_welcome("登录失败，请重试"), "")
 
 
+class TestFetchLoginParams(unittest.TestCase):
+    LOGIN_PAGE = ('<input type="hidden" name="formhash" value="ab12cd34" />'
+                  '<div id="main_messaqge_abcde"></div>')
+
+    def test_extracts_params(self):
+        session = FakeSession(self.LOGIN_PAGE)
+        with quiet():
+            formhash, seccodehash, loginhash = msc.fetch_login_params("dlsjs.net", session, False)
+        self.assertEqual(formhash, "ab12cd34")
+        self.assertIsNone(seccodehash)
+        self.assertEqual(loginhash, "abcde")
+
+    def test_http_403_raises_login_param_error(self):
+        """403 是 cookie 门槛：必须抛 LoginParamError 交给上层换域名重试，
+        不能返回 (None, None, None) 再拿 loginhash=None 去发登录请求。"""
+        session = FakeSession(FakeResponse("<html>403</html>", 403))
+        with quiet(), self.assertRaises(msc.LoginParamError):
+            msc.fetch_login_params("dlsjs.net", session, False)
+
+    def test_missing_hash_raises_login_param_error(self):
+        session = FakeSession("<html>导航页，没有登录表单</html>")
+        with quiet(), self.assertRaises(msc.LoginParamError):
+            msc.fetch_login_params("sjs96.com", session, False)
+
+
+class TestDoLogin(unittest.TestCase):
+    def test_welcome_means_success(self):
+        session = FakeSession(f"<root><![CDATA[{SAMPLE_LOGIN_WELCOME}]]></root>")
+        with quiet():
+            ok = msc.do_login("dlsjs.net", "a@b.com", "pw", "ab12cd34", "abcde", session)
+        self.assertTrue(ok)
+
+    def test_cdata_without_welcome_is_real_failure(self):
+        session = FakeSession("<root><![CDATA[登录失败，密码错误]]></root>")
+        with quiet():
+            ok = msc.do_login("dlsjs.net", "a@b.com", "pw", "ab12cd34", "abcde", session)
+        self.assertFalse(ok)
+
+    def test_non_cdata_page_is_host_level(self):
+        """站点 System Error / CF 挑战页不是凭据错误，必须抛 LoginParamError（不计熔断）。"""
+        session = FakeSession("<!DOCTYPE html><title>dlsjs.net - System Error</title>")
+        with quiet(), self.assertRaises(msc.LoginParamError):
+            msc.do_login("dlsjs.net", "a@b.com", "pw", "ab12cd34", "abcde", session)
+
+    def test_http_520_is_host_level(self):
+        session = FakeSession(FakeResponse("<html>520</html>", 520))
+        with quiet(), self.assertRaises(FakeHTTPError):
+            msc.do_login("dlsjs.net", "a@b.com", "pw", "ab12cd34", "abcde", session)
+
+
+class TestCheckCookieValid(unittest.TestCase):
+    def test_logged_in(self):
+        session = FakeSession("<html>个人空间</html>")
+        with quiet():
+            self.assertTrue(msc.check_cookie_valid("dlsjs.net", session))
+
+    def test_need_login(self):
+        session = FakeSession("<html>请先登录</html>")
+        with quiet():
+            self.assertFalse(msc.check_cookie_valid("dlsjs.net", session))
+
+    def test_transient_http_error_raises(self):
+        """403/520 不能被当成「Cookie 失效」，否则会误删仍然有效的缓存。"""
+        session = FakeSession(FakeResponse("<html>520</html>", 520))
+        with quiet(), self.assertRaises(FakeHTTPError):
+            msc.check_cookie_valid("dlsjs.net", session)
+
+
+class TestParseSignReward(unittest.TestCase):
+    def test_real_sample_1105(self):
+        """2026-11-05 真机原文：第二项为空时会留下悬空的「和 」。"""
+        inner = ('<h3>签到成功</h3><p class="con">\n'
+                 '                获得随机奖励 123车票 和 。                </p>')
+        self.assertEqual(msc.parse_sign_reward(inner), "，获得 123车票")
+
+    def test_two_rewards(self):
+        inner = "获得随机奖励 3 车票和 2 威望。"
+        self.assertEqual(msc.parse_sign_reward(inner), "，获得 3 车票和 2 威望")
+
+    def test_no_reward(self):
+        self.assertEqual(msc.parse_sign_reward("<h3>签到成功</h3>"), "")
+
+
 class TestIsNetworkError(unittest.TestCase):
     def test_ssl_and_connection(self):
         self.assertTrue(msc._is_network_error(Exception("SSLError: bad handshake")))
@@ -216,6 +350,27 @@ class TestIsNetworkError(unittest.TestCase):
     def test_business_error(self):
         self.assertFalse(msc._is_network_error(Exception("登录失败")))
         self.assertFalse(msc._is_network_error(Exception("HTTP 404")))
+
+
+class TestTransientHttpError(unittest.TestCase):
+    """403 是 cookie 门槛、5xx 是边缘抖动，都属可重试的主机级故障。"""
+
+    def test_transient_statuses(self):
+        for code in (403, 429, 500, 502, 503, 504, 520, 522, 524):
+            self.assertTrue(msc._is_transient_http_error(FakeHTTPError(code)), code)
+
+    def test_permanent_statuses(self):
+        for code in (200, 301, 404, 410):
+            self.assertFalse(msc._is_transient_http_error(FakeHTTPError(code)), code)
+
+    def test_error_without_response(self):
+        self.assertFalse(msc._is_transient_http_error(Exception("boom")))
+
+    def test_host_level_combines_both(self):
+        self.assertTrue(msc._is_host_level_error(FakeHTTPError(520)))
+        self.assertTrue(msc._is_host_level_error(Exception("SSLError: EOF")))
+        self.assertFalse(msc._is_host_level_error(FakeHTTPError(404)))
+        self.assertFalse(msc._is_host_level_error(Exception("密码错误")))
 
 
 class TestDoSignin(unittest.TestCase):
@@ -243,6 +398,12 @@ class TestDoSignin(unittest.TestCase):
             result = msc.do_signin("sjs96.com", "deadbeef", session, False)
         self.assertEqual(result["status"], "fail")
         self.assertIn("签到失败", result["message"])
+
+    def test_http_403_raises_instead_of_fail(self):
+        """签到接口的 403/5xx 属主机级故障，上抛换域名，不记为签到失败。"""
+        session = FakeSession(FakeResponse("<html>403</html>", 403))
+        with quiet(), self.assertRaises(FakeHTTPError):
+            msc.do_signin("dlsjs.net", "deadbeef", session, False)
 
 
 class TestFetchSignStats(unittest.TestCase):
@@ -357,6 +518,35 @@ class TestRunOneAccount(unittest.TestCase):
         result = self._run(["a.com"], fake, {"allow_fallback": False})
         self.assertEqual(result["reason"], "host_unreachable")
 
+    def test_host_level_failures_do_not_trip_breaker(self):
+        """主机级故障（403/520/TLS）只换域名，不能累加登录失败熔断。"""
+        calls = []
+
+        def fake(account, host, cache, debug, proxy):
+            calls.append(host)
+            return None
+
+        result = self._run(["a.com", "b.com", "c.com", "d.com"], fake,
+                           {"allow_fallback": False})
+        self.assertFalse(result["success"])
+        self.assertEqual(result["reason"], "host_unreachable")
+        self.assertEqual(calls, ["a.com", "b.com", "c.com", "d.com"])
+
+    def test_breaker_only_counts_real_login_failures(self):
+        """两次主机级故障 + 两次真实登录失败 → 只在第 2 次真实失败时熔断。"""
+        calls = []
+
+        def fake(account, host, cache, debug, proxy):
+            calls.append(host)
+            if host in ("a.com", "b.com"):
+                return None
+            return _login_failed(host)
+
+        result = self._run(["a.com", "b.com", "c.com", "d.com"], fake,
+                           {"allow_fallback": False})
+        self.assertEqual(result["reason"], "login_aborted")
+        self.assertEqual(calls, ["a.com", "b.com", "c.com", "d.com"])
+
 
 class TestCookieCache(unittest.TestCase):
     def setUp(self):
@@ -434,6 +624,30 @@ class TestNewSession(unittest.TestCase):
             with self.assertRaises(requests.exceptions.SSLError):
                 s.get("https://example.com/")
         self.assertFalse(s.verify)
+
+    @unittest.skipUnless(_HAS_REQUESTS, "需要真实 requests 库")
+    def test_403_retried_then_success(self):
+        """站点首请求 403 + Set-Cookie，同会话第二次即 200（2026-11-06 实测）。"""
+        r403 = mock.MagicMock(status_code=403)
+        r200 = mock.MagicMock(status_code=200)
+        with mock.patch.object(requests.Session, "request",
+                               side_effect=[r403, r200]) as m, \
+                mock.patch.object(msc.time, "sleep"):
+            s = msc._new_session("")
+            resp = s.get("https://example.com/")
+        self.assertIs(resp, r200)
+        self.assertEqual(m.call_count, 2)
+
+    @unittest.skipUnless(_HAS_REQUESTS, "需要真实 requests 库")
+    def test_transient_status_retry_exhausted(self):
+        """持续 520 时按上限重试，最后把响应交回上层（由 raise_for_status 处理）。"""
+        r520 = mock.MagicMock(status_code=520)
+        with mock.patch.object(requests.Session, "request", return_value=r520) as m, \
+                mock.patch.object(msc.time, "sleep"):
+            s = msc._new_session("")
+            resp = s.get("https://example.com/")
+        self.assertIs(resp, r520)
+        self.assertEqual(m.call_count, msc.MAX_TRANSIENT_RETRY)
 
 
 if __name__ == "__main__":
