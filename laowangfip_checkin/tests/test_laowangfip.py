@@ -334,8 +334,8 @@ class TestSaveCookiesToCache(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             m.COOKIE_CACHE_DIR = Path(tmp)
             s = requests.Session()
-            s.cookies.set("sid", "abc", domain="laowangfip372.vip", path="/")
-            s.cookies.set("tok", "xyz", domain="laowangfip372.vip", path="/")
+            s.cookies.set("sid", "abc", domain="laowang.vip", path="/")
+            s.cookies.set("tok", "xyz", domain="laowang.vip", path="/")
             self.assertTrue(m.save_cookies_to_cache(s, "someone"))
             loaded = m.load_cookies_from_cache("someone")
             self.assertEqual({c["name"] for c in loaded}, {"sid", "tok"})
