@@ -1,8 +1,8 @@
 # 老王FIP签到
 
-适配青龙面板的老王论坛（laowangfip372.vip）每日签到脚本，纯 `requests` 实现登录、滑块验证与签到。
+适配青龙面板的老王论坛（laowang.vip）每日签到脚本，纯 `requests` 实现登录、滑块验证与签到。
 
-站点默认地址：`https://laowangfip372.vip`
+站点默认地址：`https://laowang.vip`
 
 ## 为什么可以纯 requests
 
@@ -34,7 +34,7 @@ task laowangfip_checkin/laowangfip_checkin.py
 | `LWFIP_ACCOUNTS` | ✅ | - | `用户名#密码`，多账号用 `&` 或换行分隔 |
 | `LWFIP_PROXY` | 否 | - | HTTP 代理，站点被墙建议配置，如 `http://172.17.0.1:7890`；留空时自动回退青龙全局代理 |
 | `LWFIP_PROXY_REQUIRED` | 否 | `false` | 设为 `true` 时缺代理直接报错退出（默认缺代理仅告警并直连尝试） |
-| `LWFIP_BASE_URL` | 否 | `https://laowangfip372.vip` | 站点换域名时覆盖 |
+| `LWFIP_BASE_URL` | 否 | `https://laowang.vip` | 站点换域名时覆盖 |
 | `LWFIP_NOTIFY` | 否 | `true` | 是否调用青龙 `notify.py` 推送 |
 | `LWFIP_NOTIFY_ONLY_FAIL` | 否 | `false` | `true` 时仅在有账号失败时才推送 |
 | `LWFIP_TIMEOUT` | 否 | `30` | 请求超时，单位秒 |

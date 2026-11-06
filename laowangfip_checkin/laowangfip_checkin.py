@@ -3,7 +3,7 @@
 new Env('老王FIP签到');
 cron: 30 8 * * *
 
-老王论坛（laowangfip372.vip）Discuz 论坛 k_misign 插件每日签到。
+老王论坛（laowang.vip）Discuz 论坛 k_misign 插件每日签到。
 站点被墙，必须挂代理；登录/签到均需通过 tncode 滑块校验。
 
 为什么可以纯 requests（2026-10-10 实测）：
@@ -19,7 +19,7 @@ cron: 30 8 * * *
   LWFIP_PROXY             可选 HTTP 代理（站点被墙，建议配置），如 http://172.17.0.1:7890；
                           留空时自动回退青龙全局代理（HTTPS_PROXY/HTTP_PROXY/ALL_PROXY）
   LWFIP_PROXY_REQUIRED    可选 默认 false，true 时缺代理直接报错退出
-  LWFIP_BASE_URL          可选 默认 https://laowangfip372.vip
+  LWFIP_BASE_URL          可选 默认 https://laowang.vip
   LWFIP_NOTIFY            可选 默认 true
   LWFIP_NOTIFY_ONLY_FAIL  可选 默认 false，true 时仅在有失败时推送
   LWFIP_TIMEOUT           可选 默认 30（秒）
@@ -104,7 +104,7 @@ def send_notify(title: str, content: str) -> bool:
 
 
 # ---------------- 站点常量（2026-10-10 实测） ----------------
-DEFAULT_BASE_URL = "https://laowangfip372.vip"
+DEFAULT_BASE_URL = "https://laowang.vip"
 LOGIN_PAGE_PATH = "/member.php?mod=logging&action=login"
 SIGN_PAGE_PATH = "/plugin.php?id=k_misign:sign"
 CAPTCHA_IMG_PATH = "/captcha/tncode.php"
