@@ -13,7 +13,7 @@
 | SophNet 签到 | www.sophnet.com 福利中心签到，refreshToken 换 accessToken，纯 API 免验证码 | [sophnet_checkin/README.md](sophnet_checkin/README.md) | `task sophnet_checkin/sophnet_checkin.py` |
 | iKuuu 签到（Node.js） | ikuuu 机场签到，账号密码自动登录（Geetest 点选验证码由视觉大模型解法器过码，支持备用模型/备用解法器链）+ Cookie 缓存续期 + cookie 直填双模式 + 动态域名（登录前可达性探测）+ 多账号 + 失败延迟重试 + 推送重试 | [wuang-wu_Ikuuu/README.md](wuang-wu_Ikuuu/README.md) | `task wuang-wu_Ikuuu/ikuuu.js` |
 | gpt.qt.cool 签到 | gpt.qt.cool 签到，Playwright + OpenCV 滑动验证码自动识别（高亮/模板/边缘多候选缺口定位），登录态 storage_state 缓存复用 + 401 自愈，整轮重试可配，支持 `--check` 自检 | [gptqtcool_checkin/README.md](gptqtcool_checkin/README.md) | `task gptqtcool_checkin/gptqtcool_checkin.py` |
-| 司机社签到 | 司机社（sjs96 / dlsjs / xsijishe 等多镜像）Discuz 签到，Cookie 直签或邮箱密码登录（ddddocr 仅作验证码防御路径），内置实测可用域名 + 失败自动切换 + 运行时域名排序学习 + 连续登录失败熔断，Cookie 缓存复用 | [xsijishe_checkin/README.md](xsijishe_checkin/README.md) | `task xsijishe_checkin/xsijishe_checkin.py` |
+| 司机社签到 | 司机社（xsijishe / dlsjs / sjs66 等多镜像）Discuz 签到，Cookie 直签或邮箱密码登录（ddddocr 仅作验证码防御路径），内置实测可用域名 + 403/5xx 同域名退避重试 + 失败自动切换 + 运行时域名排序学习 + 仅真实登录失败才熔断，Cookie 缓存复用 | [xsijishe_checkin/README.md](xsijishe_checkin/README.md) | `task xsijishe_checkin/xsijishe_checkin.py` |
 | 采蘑菇论坛回帖签到 | caimogu.cc 自动回帖刷活跃度，Playwright 驱动 + AI/模板双模式评论生成（反套话词库、REPLY/SKIP 判定、防重复回帖） | [caimogu_checkin/README.md](caimogu_checkin/README.md) | `task caimogu_checkin/caimogu_checkin.py` |
 | 雨云自动签到 | 雨云服务器签到 + 自动续费，多账号 + 验证码识别，专为青龙面板优化 | [Rainyun/README.md](Rainyun/README.md) | `task Rainyun/main.py` |
 | 天翼云盘签到 | cloud189-sdk 登录签到，多账号 + 个人/家庭容量统计，复用 sendNotify.js 全通道推送 | [Cloud189Checkin/README.md](Cloud189Checkin/README.md) | `task Cloud189Checkin/src/app.js` |
@@ -135,7 +135,9 @@ environment:
 
 `NO_PROXY` 用于排除内网，避免青龙访问数据库、NAS 时也被绕进代理。
 
-> 建议代理软件开启**规则模式**：国内域名直连、境外域名走代理。否则国内站脚本（嘉立创、雨云、司机社等）会因绕行而变慢甚至失败。
+> 建议代理软件开启**规则模式**：国内域名直连、境外域名走代理。否则国内站脚本（嘉立创、雨云等）会因绕行而变慢甚至失败。
+>
+> 反过来，司机社、老王FIP 这类站点在国内会被 DNS 污染/SNI 阻断，**必须走代理**；直连只会拿到错误的 IP。
 
 ## 仓库流量
 

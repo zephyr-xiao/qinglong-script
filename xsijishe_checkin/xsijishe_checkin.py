@@ -20,7 +20,8 @@ OCR 使用本地 ddddocr 库，无需部署外部服务。
                               ★ 多账号用换行分隔
   SIJISHE_NOTIFY           true/false  默认 true，是否调用青龙 notify.py 推送
   SIJISHE_NOTIFY_ONLY_FAIL true/false  默认 false，全部成功时静默
-  SIJISHE_PROXY            代理地址    默认空，如 http://172.17.0.1:7890
+  SIJISHE_PROXY            代理地址    默认空，如 http://172.17.0.1:7890；
+                             留空时自动回退青龙全局代理（HTTPS_PROXY/HTTP_PROXY/ALL_PROXY）
   SIJISHE_HOST             可选，手动锁定签到域名（如 dlsjs.net）；
                              留空则使用内置实测可用域名列表，
                              全部失败时再用 Playwright 渲染发布页兜底
@@ -159,6 +160,18 @@ MAX_CAPTCHA_RETRY = 3
 # 因此失败两次即停，不再继续遍历备用域名。
 MAX_LOGIN_FAILURES = 2
 
+# 瞬时故障状态码：同一域名重试即可恢复，既不算登录失败，也不该删 Cookie 缓存。
+# 403 是站点/Cloudflare 的 cookie 门槛（首个请求 403 并下发 cookie，同 session 再请求即 200）；
+# 429 是限流；5xx（含 Cloudflare 的 520~524）是边缘或源站抖动。
+_TRANSIENT_HTTP_STATUS = frozenset({403, 429, 500, 502, 503, 504,
+                                    520, 521, 522, 523, 524})
+MAX_TRANSIENT_RETRY = 3                # 单个请求最多尝试次数（含首次）
+TRANSIENT_RETRY_DELAY = (0.8, 1.6)     # 重试前随机退避区间（秒）
+
+# 青龙面板「配置文件 / 环境变量」里配置的全局代理变量（大小写都认）
+GLOBAL_PROXY_KEYS = ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy",
+                     "ALL_PROXY", "all_proxy")
+
 
 # ============================ 通用工具函数 ============================
 
@@ -171,6 +184,27 @@ def env_bool(name: str, default: bool) -> bool:
     if v is None or v == "":
         return default
     return v.strip().lower() in ("1", "true", "yes", "y", "on")
+
+
+def resolve_proxy(*specific_keys: str) -> tuple[str, str]:
+    """
+    解析代理地址，返回 (代理地址, 来源变量名)，两者均可能为空字符串。
+
+    优先级：脚本专属变量 > 青龙全局代理变量 > 空（直连）。
+    session 的 trust_env 是关闭的，requests 不会自己读环境变量，故必须在这里取值。
+    """
+    for name in (*specific_keys, *GLOBAL_PROXY_KEYS):
+        value = (os.getenv(name) or "").strip()
+        if value:
+            return value, name
+    return "", ""
+
+
+def mask_proxy(proxy: str) -> str:
+    """代理 URL 脱敏：隐藏 user:pass@ 中的凭据（全局代理常带账号密码）。"""
+    if not proxy:
+        return ""
+    return re.sub(r"://[^@/]+@", "://***@", proxy)
 
 
 def mask_email(email: str) -> str:
@@ -235,17 +269,27 @@ def parse_accounts(raw: str) -> list[dict]:
 
 # ============================ 域名获取 ============================
 
-# 内置候选域名（2026-10-10 匿名实测：均能直接返回 Discuz 登录页；顺序按发布页优先级）
-# 已移除的失效域名：xsijishe.ink、sjslt.cc（已变成 JS 跳转页，不再提供 Discuz 页面）、
-#                   sjs47.com（DNS 解析与 SSL 握手均失败）
+# 内置候选域名（2026-11-06 实测：均能返回 Discuz 登录参数页，formhash/loginhash 齐全）
+# 顺序按实测稳定性排列：前两个长期在用，后两个作为备用。
 KNOWN_HOSTS = [
     "xsijishe.net",
     "dlsjs.net",
-    "sjs96.com",
-    "dlsjs.com",
     "sjs66.net",
     "xsijishe.com",
+]
+
+# 已失效域名（勿再加入候选，切到它们只会浪费一轮请求）：
+#   sjs96.com / sjs66.com  301 跳转到发布页 47447.net，站点已不在这两个域名上
+#   dlsjs.com              TLS 握手直接 EOF，连不到站点
+#   xsijishe.ink / sjslt.cc 已变成 JS 跳转页，不再提供 Discuz 页面
+#   sjs47.com              DNS 解析与 SSL 握手均失败
+DEAD_HOSTS = [
+    "sjs96.com",
     "sjs66.com",
+    "dlsjs.com",
+    "xsijishe.ink",
+    "sjslt.cc",
+    "sjs47.com",
 ]
 
 
@@ -398,18 +442,20 @@ def get_session_cookies_str(session: requests.Session) -> str:
 
 # ============================ 登录流程 ============================
 
-def fetch_login_params(host: str, session: requests.Session, debug: bool) -> tuple[str | None, str | None, str | None]:
+def fetch_login_params(host: str, session: requests.Session, debug: bool) -> tuple[str, str | None, str]:
     """
     GET 登录页，提取 formhash、seccodehash、loginhash。
-    返回 (formhash, seccodehash, loginhash)。
-    formhash/loginhash 提取失败时抛 LoginParamError（上层切换域名重试）；
-    seccodehash 为 None 属正常（当前无需验证码或 JS 动态加载），不影响登录。
+    返回 (formhash, seccodehash, loginhash)；seccodehash 为 None 属正常
+    （当前无需验证码，或验证码由 JS 动态加载），不影响登录。
+
+    任何失败都抛 LoginParamError 交给上层切换域名：拿不到 loginhash 还继续发登录
+    请求，只会换来站点的 System Error 页面，并被误记成一次「登录失败」。
     """
     try:
         url = f"https://{host}{URL_LOGIN_PARAM}"
         resp = session.get(
             url,
-            headers={"User-Agent": DEFAULT_UA, "Host": host},
+            headers={"User-Agent": DEFAULT_UA},
             timeout=15,
         )
         resp.raise_for_status()
@@ -448,8 +494,7 @@ def fetch_login_params(host: str, session: requests.Session, debug: bool) -> tup
         if not loginhash and debug:
             print(f"   [DEBUG] loginhash 缺失，响应片段: {text[:500]}")
 
-        # formhash/loginhash 任一缺失 → 疑似域名失效或被反爬拦截，
-        # 抛 LoginParamError 让上层切换备用域名重试（而非直接判定登录失败）
+        # formhash/loginhash 任一缺失 → 疑似域名失效或被反爬拦截
         if not formhash or not loginhash:
             raise LoginParamError(
                 f"无法提取登录参数（formhash={'有' if formhash else '无'}，"
@@ -463,11 +508,8 @@ def fetch_login_params(host: str, session: requests.Session, debug: bool) -> tup
     except LoginParamError:
         raise
     except Exception as e:
-        # 网络/SSL 类错误上抛（上层切换域名重试）；解析类异常按提取失败处理
-        if _is_network_error(e):
-            raise
-        print(f"❌ [获取参数] 解析异常: {e}")
-        return None, None, None
+        print(f"❌ [获取参数] 失败: {e}")
+        raise LoginParamError(f"获取登录参数失败: {e}") from e
 
 
 def fetch_captcha_image(host: str, seccodehash: str, session: requests.Session) -> str | None:
@@ -481,7 +523,6 @@ def fetch_captcha_image(host: str, seccodehash: str, session: requests.Session) 
             url,
             headers={
                 "User-Agent": DEFAULT_UA,
-                "Host": host,
                 "Referer": f"https://{host}/member.php?mod=logging&action=login",
             },
             timeout=15,
@@ -489,8 +530,8 @@ def fetch_captcha_image(host: str, seccodehash: str, session: requests.Session) 
         img_b64 = base64.b64encode(resp.content).decode("utf-8")
         return img_b64
     except Exception as e:
-        # 网络/SSL 类错误上抛（上层切换域名重试）；其余按获取失败处理（外层会重试）
-        if _is_network_error(e):
+        # 主机级故障上抛（上层切换域名重试）；其余按获取失败处理（外层会重试）
+        if _is_host_level_error(e):
             raise
         print(f"❌ [获取验证码] 异常: {e}")
         return None
@@ -523,7 +564,6 @@ def verify_captcha(host: str, captcha: str, seccodehash: str, session: requests.
             url,
             headers={
                 "User-Agent": DEFAULT_UA,
-                "Host": host,
                 "Referer": f"https://{host}/member.php?mod=logging&action=login",
             },
             timeout=15,
@@ -534,8 +574,8 @@ def verify_captcha(host: str, captcha: str, seccodehash: str, session: requests.
             return True
         return False
     except Exception as e:
-        # 网络/SSL 类错误上抛（上层切换域名重试）；其余按校验失败处理（外层会重试）
-        if _is_network_error(e):
+        # 主机级故障上抛（上层切换域名重试）；其余按校验失败处理（外层会重试）
+        if _is_host_level_error(e):
             raise
         print(f"❌ [校验验证码] 异常: {e}")
         return False
@@ -602,7 +642,6 @@ def do_login(
             url,
             headers={
                 "User-Agent": DEFAULT_UA,
-                "Host": host,
                 "Referer": f"https://{host}/home.php?mod=spacecp&ac=credit&showcredit=1",
                 "Content-Type": "application/x-www-form-urlencoded",
             },
@@ -613,22 +652,26 @@ def do_login(
 
         # Discuz! AJAX 登录返回 CDATA 包裹的 JavaScript
         m = re.search(r"<!\[CDATA\[(.*?)\]\]>", resp.text)
-        if m:
-            text = m.group(1)
-            if "欢迎您回来" in text:
-                # 等级/昵称随站点模板变化，交给 parse_login_welcome 统一提取
-                who = parse_login_welcome(text)
-                print(f"✅ [登录] 登录成功！{who}" if who else "✅ [登录] 登录成功！")
-                return True
-            else:
-                print(f"❌ [登录] 登录失败，响应: {text[:200]}")
-                return False
-        else:
-            print(f"❌ [登录] 响应格式异常: {resp.text[:200]}")
-            return False
+        if not m:
+            # 没有 CDATA 说明拿到的不是登录应答（CF 挑战页 / Discuz System Error），
+            # 属主机级故障：既不是密码错误，也不该计入登录失败熔断
+            print(f"❌ [登录] 响应格式异常（疑似拦截页）: {resp.text[:200]}")
+            raise LoginParamError("登录响应不是 Discuz 应答，疑似被拦截")
+
+        text = m.group(1)
+        if "欢迎您回来" in text:
+            # 等级/昵称随站点模板变化，交给 parse_login_welcome 统一提取
+            who = parse_login_welcome(text)
+            print(f"✅ [登录] 登录成功！{who}" if who else "✅ [登录] 登录成功！")
+            return True
+
+        print(f"❌ [登录] 登录失败，响应: {text[:200]}")
+        return False
+    except LoginParamError:
+        raise
     except Exception as e:
-        # 网络/SSL 类错误上抛（上层切换域名重试）；其余按登录失败处理
-        if _is_network_error(e):
+        # 主机级故障上抛（上层切换域名重试）；其余按登录失败处理
+        if _is_host_level_error(e):
             raise
         print(f"❌ [登录] 异常: {e}")
         return False
@@ -711,7 +754,7 @@ def check_cookie_valid(host: str, session: requests.Session) -> bool:
         url = f"https://{host}{URL_CHECK_COOKIE}"
         resp = session.get(
             url,
-            headers={"User-Agent": DEFAULT_UA, "Host": host},
+            headers={"User-Agent": DEFAULT_UA},
             timeout=15,
         )
         resp.raise_for_status()
@@ -719,8 +762,8 @@ def check_cookie_valid(host: str, session: requests.Session) -> bool:
             return False
         return True
     except Exception as e:
-        # 网络/SSL 类错误上抛（上层会切换域名重试）；页面结构等业务异常按 Cookie 失效处理
-        if _is_network_error(e):
+        # 主机级故障上抛（上层会切换域名重试），避免把 403/5xx 误判成 Cookie 失效而删缓存
+        if _is_host_level_error(e):
             raise
         print(f"⚠️ [Cookie检测] 异常: {e}")
         return False
@@ -738,7 +781,6 @@ def fetch_sign_hash(host: str, session: requests.Session, debug: bool) -> str | 
             url,
             headers={
                 "User-Agent": DEFAULT_UA,
-                "Host": host,
                 "X-Requested-With": "XMLHttpRequest",
             },
             timeout=15,
@@ -764,8 +806,8 @@ def fetch_sign_hash(host: str, session: requests.Session, debug: bool) -> str | 
     except LoginParamError:
         raise
     except Exception as e:
-        # 网络/SSL 类错误上抛（上层切换域名重试）；解析类异常返回 None 按业务失败处理
-        if _is_network_error(e):
+        # 主机级故障上抛（上层切换域名重试）；解析类异常返回 None 按业务失败处理
+        if _is_host_level_error(e):
             raise
         print(f"   ❌ [签到参数] 解析异常: {e}")
         return None
@@ -786,30 +828,24 @@ def do_signin(host: str, sign_hash: str, session: requests.Session, debug: bool)
             url,
             headers={
                 "User-Agent": DEFAULT_UA,
-                "Host": host,
                 "X-Requested-With": "XMLHttpRequest",
             },
             timeout=15,
         )
         resp.raise_for_status()
         text = resp.text
-        # 响应原文完整落日志（不截断）：成功分支文案尚未真机实测钉死，
-        # 保留原文便于事后核对站点文案变化（见 README「已知限制与待验证」）。
+        # 响应原文完整落日志（不截断）：站点会改签到面板文案，
+        # 保留原文便于事后核对解析规则是否失效（见 README「已知限制」）。
         print(f"   📥 [签到响应] HTTP {resp.status_code} 原文: {text}")
 
         # 解析 CDATA 内容
         m = re.search(r"<!\[CDATA\[(.*?)\]\]>", text, re.DOTALL)
         inner = m.group(1) if m else text
 
-        # 签到成功（⚠️ 下面两个字面量与奖励正则属历史值：2026-10-10 评审实测签到页
-        # HTML 中不存在「签到成功」「获得随机奖励」字样，即成功分支文案从未被真机验证。
-        # 下次签到成功时请按日志里的响应原文核对，确认后把文案钉死在此处）
+        # 签到成功（文案取自 2026-11-05 真机响应：<h3>签到成功</h3> +
+        # <p class="con">获得随机奖励 123车票 和 。</p>）
         if "签到成功" in inner:
-            reward_m = re.search(r"获得随机奖励\s*(.*?)\s*车票\s*和\s*(.*?)\s*[。.]", inner)
-            if reward_m:
-                msg = f"签到成功，获得 {reward_m.group(1)} 车票和 {reward_m.group(2)}"
-            else:
-                msg = "签到成功"
+            msg = "签到成功" + parse_sign_reward(inner)
             # 附加签到统计
             stats = fetch_sign_stats(host, session, debug)
             if stats:
@@ -829,10 +865,24 @@ def do_signin(host: str, sign_hash: str, session: requests.Session, debug: bool)
         return {"status": "fail", "message": f"签到失败: {snippet}"}
 
     except Exception as e:
-        # 网络/SSL 类错误上抛（上层切换域名重试）；其余按签到失败处理
-        if _is_network_error(e):
+        # 主机级故障上抛（上层切换域名重试）；其余按签到失败处理
+        if _is_host_level_error(e):
             raise
         return {"status": "fail", "message": f"签到请求异常: {e}"}
+
+
+def parse_sign_reward(inner: str) -> str:
+    """从签到成功响应里提取奖励文案，返回「，获得 …」或空串。
+
+    站点原文形如「获得随机奖励 123车票 和 。」——第二项为空时会留下悬空的「和」，
+    因此取整段奖励文本后清掉末尾的空连接词。
+    """
+    m = re.search(r"获得随机奖励\s*([^<。]*?)\s*[。.]", inner)
+    if not m:
+        return ""
+    reward = re.sub(r"\s+", " ", m.group(1)).strip()
+    reward = re.sub(r"\s*和\s*$", "", reward).strip()
+    return f"，获得 {reward}" if reward else ""
 
 
 def fetch_sign_stats(host: str, session: requests.Session, debug: bool) -> str:
@@ -847,7 +897,6 @@ def fetch_sign_stats(host: str, session: requests.Session, debug: bool) -> str:
             url,
             headers={
                 "User-Agent": DEFAULT_UA,
-                "Host": host,
                 "X-Requested-With": "XMLHttpRequest",
             },
             timeout=15,
@@ -901,6 +950,20 @@ def _is_network_error(err: Exception) -> bool:
     return any(kw in msg for kw in _NETWORK_ERR_KEYWORDS)
 
 
+def _is_transient_http_error(err: Exception) -> bool:
+    """判断是否为可重试的 HTTP 状态错误（cookie 门槛/限流/边缘抖动）。
+
+    与 _is_network_error 互补：后者看异常文本，这里看响应状态码。
+    """
+    response = getattr(err, "response", None)
+    return getattr(response, "status_code", None) in _TRANSIENT_HTTP_STATUS
+
+
+def _is_host_level_error(err: Exception) -> bool:
+    """主机级故障：换域名或稍后重试可能恢复，不能记成账号登录失败。"""
+    return _is_network_error(err) or _is_transient_http_error(err)
+
+
 def _result(success: bool, reason: str, message: str, label: str, host: str) -> dict:
     """
     统一构造账号结果。
@@ -918,11 +981,15 @@ def _result(success: bool, reason: str, message: str, label: str, host: str) -> 
 
 
 def _new_session(proxy: str = "") -> requests.Session:
-    """构建会话：TLS 默认校验证书 + trust_env 关闭。
+    """构建会话：TLS 默认校验证书 + trust_env 关闭 + 瞬时故障同域名重试。
 
     trust_env 关闭后 requests 不再静默读系统环境/注册表代理（Windows 上会击穿
-    XSJISHE_PROXY > 青龙全局代理 > 直连的优先级链）；仅当确系 SSL 握手失败时
-    降级为不校验并告警一次（站点边缘证书异常的兜底）。"""
+    SIJISHE_PROXY > 青龙全局代理 > 直连的优先级链）；仅当确系 SSL 握手失败时
+    降级为不校验并告警一次（站点边缘证书异常的兜底）。
+
+    站点与 Cloudflare 会在首个请求返回 403 并下发 cookie，同一会话再请求即放行；
+    429/5xx 多为边缘抖动。这类故障在域名内重试比切域名更快恢复，因此统一在会话层
+    处理，业务层只会拿到「可用响应」或「确实不可用」。"""
     session = requests.Session()
     session.trust_env = False
     session.verify = True
@@ -932,10 +999,15 @@ def _new_session(proxy: str = "") -> requests.Session:
     state = {"downgraded": False}
 
     def _request(method, url, **kwargs):
-        try:
-            return _orig_request(method, url, **kwargs)
-        except requests.exceptions.SSLError:
-            if not state["downgraded"]:
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                resp = _orig_request(method, url, **kwargs)
+            except requests.exceptions.SSLError:
+                # 证书/握手失败只降级一次，且重试次数用尽时仍要把异常抛给上层
+                if state["downgraded"] or attempt >= MAX_TRANSIENT_RETRY:
+                    raise
                 state["downgraded"] = True
                 session.verify = False
                 print("   ⚠️ TLS 证书校验失败，已自动降级为不校验继续"
@@ -944,7 +1016,11 @@ def _new_session(proxy: str = "") -> requests.Session:
                     urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
                 except Exception:
                     pass
-            return _orig_request(method, url, **kwargs)
+                continue
+            if resp.status_code in _TRANSIENT_HTTP_STATUS and attempt < MAX_TRANSIENT_RETRY:
+                time.sleep(random.uniform(*TRANSIENT_RETRY_DELAY))
+                continue
+            return resp
 
     session.request = _request
     return session
@@ -974,8 +1050,8 @@ def _try_signin_with_host(
                 print(f"   ❌ [{host}] Cookie 已失效，请重新获取")
                 return _result(False, "cookie_invalid", "❌ Cookie 已失效，请重新获取", label, host)
         except Exception as e:
-            if _is_network_error(e):
-                print(f"   ⚠️ [{host}] Cookie 检测网络异常: {e}")
+            if _is_host_level_error(e):
+                print(f"   ⚠️ [{host}] Cookie 检测站点异常: {e}")
                 return None  # 换域名重试
             raise
 
@@ -987,8 +1063,8 @@ def _try_signin_with_host(
             print(f"   ⚠️ [{host}] {e}，尝试切换备用域名...")
             return None
         except Exception as e:
-            if _is_network_error(e):
-                print(f"   ⚠️ [{host}] 获取签到参数网络异常: {e}")
+            if _is_host_level_error(e):
+                print(f"   ⚠️ [{host}] 获取签到参数站点异常: {e}")
                 return None
             raise
 
@@ -998,8 +1074,8 @@ def _try_signin_with_host(
         try:
             result = do_signin(host, sign_hash, session, debug)
         except Exception as e:
-            if _is_network_error(e):
-                print(f"   ⚠️ [{host}] 签到请求网络异常: {e}")
+            if _is_host_level_error(e):
+                print(f"   ⚠️ [{host}] 签到请求站点异常: {e}")
                 return None
             raise
 
@@ -1042,12 +1118,12 @@ def _try_signin_with_host(
                     print(f"   ⚠️ [{host}] {e}，尝试切换备用域名...")
                     return None
                 except Exception as e:
-                    if _is_network_error(e):
-                        print(f"   ⚠️ [{host}] 缓存 Cookie 检测网络异常，尝试重新登录...")
+                    if _is_host_level_error(e):
+                        print(f"   ⚠️ [{host}] 缓存 Cookie 检测站点异常，尝试重新登录...")
                     else:
                         print(f"   ⚠️ [{host}] 缓存 Cookie 检测异常，尝试重新登录...")
 
-                # 缓存确认失效才清（网络异常时缓存未必失效，保留它）
+                # 缓存确认失效才清（主机级故障时缓存未必失效，保留它）
                 if cache_invalid:
                     remove_cached_cookie(email)
                 # 缓存 Cookie 失效或网络错误 → 继续走登录流程
@@ -1060,8 +1136,8 @@ def _try_signin_with_host(
             print(f"   ⚠️ [{host}] {e}，尝试切换备用域名...")
             return None
         except Exception as e:
-            if _is_network_error(e):
-                print(f"   ⚠️ [{host}] 登录网络异常: {e}")
+            if _is_host_level_error(e):
+                print(f"   ⚠️ [{host}] 登录站点异常: {e}")
                 return None
             raise
 
@@ -1075,8 +1151,8 @@ def _try_signin_with_host(
             print(f"   ⚠️ [{host}] {e}，尝试切换备用域名...")
             return None
         except Exception as e:
-            if _is_network_error(e):
-                print(f"   ⚠️ [{host}] 获取签到参数网络异常: {e}")
+            if _is_host_level_error(e):
+                print(f"   ⚠️ [{host}] 获取签到参数站点异常: {e}")
                 return None
             raise
 
@@ -1086,8 +1162,8 @@ def _try_signin_with_host(
         try:
             result = do_signin(host, sign_hash, session, debug)
         except Exception as e:
-            if _is_network_error(e):
-                print(f"   ⚠️ [{host}] 签到请求网络异常: {e}")
+            if _is_host_level_error(e):
+                print(f"   ⚠️ [{host}] 签到请求站点异常: {e}")
                 return None
             raise
 
@@ -1198,11 +1274,16 @@ def main():
     NOTIFY_ENABLED = env_bool("SIJISHE_NOTIFY", True)
     NOTIFY_ONLY_FAIL = env_bool("SIJISHE_NOTIFY_ONLY_FAIL", False)
     DEBUG = env_bool("SIJISHE_DEBUG", False)
-    PROXY = (os.getenv("SIJISHE_PROXY") or "").strip()
+    PROXY, PROXY_SOURCE = resolve_proxy("SIJISHE_PROXY")
 
     print("=" * 60)
     print(f"🚀 {title}  开始执行  {datetime.now():%Y-%m-%d %H:%M:%S}")
     print("=" * 60)
+    if PROXY:
+        source_desc = "SIJISHE_PROXY" if PROXY_SOURCE == "SIJISHE_PROXY" else f"青龙全局代理 {PROXY_SOURCE}"
+        print(f"🌐 代理: {mask_proxy(PROXY)}（来源: {source_desc}）")
+    else:
+        print("🌐 代理: 未配置，直连（站点需要代理时请设置 SIJISHE_PROXY）")
 
     # 解析账号
     raw_accounts = (os.getenv("SIJISHE_ACCOUNTS") or "").strip()
