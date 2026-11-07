@@ -487,22 +487,84 @@ function pickClicks(parsed, size) {
   return clicks.length ? clicks : null;
 }
 
-// 多轮取中位数；返回 { ok, clicks?, msg? }
+// 多轮取中位数；返回 { ok, clicks?, reordered?, msg? }
+//
+// 合并前必须先把各次的点序拉齐：模型对同一批图案可能按不同顺序枚举
+// （2026-11-06 实测：两次投票把前两个图标换了顺序），逐元素取中位数会造出
+// 夹在两个图案中间的假坐标——看着"偏差不大"（34px < 35px 阈值）却一个都点不中。
+const pointDistance = (a, b) => Math.hypot(a[0] - b[0], a[1] - b[1]);
+
+// 全排列（n ≤ 7 最多 5040 个，穷举最优一对一匹配足够快）
+function permutations(n) {
+  const out = [];
+  const walk = (rest, acc) => {
+    if (rest.length === 0) { out.push(acc.slice()); return; }
+    for (let i = 0; i < rest.length; i++) {
+      acc.push(rest[i]);
+      walk(rest.slice(0, i).concat(rest.slice(i + 1)), acc);
+      acc.pop();
+    }
+  };
+  walk(Array.from({ length: n }, (_, i) => i), []);
+  return out;
+}
+
+// 把 other 的点重排成与 base 同序，返回使总距离最小的下标序列
+// 点数过多时全排列不划算，退化成"每个点挑最近的未用点"的贪心
+function alignToBase(base, other) {
+  const n = base.length;
+  if (n <= 1) return { order: n ? [0] : [], cost: n ? pointDistance(base[0], other[0]) : 0 };
+  if (n > 7) {
+    const used = new Set();
+    const order = [];
+    let cost = 0;
+    for (const p of base) {
+      let best = -1;
+      let bestD = Infinity;
+      for (let i = 0; i < n; i++) {
+        if (used.has(i)) continue;
+        const d = pointDistance(p, other[i]);
+        if (d < bestD) { bestD = d; best = i; }
+      }
+      used.add(best);
+      order.push(best);
+      cost += bestD;
+    }
+    return { order, cost };
+  }
+  let bestOrder = null;
+  let bestCost = Infinity;
+  // permutations 先产出恒等排列，代价相同时保留它（点序本来就一致就别动）
+  for (const perm of permutations(n)) {
+    let cost = 0;
+    for (let i = 0; i < n; i++) cost += pointDistance(base[i], other[perm[i]]);
+    if (cost < bestCost) { bestCost = cost; bestOrder = perm; }
+  }
+  return { order: bestOrder, cost: bestCost };
+}
+
 function vote(votesClicks) {
   const counts = new Set(votesClicks.map((v) => v.length));
   if (counts.size !== 1) {
     return { ok: false, msg: `各次调用给出的点数不一致（${votesClicks.map((v) => v.length).join('/')}）` };
   }
   const n = votesClicks[0].length;
+  const aligned = [votesClicks[0]];
+  let reordered = false;
+  for (let k = 1; k < votesClicks.length; k++) {
+    const { order } = alignToBase(votesClicks[0], votesClicks[k]);
+    if (order.some((idx, i) => idx !== i)) reordered = true;
+    aligned.push(order.map((idx) => votesClicks[k][idx]));
+  }
   const out = [];
   let maxDev = 0;
   for (let i = 0; i < n; i++) {
-    const xs = votesClicks.map((v) => v[i][0]).sort((a, b) => a - b);
-    const ys = votesClicks.map((v) => v[i][1]).sort((a, b) => a - b);
+    const xs = aligned.map((v) => v[i][0]).sort((a, b) => a - b);
+    const ys = aligned.map((v) => v[i][1]).sort((a, b) => a - b);
     const mid = Math.floor(xs.length / 2);
     const mx = xs.length % 2 ? xs[mid] : (xs[mid - 1] + xs[mid]) / 2;
     const my = ys.length % 2 ? ys[mid] : (ys[mid - 1] + ys[mid]) / 2;
-    for (const v of votesClicks) {
+    for (const v of aligned) {
       maxDev = Math.max(maxDev, Math.hypot(v[i][0] - mx, v[i][1] - my));
     }
     out.push([mx, my]);
@@ -510,7 +572,7 @@ function vote(votesClicks) {
   if (maxDev > 35) {
     return { ok: false, msg: `各次调用结果分歧过大（最大偏差 ${maxDev.toFixed(0)}px）` };
   }
-  return { ok: true, clicks: out, spread: maxDev };
+  return { ok: true, clicks: out, spread: maxDev, reordered };
 }
 
 // ==========================================
@@ -668,6 +730,7 @@ async function main() {
         process.stdout.write(JSON.stringify({ ok: false, msg: v.msg }));
         return;
       }
+      if (v.reordered) log('各次点序不一致，已按最近邻对齐后合并');
       log(`最终坐标: ${JSON.stringify(v.clicks)}（各次最大偏差 ${v.spread.toFixed(0)}px）`);
       process.stdout.write(JSON.stringify({ ok: true, clicks: v.clicks }));
     } catch (e) {
@@ -692,6 +755,7 @@ module.exports = {
   computeMaxTokens,
   // 投票与坐标过滤：决定"要不要把坐标交给服务端"的两道闸门
   vote,
+  alignToBase,
   pickClicks,
   // 限流退避：429 的等待策略（纯函数 + 单次调用，便于单测注入）
   rateLimitBackoffSec,

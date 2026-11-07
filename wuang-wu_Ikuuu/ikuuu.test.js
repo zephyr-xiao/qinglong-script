@@ -19,6 +19,7 @@ const {
   extractSolverJson,
   normalizeClicks,
   cellIndexForPoint,
+  gridLayoutFromCells,
   clickImagePoint,
   solverUnavailable,
   solverFatal,
@@ -50,6 +51,7 @@ const {
   killProcessTree,
   runSolver,
   pickLoginHost,
+  openLoginPage,
   runAccountSafe,
   sendNotifyWithRetry,
   rotateDebugDir,
@@ -819,6 +821,24 @@ test('vote: 中位数投票与分歧阈值', () => {
   assert.strictEqual(vote([[[0, 0]], [[0, 0]], [[36, 0]]]).ok, false);
 });
 
+test('vote: 点序不同但点集一致时先对齐再合并（2026-11-06 事故样本）', () => {
+  // 实测两次投票找的是同一组三个图标，只是第 2 次把前两个换了顺序。
+  // 逐元素取中位数会造出 (74,107)/(94,104) 这种夹在两个图标中间的假坐标（相距仅 20px，
+  // 300×200 的题图里不可能同时命中两个图标），点击必然落空。对齐后应还原成真实图标位置。
+  const first = [[70, 73], [110, 133], [240, 100]];
+  const second = [[78, 140], [78, 75], [275, 95]];
+  const v = vote([first, second]);
+  assert.strictEqual(v.ok, true);
+  assert.strictEqual(v.reordered, true);
+  assert.deepStrictEqual(v.clicks, [[74, 74], [94, 136.5], [257.5, 97.5]]);
+});
+
+test('vote: 对齐后仍然错位（真选了不同图案）时拒绝', () => {
+  const a = [[10, 10], [100, 10], [10, 100]];
+  const b = [[110, 110], [200, 110], [110, 200]]; // 整体偏移 100px，怎么配都对不上
+  assert.strictEqual(vote([a, b]).ok, false);
+});
+
 test('pickClicks: 坐标越界过滤与全非法返回 null', () => {
   const size = { w: 300, h: 200 };
   assert.deepStrictEqual(pickClicks({ clicks: [[10, 20], [301, 50], [-5, 3]] }, size), [[10, 20]]);
@@ -940,6 +960,40 @@ test('resolveChromiumPath: 环境变量优先于自动探测', () => {
 const GRID9 = { cols: 3, rows: 3 };
 const SPRITE9 = { w: 300, h: 261 };   // 实测精灵图尺寸（3×3 拼接）
 
+test('gridLayoutFromCells: 按格子几何还原行列数（不能拿 background-size 反推）', () => {
+  // 2026-11-07 现场 DOM：9 格，3 列 × 3 行，格子 96×83、间距 6px
+  const real = [];
+  [471, 560, 649].forEach((y, row) => {
+    [490, 592, 694].forEach((x, col) => {
+      real.push({ i: row * 3 + col, rect: { x, y, w: 96, h: 83 } });
+    });
+  });
+  assert.deepStrictEqual(gridLayoutFromCells(real), { cols: 3, rows: 3 });
+
+  // 竖条精灵图（真·1×9）必须仍然识别成 1 列，不能被"一律 3 列"带偏
+  const strip = Array.from({ length: 9 }, (_, i) => ({ i, rect: { x: 0, y: i * 29, w: 300, h: 29 } }));
+  assert.deepStrictEqual(gridLayoutFromCells(strip), { cols: 1, rows: 9 });
+
+  // 4 列 × 3 行
+  const wide = [];
+  [0, 80, 160].forEach((y, row) => {
+    [0, 75, 150, 225].forEach((x, col) => {
+      wide.push({ i: row * 4 + col, rect: { x, y, w: 70, h: 75 } });
+    });
+  });
+  assert.deepStrictEqual(gridLayoutFromCells(wide), { cols: 4, rows: 3 });
+
+  // DOM 顺序是列优先时，几何分组仍要给出 3 列
+  const columnMajor = [0, 1, 2].flatMap((col) => [0, 1, 2].map((row) => ({
+    i: col * 3 + row, rect: { x: col * 102, y: row * 89, w: 96, h: 83 },
+  })));
+  assert.deepStrictEqual(gridLayoutFromCells(columnMajor), { cols: 3, rows: 3 });
+
+  // 不足 4 格不算九宫格
+  assert.strictEqual(gridLayoutFromCells(real.slice(0, 3)), null);
+  assert.strictEqual(gridLayoutFromCells([]), null);
+});
+
 test('cellIndexForPoint: 精灵图坐标 → 格子序号', () => {
   // 三只蝴蝶分别在第 1/2/6 格（2026-11-01 现场抓到的真题，人工按这三格点击站点判过）
   assert.strictEqual(cellIndexForPoint(150, 43, SPRITE9, GRID9), 1);
@@ -994,6 +1048,36 @@ test('clickImagePoint: 整图布局走比例映射，不带格子语义', async 
   assert.strictEqual(calls[0].cell, null);      // 不进入格子分支
   assert.strictEqual(calls[0].url, 'https://x/bg.jpg'); // 仍按背景图 URL 定位元素
   assert.strictEqual(pt.cell, undefined);
+});
+
+test('openLoginPage: 刷新超时后回落 goto，不把整轮登录判死', async () => {
+  // 2026-11-06 事故：reload 用默认 30s 超时，一次慢刷新直接把 browserLogin 抛成
+  // "浏览器登录异常"，6 轮重抽机会全废。刷新失败必须能回落到 goto。
+  const calls = [];
+  const page = {
+    reload: async () => {
+      calls.push('reload');
+      throw new Error('page.reload: Timeout 45000ms exceeded.');
+    },
+    goto: async (url) => { calls.push(`goto ${url}`); },
+    waitForSelector: async (sel) => { calls.push(`wait ${sel}`); },
+  };
+  await openLoginPage(page, 'https://ikuuu.top/auth/login', { reload: true });
+  assert.deepStrictEqual(calls, [
+    'reload',
+    'goto https://ikuuu.top/auth/login',
+    'wait #email',
+  ]);
+});
+
+test('openLoginPage: 导航成功但表单没出来也要重试，两次都失败才抛错', async () => {
+  let gotos = 0;
+  const page = {
+    goto: async () => { gotos += 1; },
+    waitForSelector: async () => { throw new Error('Timeout 45000ms exceeded'); },
+  };
+  await assert.rejects(() => openLoginPage(page, 'https://ikuuu.top/auth/login'), /Timeout/);
+  assert.strictEqual(gotos, 1); // 首次打开没有 reload 分支，只试一次
 });
 
 test('wantedCount: 站点改版后的英文提示语也要取到数量', () => {
