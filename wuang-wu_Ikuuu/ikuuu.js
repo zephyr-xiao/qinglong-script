@@ -451,6 +451,23 @@ async function isCaptchaReady(page) {
     .catch(() => false);
 }
 
+// 九宫格的行列数只能从几何还原：同一行的格子 top 相同，最大的一行有几格就是几列。
+// 不能拿 background-size 反推——它表示"图片相对元素放大多少倍"，300% 就是 3 列，
+// 按 100/300 折算会得到 1 列，9 格题被当成 1×9，点击坐标全部折算到错误格子。
+// 纯函数，便于单测（浏览器侧只负责把格子矩形读出来）。
+function gridLayoutFromCells(cells) {
+  const list = (cells || []).filter((c) => c && c.rect && c.rect.w > 0 && c.rect.h > 0);
+  if (list.length < 4) return null;
+  const rowTops = [];
+  for (const cell of list) {
+    const row = rowTops.find((r) => Math.abs(r.y - cell.rect.y) <= 4);
+    if (row) row.count += 1;
+    else rowTops.push({ y: cell.rect.y, count: 1 });
+  }
+  const cols = Math.max(...rowTops.map((r) => r.count));
+  return { cols, rows: Math.ceil(list.length / cols) };
+}
+
 // 读取点选挑战面板：挑战图地址、待点图案、显示区域与图片自然尺寸
 // 验证形式（含挑战图与待点图案）在页面加载时的 /load 就已确定，点按钮只是校验，
 // 因此这里要能等面板渲染出来，并对不同形式的 DOM 结构做兼容（背景图/普通 img）。
@@ -462,7 +479,7 @@ async function isCaptchaReady(page) {
 //             点击必须落到所属格子的元素上——退化成"窗口里第一个带背景图的元素"会让所有点击
 //             都落进左上角第 0 格（2026-11-01 六轮全挂的根因）。
 async function readClickChallenge(page) {
-  return page.evaluate(async () => {
+  const raw = await page.evaluate(async () => {
     const win = document.querySelector('.geetest_window');
     const fromBg = (el) => {
       const cs = el ? getComputedStyle(el) : null;
@@ -478,18 +495,12 @@ async function readClickChallenge(page) {
     // 判据：窗口内出现多个 .geetest_item_img 且共用同一张背景图（精灵图）
     let cells = [];
     let spriteUrl = null;
-    let cols = 3;
     if (win) {
       for (const el of win.querySelectorAll('.geetest_item_img')) {
         const url = fromBg(el);
         const r = rectOf(el);
         if (!url || r.w < 20 || r.h < 20) continue;
-        if (!spriteUrl) {
-          spriteUrl = url;
-          // background-size: 300% auto → 横向 3 列
-          const m = /^(\d+(?:\.\d+)?)%/.exec(getComputedStyle(el).backgroundSize || '');
-          if (m) cols = Math.max(1, Math.round(100 / Number(m[1])));
-        }
+        if (!spriteUrl) spriteUrl = url;
         if (url !== spriteUrl) continue;
         const idx = /geetest_imgs(\d+)/.exec(String(el.className));
         cells.push({ i: idx ? Number(idx[1]) : cells.length, rect: r });
@@ -504,7 +515,6 @@ async function readClickChallenge(page) {
 
     if (isGrid) {
       cells = cells.sort((a, b) => a.i - b.i);
-      const rows = Math.ceil(cells.length / cols);
       // 九格并集 = 整张精灵图在页面上的显示区域
       const xs = cells.map((c) => c.rect.x);
       const ys = cells.map((c) => c.rect.y);
@@ -515,7 +525,7 @@ async function readClickChallenge(page) {
         w: Math.max(...xe) - Math.min(...xs), h: Math.max(...ye) - Math.min(...ys),
       };
       imageUrl = spriteUrl;
-      grid = { cols, rows };
+      grid = { cols: null, rows: null }; // 行列数由主进程按格子矩形还原（gridLayoutFromCells）
     } else {
       cells = [];
       let target = null;
@@ -567,6 +577,12 @@ async function readClickChallenge(page) {
   }).catch(() => ({
     layout: 'single', visible: false, imageUrl: null, grid: null, cells: [], tplUrls: [], rect: null, natural: null,
   }));
+  // 九宫格的行列数在主进程算：浏览器侧拿不到 Node 里的纯函数，而这段逻辑要能单测
+  if (raw.layout === 'grid9') {
+    const layout = gridLayoutFromCells(raw.cells);
+    raw.grid = layout || { cols: 3, rows: Math.ceil(raw.cells.length / 3) };
+  }
+  return raw;
 }
 
 // 等点选面板渲染出来（面板可能晚于 isReady 轮询才出现）
@@ -900,6 +916,31 @@ function buildCookieString(cookies, host) {
     .join('; ');
 }
 
+// 打开/刷新登录页。
+// 不用 domcontentloaded：代理抖动时一次慢加载会撞上 Playwright 默认 30s 超时，
+// 整轮登录直接判死（2026-11-06 实测）。改成 commit（拿到响应头即返回）再等表单选择器，
+// 既容忍慢子资源，又能确认页面真的可用；刷新失败时回落一次 goto。
+const NAV_TIMEOUT_MS = 45000;
+async function openLoginPage(page, url, { reload = false } = {}) {
+  const attempts = reload
+    ? [() => page.reload({ waitUntil: 'commit', timeout: NAV_TIMEOUT_MS }),
+      () => page.goto(url, { waitUntil: 'commit', timeout: NAV_TIMEOUT_MS })]
+    : [() => page.goto(url, { waitUntil: 'commit', timeout: NAV_TIMEOUT_MS })];
+  let lastErr = null;
+  for (let i = 0; i < attempts.length; i++) {
+    try {
+      await attempts[i]();
+      await page.waitForSelector('#email', { timeout: NAV_TIMEOUT_MS });
+      return;
+    } catch (e) {
+      lastErr = e;
+      const next = i < attempts.length - 1 ? '，回落到 goto 重试' : '';
+      dbg(`登录页导航失败（${String(e.message).split('\n')[0]}）${next}`);
+    }
+  }
+  throw lastErr || new Error('登录页加载失败');
+}
+
 // 浏览器登录：成功返回 { ok, cookie }，失败返回 { ok: false, msg }
 async function browserLogin({ host, email, password }) {
   let playwright;
@@ -984,8 +1025,20 @@ async function browserLogin({ host, email, password }) {
       }
     });
 
-    console.log(`  🌐 打开登录页 https://${host}/auth/login ...`);
-    await page.goto(`https://${host}/auth/login`, { waitUntil: 'domcontentloaded', timeout: 45000 });
+    // 调试模式下把登录阶段的所有 POST 打出来：站点改过登录端点时，
+    // "提交后未捕获登录响应" 才不会变成无迹可查的黑洞
+    if (DEBUG) {
+      page.on('request', (req) => { if (req.method() === 'POST') dbg('POST →', req.url()); });
+      page.on('response', (resp) => { if (resp.request().method() === 'POST') dbg('POST ←', resp.status(), resp.url()); });
+    }
+
+    const loginUrl = `https://${host}/auth/login`;
+    console.log(`  🌐 打开登录页 ${loginUrl} ...`);
+    try {
+      await openLoginPage(page, loginUrl);
+    } catch (e) {
+      return { ok: false, msg: `打开登录页失败（网络/代理不稳定或页面结构变化）: ${String(e.message).split('\n')[0]}` };
+    }
     await page.waitForTimeout(2500);
 
     // 验证码处理：按"抽到哪种形式"分支，最多整页重来 MAX_CAPTCHA_ROUNDS 次
@@ -1002,7 +1055,12 @@ async function browserLogin({ host, email, password }) {
           break;
         }
         captchaType = null;
-        await page.reload({ waitUntil: 'domcontentloaded' });
+        try {
+          await openLoginPage(page, loginUrl, { reload: true });
+        } catch (e) {
+          // 刷新两次（reload + goto）都失败说明网络/代理当时确实不通，继续重抽只会空转
+          return { ok: false, msg: `刷新登录页失败（网络/代理不稳定或页面结构变化）: ${String(e.message).split('\n')[0]}` };
+        }
         await page.waitForTimeout(2500);
       }
       await page.fill('#email', email);
@@ -1090,12 +1148,20 @@ async function browserLogin({ host, email, password }) {
         return false;
       }
     };
-    const deadline = Date.now() + 20000;
+    const deadline = Date.now() + 30000;
     while (Date.now() < deadline && !loginPhaseBody && !landedOnUser()) {
       await page.waitForTimeout(500);
     }
     await page.waitForTimeout(2000);
     await shot(page, 'after_submit');
+    if (!loginPhaseBody) {
+      // 没抓到登录响应时把页面提示语打出来：验证未通过/密码错误/接口变了都会留痕
+      const hints = await page.evaluate(() => Array.from(document.querySelectorAll(
+        '.toast, .alert, .invalid-feedback, [class*=toast], [class*=message], [class*=error]',
+      ))
+        .map((el) => (el.textContent || '').trim()).filter(Boolean).slice(0, 5)).catch(() => []);
+      dbg('提交后页面提示:', JSON.stringify(hints));
+    }
 
     const allCookies = await context.cookies();
     const cookieStr = buildCookieString(allCookies, host);
@@ -1709,7 +1775,9 @@ module.exports = {
   extractSolverJson,
   normalizeClicks,
   cellIndexForPoint,
+  gridLayoutFromCells,
   clickImagePoint,
+  openLoginPage,
   solverUnavailable,
   solverFatal,
   isRetryableStatus,
