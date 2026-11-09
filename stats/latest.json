@@ -1,13 +1,13 @@
 {
-  "fetched_at": "2026-11-08T07:04:26+00:00",
+  "fetched_at": "2026-11-09T07:48:44+00:00",
   "repo": "zephyr-xiao/qinglong-script",
   "views_14d": {
-    "count": 185,
-    "uniques": 54
+    "count": 213,
+    "uniques": 60
   },
   "clones_14d": {
-    "count": 248,
-    "uniques": 98
+    "count": 237,
+    "uniques": 93
   },
   "stars": 5,
   "forks": 2,
@@ -16,54 +16,54 @@
     {
       "referrer": "github.com",
       "views": 56,
-      "uniques": 35
+      "uniques": 33
     },
     {
       "referrer": "Bing",
-      "views": 12,
-      "uniques": 9
+      "views": 16,
+      "uniques": 10
     }
   ],
   "popular_paths": [
     {
       "path": "/zephyr-xiao/qinglong-script",
-      "views": 58,
-      "uniques": 40
+      "views": 67,
+      "uniques": 47
     },
     {
       "path": "/zephyr-xiao/qinglong-script/blob/main/xsijishe_checkin/README.md",
-      "views": 11,
-      "uniques": 5
-    },
-    {
-      "path": "/zephyr-xiao/qinglong-script/tree/main",
-      "views": 9,
+      "views": 13,
       "uniques": 7
     },
     {
-      "path": "/zephyr-xiao/qinglong-script/blob/main/wuang-wu_Ikuuu/README.md",
-      "views": 9,
-      "uniques": 4
-    },
-    {
-      "path": "/zephyr-xiao/qinglong-script/blob/main/laowangfip_checkin/README.md",
-      "views": 6,
-      "uniques": 4
-    },
-    {
-      "path": "/zephyr-xiao/qinglong-script/tree/main/jlc_checkin",
-      "views": 6,
-      "uniques": 2
-    },
-    {
-      "path": "/zephyr-xiao/qinglong-script/blob/main/wnflb_checkin/README.md",
-      "views": 5,
-      "uniques": 5
+      "path": "/zephyr-xiao/qinglong-script/tree/main",
+      "views": 11,
+      "uniques": 8
     },
     {
       "path": "/zephyr-xiao/qinglong-script/blob/main/laowangfip_checkin/laowangfip_checkin.py",
-      "views": 5,
-      "uniques": 4
+      "views": 9,
+      "uniques": 6
+    },
+    {
+      "path": "/zephyr-xiao/qinglong-script/blob/main/laowangfip_checkin/README.md",
+      "views": 8,
+      "uniques": 5
+    },
+    {
+      "path": "/zephyr-xiao/qinglong-script/blob/main/wuang-wu_Ikuuu/README.md",
+      "views": 8,
+      "uniques": 3
+    },
+    {
+      "path": "/zephyr-xiao/qinglong-script/blob/main/wnflb_checkin/README.md",
+      "views": 6,
+      "uniques": 6
+    },
+    {
+      "path": "/zephyr-xiao/qinglong-script/blob/main/caimogu_checkin/README.md",
+      "views": 6,
+      "uniques": 5
     },
     {
       "path": "/zephyr-xiao/qinglong-script/blob/main/mybt-checkin-ql/README.md",
