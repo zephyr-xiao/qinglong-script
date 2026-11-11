@@ -1,34 +1,34 @@
 {
-  "fetched_at": "2026-11-09T07:48:44+00:00",
+  "fetched_at": "2026-11-11T07:38:18+00:00",
   "repo": "zephyr-xiao/qinglong-script",
   "views_14d": {
-    "count": 213,
-    "uniques": 60
+    "count": 210,
+    "uniques": 59
   },
   "clones_14d": {
-    "count": 237,
-    "uniques": 93
+    "count": 225,
+    "uniques": 87
   },
-  "stars": 5,
+  "stars": 6,
   "forks": 2,
   "watchers": 0,
   "referrers": [
     {
       "referrer": "github.com",
-      "views": 56,
-      "uniques": 33
+      "views": 52,
+      "uniques": 30
     },
     {
       "referrer": "Bing",
-      "views": 16,
-      "uniques": 10
+      "views": 17,
+      "uniques": 11
     }
   ],
   "popular_paths": [
     {
       "path": "/zephyr-xiao/qinglong-script",
-      "views": 67,
-      "uniques": 47
+      "views": 64,
+      "uniques": 45
     },
     {
       "path": "/zephyr-xiao/qinglong-script/blob/main/xsijishe_checkin/README.md",
@@ -57,8 +57,8 @@
     },
     {
       "path": "/zephyr-xiao/qinglong-script/blob/main/wnflb_checkin/README.md",
-      "views": 6,
-      "uniques": 6
+      "views": 7,
+      "uniques": 7
     },
     {
       "path": "/zephyr-xiao/qinglong-script/blob/main/caimogu_checkin/README.md",
