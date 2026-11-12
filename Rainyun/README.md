@@ -172,7 +172,7 @@ RAINYUN_ACCOUNT
 
 | 位置 | 必填 | 说明 | 示例 |
 |------|------|------|------|
-| 1 | ✅ | 雨云账号 | `user@qq.com` |
+| 1 | ✅ | 雨云账号 | `user@example.com` |
 | 2 | ✅ | 密码 | `your_password` |
 | 3 | ❌ | 自动续费 | `true` / `false`（默认 false） |
 | 4 | ❌ | API Key | 雨云后台获取（不续费可留空） |
@@ -183,7 +183,7 @@ RAINYUN_ACCOUNT
 <summary>单账号启用续费</summary>
 
 ```bash
-RAINYUN_ACCOUNT=[["user@qq.com","password123","true","ryapi_xxxxxxxx"]]
+RAINYUN_ACCOUNT=[["user@example.com","password123","true","ryapi_xxxxxxxx"]]
 ```
 
 </details>
@@ -192,7 +192,7 @@ RAINYUN_ACCOUNT=[["user@qq.com","password123","true","ryapi_xxxxxxxx"]]
 <summary>多账号部分续费</summary>
 
 ```bash
-RAINYUN_ACCOUNT=[["user1@qq.com","pwd1","true","key1"],["user2@qq.com","pwd2","false"]]
+RAINYUN_ACCOUNT=[["user1@example.com","pwd1","true","key1"],["user2@example.com","pwd2","false"]]
 ```
 
 </details>
@@ -201,7 +201,7 @@ RAINYUN_ACCOUNT=[["user1@qq.com","pwd1","true","key1"],["user2@qq.com","pwd2","f
 <summary>仅签到不续费</summary>
 
 ```bash
-RAINYUN_ACCOUNT=[["user@qq.com","password"]]
+RAINYUN_ACCOUNT=[["user@example.com","password"]]
 ```
 
 </details>
@@ -373,6 +373,21 @@ export PUSH_PLUS_TOKEN="你的token"
 <td>0.4</td>
 <td>验证码相似度阈值（0-1）</td>
 </tr>
+<tr>
+<td><code>captcha_upscale_fallback</code></td>
+<td><code>true</code></td>
+<td>候选框不足 3 个时，把背景图放大 1.5× 重新检测并合并去重</td>
+</tr>
+<tr>
+<td><code>captcha_debug</code></td>
+<td><code>true</code></td>
+<td>验证码每次失败时，把背景图/碎片图/标注图/相似度矩阵存到脚本目录 <code>captcha_debug/</code>，便于排查</td>
+</tr>
+<tr>
+<td><code>captcha_debug_keep</code></td>
+<td>10</td>
+<td>调试图最多保留最近 N 次，自动清理旧目录</td>
+</tr>
 <tr><td colspan="3"><strong>下载配置</strong></td></tr>
 <tr>
 <td><code>download_max_retries</code></td>
@@ -414,7 +429,7 @@ export PUSH_PLUS_TOKEN="你的token"
 <tr>
 <td><code>cookie_cache</code></td>
 <td><code>true</code></td>
-<td>会话 Cookie 落盘复用：命中且有效则跳过登录 + 登录验证码，直接签到；失效自动回退完整登录。缓存文件在脚本同目录 <code>cookies/rainyun_{hash}.json</code></td>
+<td>会话 Cookie 落盘复用：命中且有效则跳过登录 + 登录验证码，直接签到；失效自动回退完整登录。注入前会先访问雨云首页落到目标域（否则 <code>add_cookie</code> 报 invalid cookie domain）。缓存文件在脚本同目录 <code>cookies/rainyun_{hash}.json</code></td>
 </tr>
 <tr>
 <td><code>stealth_js_path</code></td>
@@ -489,22 +504,22 @@ export PUSH_PLUS_TOKEN="你的token"
 
 💰 积分统计:
   签到前总积分: 25000
-  签到后总积分: 25500
-  本次获得: 500 分
-  约合人民币: 12.75 元
+  签到后总积分: 25520
+  本次获得: 520 分
+  约合人民币: 12.76 元
 
 📋 各账号详情:
 ------------------------------------------------------------
 
-【账号 1】 user1@qq.com
+【账号 1】 user1@example.com
   状态: ✅ 成功
-  积分: 12000 → 12250 (+250)
+  积分: 12000 → 12260 (+260)，约 6.13 元
   自动续费: ✅ 已启用
     续费: 1台成功, 0台跳过, 0台失败
 
-【账号 2】 user2@qq.com
+【账号 2】 user2@example.com
   状态: ✅ 成功
-  积分: 13000 → 13250 (+250)
+  积分: 13000 → 13260 (+260)，约 6.63 元
   自动续费: ⏭️  未启用
 
 ============================================================
@@ -521,12 +536,15 @@ export PUSH_PLUS_TOKEN="你的token"
 <details>
 <summary><strong>Q: 验证码识别率低怎么办？</strong></summary>
 
-**方案 1：降低相似度阈值**
+**方案 1：先看调试图**
+验证码每次失败时，脚本都会把背景图、碎片图、标注图和相似度矩阵存到脚本目录 `captcha_debug/<时间戳>/`（默认保留最近 10 次）。先看 `annotated.jpg` 与 `meta.json`，确认是「检测框没找到图标」还是「匹配分数偏低」，再决定调哪个参数。
+
+**方案 2：降低相似度阈值**
 ```bash
 RAINYUN_CONFIG={"similarity_threshold":0.3}
 ```
 
-**方案 2：启用无限重试**
+**方案 3：启用无限重试**
 ```bash
 RAINYUN_CONFIG={"captcha_retry_limit":-1}
 ```
@@ -540,10 +558,10 @@ RAINYUN_CONFIG={"captcha_retry_limit":-1}
 
 ```bash
 # 原配置
-RAINYUN_ACCOUNT=[["user@qq.com","pwd","true","key"]]
+RAINYUN_ACCOUNT=[["user@example.com","pwd","true","key"]]
 
 # 修改后
-RAINYUN_ACCOUNT=[["user@qq.com","pwd","false","key"]]
+RAINYUN_ACCOUNT=[["user@example.com","pwd","false","key"]]
 ```
 
 </details>
@@ -668,12 +686,44 @@ RainYun/
 ├── 👤 account_parser.py    # 账号解析，多账号配置
 ├── 🌐 api_client.py        # API客户端，封装雨云API
 ├── 🖥️ server_manager.py    # 服务器管理，自动续费逻辑
-└── 🎯 captcha.py           # 验证码处理，图像识别
+├── 🎯 captcha.py           # 验证码处理，图像识别
+├── 🧪 test_captcha.py      # 验证码算法离线单测（容器内运行）
+└── 🧪 captcha_debug/       # 验证码失败现场图（自动生成，保留最近10次）
 ```
 
 ---
 
 ## 📝 更新日志
+
+### v2.0.4 (2026-11-12)
+
+<div style="background: #e8f5e9; padding: 15px; border-radius: 8px; border-left: 4px solid #4caf50;">
+
+**🧩 验证码匹配算法重写**
+
+- 🔴 三个碎片改为「全局唯一分配」：枚举所有「碎片→不同候选框」组合取总分最高，彻底消除「坐标重复」导致的失败
+- 🔴 移除碎片 OCR 判 0/1 的有效性检查（误杀率高），改为图像尺寸 + 标准差 + Laplacian 方差的空白/损坏检测
+- 🟡 候选框按 IoU 去重；不足 3 个时放大 1.5× 重新检测并合并（`captcha_upscale_fallback`）
+- 🟡 相似度计算增加 ORB 兜底：SIFT 关键点 <4 时整对改用 ORB
+- 🟡 签到验证码改为「先判断 iframe 是否可见」，没弹验证码不再误判；只有状态变为「已完成」或积分增加才算签到成功（避免假成功上报）
+- 🟢 每次失败自动留图到 `captcha_debug/`（保留最近 10 次），日志不再输出整段带 `sess` 的验证码 URL
+- 🟢 UA 改用探测到的 Chrome 主版本；随机秒修正为 0-59
+
+</div>
+
+### v2.0.3 (2026-11-12)
+
+<div style="background: #e8f5e9; padding: 15px; border-radius: 8px; border-left: 4px solid #4caf50;">
+
+**💰 通知展示积分 + 🍪 Cookie 缓存修复**
+
+- 通知报告新增每个账号的积分：`积分: 42700 → 42800 (+100)，约 21.40 元`
+- 未配置 API Key 时自动从签到页读取积分（签到前后各读一次），不再依赖 API Key 才能看到积分
+- 已签到过的账号同样显示当前积分与「本次获得」（显示 +0）
+- 🔴 修复 Cookie 缓存注入报 `invalid cookie domain`：注入前先访问雨云首页落到目标域，缓存复用真正生效（可跳过登录与登录验证码）
+- 汇率统一读取 `points_to_cny_rate`，移除代码里硬编码的 2000
+
+</div>
 
 ### v2.0.2 (2026-08-16)
 
