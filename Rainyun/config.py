@@ -18,6 +18,9 @@ class Config:
         # 验证码配置
         "captcha_retry_limit": 10,  # -1表示无限重试
         "captcha_total_timeout": 1800,  # 无限重试模式的全局时间上限（秒），防止验证码结构变化导致死循环
+        "captcha_upscale_fallback": True,  # 候选框不足 3 个时放大背景图重试检测
+        "captcha_debug": True,             # 最终失败时把现场图片存到 captcha_debug/
+        "captcha_debug_keep": 10,          # 调试图最多保留最近 N 次
         
         # 下载配置
         "download_max_retries": 3,
@@ -57,6 +60,12 @@ class Config:
             # 合并用户配置和默认配置
             merged_config = self.DEFAULT_CONFIG.copy()
             merged_config.update(user_config)
+
+            # 汇率必须为正数，否则报告/日志里的除法会抛 ZeroDivisionError
+            rate = merged_config.get("points_to_cny_rate")
+            if not isinstance(rate, (int, float)) or rate <= 0:
+                logger.warning(f"⚠️  points_to_cny_rate={rate!r} 无效，已回退为 2000")
+                merged_config["points_to_cny_rate"] = 2000
             
             logger.info("✅ 配置加载成功")
             # 打印关键配置

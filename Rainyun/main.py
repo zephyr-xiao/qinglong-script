@@ -24,7 +24,7 @@ from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.wait import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.common import TimeoutException
+from selenium.common import TimeoutException, NoSuchElementException
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
 
@@ -95,7 +95,6 @@ class RuntimeContext:
     """运行时上下文"""
     driver: webdriver.Chrome
     wait: WebDriverWait
-    ocr: ddddocr.DdddOcr
     det: ddddocr.DdddOcr
     temp_dir: str
     config: dict
@@ -130,7 +129,18 @@ def init_logger():
 # ---------------------------------------------------------------------------
 LOGIN_URL = "https://app.rainyun.com/auth/login"
 EARN_URL = "https://app.rainyun.com/account/reward/earn"
+HOME_URL = "https://app.rainyun.com/"   # 注入 Cookie 前需先落到该域，否则 add_cookie 报 invalid cookie domain
 COOKIE_DIR_NAME = "cookies"   # Cookie 缓存目录（脚本同目录下，青龙数据卷持久化）
+
+# 赚取积分页顶部「积分」卡片的数值
+POINTS_XPATH = '//*[@id="app"]/div[1]/div[3]/div[2]/div/div/div[2]/div[1]/div[1]/div/p/div/h3'
+
+# 赚取积分页「每日签到」行（行容器 → 标签 → 右侧状态 span）
+SIGN_ROW_XPATH = '//*[@id="app"]/div[1]/div[3]/div[2]/div/div/div[2]/div[2]/div/div/div/div[1]/div'
+
+# 签到状态文案（来自页面 JS：Status=1/0/2）
+SIGN_STATUS_CLAIM = "领取奖励"
+SIGN_STATUS_DONE = "已完成"
 
 
 # ---------------------------------------------------------------------------
@@ -201,7 +211,7 @@ def _pick_headless_flag(major: int) -> str:
     return "--headless"
 
 
-def _build_chrome_options(binary: str, headless_flag: str) -> Options:
+def _build_chrome_options(binary: str, headless_flag: str, ua_major: int = 0) -> Options:
     """组装 Chrome 启动参数（容器必需配置 + 稳健性参数 + 反爬配置）"""
     ops = Options()
     # 容器必需配置
@@ -219,8 +229,12 @@ def _build_chrome_options(binary: str, headless_flag: str) -> Options:
     ops.add_argument("--disable-sync")
     ops.add_argument("--remote-debugging-port=0")
 
-    # User-Agent
-    ops.add_argument("--user-agent=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+    # UA 与探测到的浏览器主版本保持一致；版本未知时不覆盖，避免指纹矛盾
+    if ua_major:
+        ops.add_argument(
+            "--user-agent=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+            f"(KHTML, like Gecko) Chrome/{ua_major}.0.0.0 Safari/537.36"
+        )
 
     # 反爬配置
     ops.add_experimental_option("excludeSwitches", ["enable-automation"])
@@ -285,7 +299,7 @@ def init_selenium(config: dict):
         try:
             logger.info(f"   - 尝试 headless 参数: {flag}")
             driver = webdriver.Chrome(
-                service=service, options=_build_chrome_options(binary, flag)
+                service=service, options=_build_chrome_options(binary, flag, major)
             )
             driver.delete_all_cookies()
             logger.info("✅ Selenium WebDriver 初始化成功")
@@ -408,7 +422,12 @@ def load_cookies(ctx: RuntimeContext, username: str) -> bool:
             # 已过期的 cookie 跳过（不删文件，可能只是部分过期）
             if c.get("expires") and c["expires"] < now:
                 continue
-            ctx.driver.add_cookie(c)
+            # get_cookies() 读出的键是 expires，add_cookie() 要求 expiry；
+            # 不转换的话过期时间会被驱动忽略，注入成会话级 Cookie
+            cookie = {k: v for k, v in c.items() if k != "expires"}
+            if c.get("expires"):
+                cookie["expiry"] = c["expires"]
+            ctx.driver.add_cookie(cookie)
             injected += 1
         if injected == 0:
             return False
@@ -432,9 +451,16 @@ def _drop_cookie_cache(username: str) -> None:
 
 def try_restore_session(ctx: RuntimeContext, account: Account) -> bool:
     """尝试用缓存的 Cookie 恢复登录态。命中且有效返回 True；失效/异常删缓存返回 False。"""
-    if not load_cookies(ctx, account.username):
+    if not os.path.exists(cookie_cache_path(account.username)):
         return False
     try:
+        # add_cookie 要求当前页面域与 Cookie 域匹配，about:blank 上注入会报
+        # "invalid cookie domain"，因此先落到雨云域再注入
+        ctx.driver.get(HOME_URL)
+        if not load_cookies(ctx, account.username):
+            # 全部过期或注入失败：清掉坏缓存，避免每次运行都白试一遍
+            _drop_cookie_cache(account.username)
+            return False
         # 雨云为 SPA：登录失效时访问内部页会 302 回 /auth/login
         ctx.driver.get(EARN_URL)
         time.sleep(5)
@@ -530,68 +556,166 @@ def do_login(ctx: RuntimeContext, username: str, password: str) -> bool:
         return False
 
 
-def do_sign_in(ctx: RuntimeContext) -> bool:
-    """执行签到"""
+def read_points(ctx: RuntimeContext, wait_seconds: float = 5) -> int:
+    """读取赚取积分页顶部的当前积分；读取失败返回 0（0 同时表示“未知”）。
+
+    积分数值是页面异步渲染的，元素出现时文本可能还是空的，因此在
+    wait_seconds 内轮询等待，避免把「尚未加载」误判成「读取失败」。
+    """
+    deadline = time.time() + wait_seconds
+    last_error = None
+    while True:
+        try:
+            digits = re.findall(r"\d+", ctx.driver.find_element(By.XPATH, POINTS_XPATH).text)
+            if digits:
+                return int("".join(digits))
+        except Exception as e:
+            last_error = e
+        if time.time() >= deadline:
+            if last_error is not None:
+                logger.warning(f"⚠️  积分读取失败: {last_error}")
+            return 0
+        time.sleep(0.5)
+
+
+def find_sign_status_element(ctx: RuntimeContext):
+    """定位「每日签到」右侧的状态元素（其下含领取奖励链接）。"""
+    row = ctx.driver.find_element(By.XPATH, SIGN_ROW_XPATH)
+    label = row.find_element(By.XPATH, './/span[contains(text(),"每日签到")]')
+    return label.find_element(By.XPATH, './following-sibling::span[1]')
+
+
+def wait_sign_status(ctx: RuntimeContext, timeout: float = 10) -> str:
+    """轮询等待签到状态文本渲染出来；超时返回最后一次读到的值（可能为空）。"""
+    deadline = time.time() + timeout
+    last_text = ""
+    while True:
+        try:
+            text = find_sign_status_element(ctx).text.strip()
+            last_text = text
+            if text:
+                return text
+        except Exception:
+            pass
+        if time.time() >= deadline:
+            return last_text
+        time.sleep(0.5)
+
+
+def wait_sign_status_until(ctx: RuntimeContext, target: str, timeout: float = 20) -> str:
+    """轮询等待签到状态变成目标文案；超时返回最后读到的值。"""
+    deadline = time.time() + timeout
+    last_text = ""
+    while True:
+        try:
+            text = find_sign_status_element(ctx).text.strip()
+            if text:
+                last_text = text
+                if text == target:
+                    return text
+        except Exception:
+            pass
+        if time.time() >= deadline:
+            return last_text
+        time.sleep(0.5)
+
+
+def do_sign_in(ctx: RuntimeContext, result: AccountResult) -> bool:
+    """执行签到，并把页面积分回填到 result（未配置 API Key 时的积分来源）。"""
     try:
         logger.info("=" * 60)
-        logger.info("🌐 访问赚取积分页: https://app.rainyun.com/account/reward/earn")
+        logger.info(f"🌐 访问赚取积分页: {EARN_URL}")
         ctx.driver.get(EARN_URL)
         ctx.driver.implicitly_wait(5)
-        
+
         logger.info(f"   当前页面URL: {ctx.driver.current_url}")
         logger.info(f"   当前页面标题: {ctx.driver.title}")
-        
+
+        # 签到前积分：API 未提供（未配置 Key 或取数失败）时用页面值兜底，
+        # 通知里才能算出「本次获得」
+        if result.points_before == 0:
+            page_points = read_points(ctx)
+            if page_points > 0:
+                result.points_before = page_points
+                logger.info(
+                    f"💰 签到前积分: {page_points} "
+                    f"（约 {page_points / ctx.config['points_to_cny_rate']:.2f} 元）"
+                )
+
         # 查找签到按钮
         logger.info("🔍 查找每日签到按钮...")
         try:
-            earn_btn_qddiv = ctx.driver.find_element(By.XPATH, '//*[@id="app"]/div[1]/div[3]/div[2]/div/div/div[2]/div[2]/div/div/div/div[1]/div')
-            earn_btn_qd = earn_btn_qddiv.find_element(By.XPATH, './/span[contains(text(),"每日签到")]')
-            status_elem = earn_btn_qd.find_element(By.XPATH, './following-sibling::span[1]')
-            status_text = status_elem.text.strip()
-            
+            status_text = wait_sign_status(ctx, 10)
+            if not status_text:
+                logger.error("❌ 未能读取签到状态（页面可能未加载完成）")
+                return False
+
             logger.info(f"📌 签到状态: {status_text}")
-            
-            if status_text == "领取奖励":
-                earn_btn = status_elem.find_element(By.XPATH, './a')
-                logger.info("🎯 开始领取签到奖励")
-                earn_btn.click()
-                
-                # 处理签到验证码
-                time.sleep(2)
-                logger.info("⚠️  触发签到验证码")
+
+            if status_text == SIGN_STATUS_DONE:
+                logger.info("📌 今日已签到，无需重复签到")
+                return True
+            if status_text != SIGN_STATUS_CLAIM:
+                logger.error(f"❌ 签到状态为「{status_text}」，当前不可领取")
+                return False
+
+            earn_btn = find_sign_status_element(ctx).find_element(By.XPATH, './a')
+            logger.info("🎯 开始领取签到奖励")
+            earn_btn.click()
+
+            # 签到验证码不是每次都会出现：先短等待 iframe 可见，出现才处理
+            time.sleep(2)
+            from captcha import process_captcha
+            try:
+                WebDriverWait(ctx.driver, 8).until(
+                    EC.visibility_of_element_located((By.ID, "tcaptcha_iframe_dy"))
+                )
                 ctx.driver.switch_to.frame("tcaptcha_iframe_dy")
-                
-                from captcha import process_captcha
+                logger.info("⚠️  触发签到验证码")
                 if not process_captcha(ctx, ctx.config):
                     logger.error("❌ 签到验证码处理失败")
                     return False
-                
                 ctx.driver.switch_to.default_content()
-                logger.info("⏳ 等待签到结果...")
-                time.sleep(5)
-                
+            except TimeoutException:
+                logger.info("✅ 未触发签到验证码，继续检查签到结果")
+
+            # 只有状态变成「已完成」（或积分增加）才算签到成功，避免假成功上报
+            logger.info("⏳ 等待签到结果...")
+            final_status = wait_sign_status_until(ctx, SIGN_STATUS_DONE, 20)
+            logger.info(f"📌 签到后状态: {final_status or '未读取到'}")
+            if final_status == SIGN_STATUS_DONE:
                 logger.info("✅ 签到奖励领取成功")
             else:
-                logger.info(f"📌 {status_text}，无需重复签到")
-            
-            # 获取当前积分
-            try:
-                points_elem = ctx.driver.find_element(By.XPATH, '//*[@id="app"]/div[1]/div[3]/div[2]/div/div/div[2]/div[1]/div[1]/div/p/div/h3')
-                import re
-                current_points = int(''.join(re.findall(r'\d+', points_elem.text)))
-                logger.info(f"💰 当前积分: {current_points} （约 {current_points/2000:.2f} 元）")
-            except Exception as e:
-                logger.warning(f"⚠️  积分获取失败: {e}")
-            
+                current_points = read_points(ctx, wait_seconds=3)
+                if result.points_before > 0 and current_points > result.points_before:
+                    logger.info(
+                        f"✅ 积分已增加（{result.points_before} → {current_points}），判定签到成功"
+                    )
+                else:
+                    logger.error("❌ 未能确认签到结果，本次按失败处理")
+                    return False
+
             return True
-            
-        except TimeoutException:
+
+        except (TimeoutException, NoSuchElementException):
             logger.error("❌ 未找到签到按钮")
             return False
-        
+
     except Exception as e:
         logger.error(f"❌ 签到异常: {e}", exc_info=True)
         return False
+
+    finally:
+        # 验证码失败时可能仍停留在 iframe 内，先切回主文档再读积分
+        try:
+            ctx.driver.switch_to.default_content()
+        except Exception:
+            pass
+        # 无论签到成功还是中途失败，只要登录态还在就刷新一次积分，
+        # 保证通知里能看到账号当前余额（API Key 有值时后续以 API 值为准）
+        page_points = read_points(ctx)
+        if page_points > 0 and result.points_after == 0:
+            result.points_after = page_points
 
 
 def execute_auto_renew(account: Account, config: dict) -> str:
@@ -639,13 +763,12 @@ def sign_in_rainyun(account: Account, config: dict) -> AccountResult:
         
         # 随机延时
         delay_min = random.randint(0, config["max_delay"])
-        delay_sec = random.randint(0, 60)
+        delay_sec = random.randint(0, 59)
         logger.info(f"⏳ 随机延时 {delay_min} 分钟 {delay_sec} 秒")
         time.sleep(delay_min * 60 + delay_sec)
         
-        # 初始化组件
-        logger.info("🔧 初始化 ddddocr 验证码识别库")
-        ocr = ddddocr.DdddOcr(ocr=True, show_ad=False)
+        # 初始化组件（只加载检测模型；碎片有效性已改为图像质量检查，不再需要 OCR 模型）
+        logger.info("🔧 初始化 ddddocr 检测库")
         det = ddddocr.DdddOcr(det=True, show_ad=False)
         logger.info("✅ ddddocr 初始化成功")
         
@@ -661,7 +784,6 @@ def sign_in_rainyun(account: Account, config: dict) -> AccountResult:
         ctx = RuntimeContext(
             driver=driver,
             wait=wait,
-            ocr=ocr,
             det=det,
             temp_dir=temp_dir,
             config=config
@@ -695,23 +817,36 @@ def sign_in_rainyun(account: Account, config: dict) -> AccountResult:
             return result
         
         # 执行签到
-        result.sign_in_success = do_sign_in(ctx)
+        result.sign_in_success = do_sign_in(ctx, result)
         if not result.sign_in_success:
             result.error_msg = "签到失败"
             logger.error("❌ 签到失败")
+            if result.points_after > 0:
+                logger.info(
+                    f"💰 当前积分: {result.points_after} "
+                    f"（约 {result.points_after / config['points_to_cny_rate']:.2f} 元）"
+                )
             return result
-        
-        # 记录签到后积分
+
+        # 记录签到后积分（API Key 存在时以 API 值为准，覆盖页面兜底值）
         if account.api_key:
             try:
                 logger.info("🔍 正在获取签到后积分...")
                 api = RainyunAPI(account.api_key, config)
                 result.points_after = api.get_user_points()
-                result.points_earned = result.points_after - result.points_before
-                logger.info(f"💰 当前积分: {result.points_after} (本次获得 {result.points_earned} 分)")
-                logger.info(f"💵 约合人民币: {result.points_after / config['points_to_cny_rate']:.2f} 元")
             except Exception as e:
                 logger.warning(f"⚠️  获取最终积分失败: {e}")
+
+        # 统一计算本次获得：积分可能来自 API 或页面，按同一口径汇总
+        if result.points_before > 0 and result.points_after > 0:
+            result.points_earned = result.points_after - result.points_before
+            logger.info(f"💰 当前积分: {result.points_after} (本次获得 {result.points_earned} 分)")
+            logger.info(f"💵 约合人民币: {result.points_after / config['points_to_cny_rate']:.2f} 元")
+        elif result.points_after > 0:
+            logger.info(
+                f"💰 当前积分: {result.points_after} "
+                f"（约 {result.points_after / config['points_to_cny_rate']:.2f} 元）"
+            )
         
         # 执行自动续费（如果启用）
         result.auto_renew_enabled = account.auto_renew
@@ -759,6 +894,7 @@ def generate_summary_report(results: List[AccountResult], config: dict) -> str:
     Returns:
         汇总报告文本
     """
+    rate = config["points_to_cny_rate"]
     lines = []
     lines.append("=" * 60)
     lines.append("📊 雨云签到任务执行报告")
@@ -774,17 +910,19 @@ def generate_summary_report(results: List[AccountResult], config: dict) -> str:
     lines.append(f"  ✅ 成功: {success}")
     lines.append(f"  ❌ 失败: {failed}")
     
-    # 积分统计
+    # 积分统计：只累加成功读取到的值（未配置 API Key 时来自页面抓取）
     total_points_before = sum(r.points_before for r in results)
     total_points_after = sum(r.points_after for r in results)
     total_earned = sum(r.points_earned for r in results)
     
     if total_points_after > 0:
         lines.append(f"\n💰 积分统计:")
-        lines.append(f"  签到前总积分: {total_points_before}")
+        if total_points_before > 0:
+            lines.append(f"  签到前总积分: {total_points_before}")
         lines.append(f"  签到后总积分: {total_points_after}")
-        lines.append(f"  本次获得: {total_earned} 分")
-        lines.append(f"  约合人民币: {total_points_after / config['points_to_cny_rate']:.2f} 元")
+        if total_points_before > 0:
+            lines.append(f"  本次获得: {total_earned} 分")
+        lines.append(f"  约合人民币: {total_points_after / rate:.2f} 元")
     
     # 各账号详情
     lines.append(f"\n📋 各账号详情:")
@@ -795,17 +933,29 @@ def generate_summary_report(results: List[AccountResult], config: dict) -> str:
         
         if result.is_success():
             lines.append(f"  状态: ✅ 成功")
-            if result.points_after > 0:
-                lines.append(f"  积分: {result.points_before} → {result.points_after} (+{result.points_earned})")
+        else:
+            lines.append(f"  状态: ❌ 失败")
+            lines.append(f"  原因: {result.error_msg}")
+        
+        # 积分行：前后都有展示变化，只有当前值展示余额，登录成功但读不到则明确提示
+        if result.points_after > 0:
+            if result.points_before > 0:
+                lines.append(
+                    f"  积分: {result.points_before} → {result.points_after} "
+                    f"({result.points_earned:+d})，约 {result.points_after / rate:.2f} 元"
+                )
+            else:
+                lines.append(f"  当前积分: {result.points_after}，约 {result.points_after / rate:.2f} 元")
+        elif result.login_success:
+            lines.append("  积分: 获取失败")
+        
+        if result.is_success():
             if result.auto_renew_enabled:
                 lines.append(f"  自动续费: ✅ 已启用")
                 if result.renew_summary:
                     lines.append(f"    {result.renew_summary}")
             else:
                 lines.append(f"  自动续费: ⏭️  未启用")
-        else:
-            lines.append(f"  状态: ❌ 失败")
-            lines.append(f"  原因: {result.error_msg}")
     
     lines.append("\n" + "=" * 60)
     lines.append(f"📅 执行时间: {time.strftime('%Y-%m-%d %H:%M:%S')}")

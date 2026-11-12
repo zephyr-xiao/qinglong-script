@@ -19,6 +19,9 @@ cookies.json
 cookies/
 *.log
 
+# 验证码调试图
+captcha_debug/
+
 # IDE
 .vscode/
 .idea/
