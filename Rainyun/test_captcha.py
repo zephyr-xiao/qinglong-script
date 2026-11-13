@@ -199,6 +199,114 @@ def test_helpers():
     assert not captcha._image_has_content(np.zeros((60, 60), np.uint8))
 
 
+def test_candidate_merge():
+    candidates = [
+        {"box": (10, 10, 100, 100), "scores": {}},
+        {"box": (20, 20, 60, 60), "scores": {}},
+    ]
+    captcha._drop_contained(candidates)
+    assert len(candidates) == 1, candidates
+    assert candidates[0]["box"] == (10, 10, 100, 100)
+
+    candidates = [{"box": (10, 10, 100, 100), "scores": {}}]
+    captcha._add_candidate(candidates, (12, 12, 98, 98), 0, 0.8)
+    assert len(candidates) == 1
+    assert candidates[0]["scores"][0] == 0.8
+
+
+def _paste(background, icon, x, y, scale=1.0):
+    height, width = icon.shape[:2]
+    resized = cv2.resize(icon, (int(width * scale), int(height * scale)))
+    background[y:y + resized.shape[0], x:x + resized.shape[1]] = resized
+    return (x, y, x + resized.shape[1], y + resized.shape[0])
+
+
+def _textured_background(seed, size=(480, 672)):
+    rng = np.random.default_rng(seed)
+    background = np.zeros((size[0], size[1], 3), np.uint8)
+    background[:] = (40, 55, 70)
+    for _ in range(30):
+        x, y = int(rng.integers(0, size[1] - 80)), int(rng.integers(0, size[0] - 80))
+        w, h = int(rng.integers(40, 160)), int(rng.integers(40, 160))
+        color = tuple(int(c) for c in rng.integers(20, 160, size=3))
+        cv2.rectangle(background, (x, y), (x + w, y + h), color, -1)
+    return background
+
+
+def test_sift_localize(tmp):
+    icons = [make_icon(30), make_icon(31), make_icon(32)]
+    background = _textured_background(33)
+    positions = [(80, 80, 1.0), (300, 200, 1.2), (500, 350, 0.9)]
+    for icon, (x, y, scale) in zip(icons, positions):
+        _paste(background, icon, x, y, scale)
+
+    gray = cv2.cvtColor(background, cv2.COLOR_BGR2GRAY)
+    for icon, (x, y, scale) in zip(icons, positions):
+        template = cv2.cvtColor(icon, cv2.COLOR_BGR2GRAY)
+        result = captcha.sift_localize(gray, template)
+        assert result is not None, (x, y, scale)
+        expected_x = x + icon.shape[1] * scale / 2
+        expected_y = y + icon.shape[0] * scale / 2
+        assert abs(result["center"][0] - expected_x) < 45, result
+        assert abs(result["center"][1] - expected_y) < 45, result
+        assert result["score"] > 0.3, result
+
+
+def test_hybrid_recovery(tmp):
+    icons = [make_icon(40), make_icon(41), make_icon(42)]
+    background = _textured_background(43)
+    positions = [(80, 80), (300, 200), (500, 350)]
+    boxes = [_paste(background, icon, x, y) for icon, (x, y) in zip(icons, positions)]
+
+    # 只给前两个图标检测框，第三个模拟 ddddocr 漏检
+    det_boxes = boxes[:2]
+    templates = [cv2.cvtColor(icon, cv2.COLOR_BGR2GRAY) for icon in icons]
+    candidates = captcha.build_candidates(
+        background,
+        det_boxes,
+        templates,
+        {"captcha_sift_localize": True, "captcha_template_fallback": False},
+    )
+    assert len(candidates) >= 3, candidates
+
+    crop_paths = []
+    for idx, candidate in enumerate(candidates):
+        crop = captcha._crop_box(background, candidate["box"])
+        path = os.path.join(tmp, f"hybrid_{idx}.jpg")
+        cv2.imwrite(path, crop)
+        crop_paths.append(path)
+
+    matrix = []
+    for index in range(3):
+        template_path = os.path.join(tmp, f"hybrid_tpl_{index}.jpg")
+        cv2.imwrite(template_path, templates[index])
+        row = []
+        for cand_idx, crop_path in enumerate(crop_paths):
+            base = captcha.compute_similarity(template_path, crop_path)[0]
+            bonus = candidates[cand_idx]["scores"].get(index, 0.0)
+            row.append(max(base, bonus))
+        matrix.append(row)
+
+    assignment, _ = captcha.assign_sprites(matrix, 0.4)
+    assert assignment is not None
+    assert all(matrix[i][assignment[i]] >= 0.4 for i in range(3)), (assignment, matrix)
+
+
+def test_template_localize(tmp):
+    icon = make_icon(50)
+    background = _textured_background(51)
+    box = _paste(background, icon, 200, 150)
+    gray = cv2.cvtColor(background, cv2.COLOR_BGR2GRAY)
+    template = cv2.cvtColor(icon, cv2.COLOR_BGR2GRAY)
+    result = captcha.template_localize(gray, template)
+    assert result is not None, "模板匹配未找到图标"
+    x1, y1, x2, y2 = result["box"]
+    center = ((x1 + x2) // 2, (y1 + y2) // 2)
+    expected = ((box[0] + box[2]) // 2, (box[1] + box[3]) // 2)
+    assert abs(center[0] - expected[0]) < 30, (center, expected)
+    assert abs(center[1] - expected[1]) < 30, (center, expected)
+
+
 def test_debug_dump(tmp):
     ctx = FakeCtx(tmp, {"captcha_debug": True, "captcha_debug_keep": 2, "similarity_threshold": 0.4})
     rng = np.random.default_rng(7)
@@ -243,6 +351,14 @@ def main():
         print("quality check: ok")
         test_upscale_fallback(tmp)
         print("upscale fallback: ok")
+        test_candidate_merge()
+        print("candidate merge: ok")
+        test_sift_localize(tmp)
+        print("sift localize: ok")
+        test_hybrid_recovery(tmp)
+        print("hybrid recovery: ok")
+        test_template_localize(tmp)
+        print("template localize: ok")
         test_helpers()
         print("helpers: ok")
         test_debug_dump(tmp)

@@ -10,6 +10,7 @@ from typing import List, Optional, Tuple
 from urllib.parse import parse_qs, urlparse
 
 import cv2
+import numpy as np
 import requests
 from selenium.common import TimeoutException, NoSuchElementException
 from selenium.webdriver import ActionChains
@@ -96,8 +97,18 @@ def process_captcha(ctx, config: dict) -> bool:
             if captcha is None:
                 raise CaptchaRetryableError("验证码背景图读取失败")
 
-            boxes = detect_candidates(ctx)
-            logger.info(f"   检测到 {len(boxes)} 个候选区域")
+            det_boxes = detect_candidates(ctx)
+            logger.info(f"   检测到 {len(det_boxes)} 个候选区域")
+
+            templates = []
+            for sprite_idx in range(SPRITE_COUNT):
+                template_path = ctx.temp_path(f"sprite_{sprite_idx+1}.jpg")
+                templates.append(cv2.imread(template_path, cv2.IMREAD_GRAYSCALE))
+
+            # 检测框可能漏掉细笔画图标，用 SIFT 定位/模板匹配补候选
+            candidates = build_candidates(captcha, det_boxes, templates, ctx.config)
+            logger.info(f"   候选框合计 {len(candidates)} 个")
+            boxes = [candidate["box"] for candidate in candidates]
             last_state["boxes"] = boxes
             if len(boxes) < SPRITE_COUNT:
                 raise CaptchaRetryableError(f"候选区域不足（{len(boxes)} < {SPRITE_COUNT}）")
@@ -110,11 +121,15 @@ def process_captcha(ctx, config: dict) -> bool:
                 cv2.imwrite(crop_path, crop)
                 crop_paths.append(crop_path)
 
-            # 3 个碎片 × N 个候选框的相似度矩阵
+            # 3 个碎片 × N 个候选框的相似度矩阵；定位框可用定位置信度补足低分
             sim_matrix = []
             for sprite_idx in range(SPRITE_COUNT):
                 sprite_path = ctx.temp_path(f"sprite_{sprite_idx+1}.jpg")
-                row = [compute_similarity(sprite_path, crop_path)[0] for crop_path in crop_paths]
+                row = []
+                for cand_idx, crop_path in enumerate(crop_paths):
+                    base = compute_similarity(sprite_path, crop_path)[0]
+                    bonus = candidates[cand_idx]["scores"].get(sprite_idx, 0.0)
+                    row.append(max(base, bonus))
                 sim_matrix.append(row)
 
             # 候选过多时按列最高分截断，控制分配枚举规模
@@ -393,6 +408,225 @@ def _crop_box(image, box: Tuple[int, int, int, int], padding: int = 2):
     x2 = min(width, x2 + padding)
     y2 = min(height, y2 + padding)
     return image[y1:y2, x1:x2]
+
+
+def sift_localize(
+    background_gray,
+    template_gray,
+    cluster_radius: int = 50,
+    min_cluster: int = 3,
+) -> Optional[dict]:
+    """用 SIFT 特征把碎片匹配到整张背景，再对匹配点聚类定位漏检图标。
+
+    ddddocr 的检测框只覆盖「像文字的区域」，细笔画数字画在复杂背景上时经常漏检；
+    这里直接用碎片自身的特征在整张背景上找位置，作为候选框补充。
+    """
+    try:
+        sift = cv2.SIFT_create()
+    except Exception:
+        return None
+
+    keypoints_bg, descriptors_bg = sift.detectAndCompute(background_gray, None)
+    keypoints_tpl, descriptors_tpl = sift.detectAndCompute(template_gray, None)
+    if (
+        descriptors_bg is None
+        or descriptors_tpl is None
+        or len(keypoints_bg) == 0
+        or len(keypoints_tpl) == 0
+    ):
+        return None
+
+    matches = cv2.BFMatcher(cv2.NORM_L2).knnMatch(descriptors_tpl, descriptors_bg, k=2)
+    good = []
+    for pair in matches:
+        if len(pair) != 2:
+            continue
+        best, second = pair
+        if best.distance < 0.75 * second.distance:
+            good.append(best)
+    if len(good) < min_cluster:
+        return None
+
+    points = np.array([keypoints_bg[m.trainIdx].pt for m in good], dtype=np.float32)
+
+    # 以每个匹配点为种子统计邻域点数，取最大簇
+    best_center = None
+    best_count = 0
+    for point in points:
+        count = int((np.linalg.norm(points - point, axis=1) < cluster_radius).sum())
+        if count > best_count:
+            best_count = count
+            best_center = point
+    if best_count < min_cluster:
+        return None
+
+    height, width = template_gray.shape[:2]
+    center_x, center_y = float(best_center[0]), float(best_center[1])
+    box = (
+        int(center_x - width / 2),
+        int(center_y - height / 2),
+        int(center_x + width / 2),
+        int(center_y + height / 2),
+    )
+    return {
+        "box": box,
+        # 簇内匹配点占模板关键点的比例，作为该碎片在此位置的置信度
+        "score": min(1.0, best_count / max(1, len(keypoints_tpl))),
+        "center": (int(center_x), int(center_y)),
+        "cluster": best_count,
+        "keypoints": len(keypoints_tpl),
+    }
+
+
+def template_localize(
+    background_gray,
+    template_gray,
+    scales: Tuple[float, ...] = (0.7, 0.85, 1.0, 1.15, 1.3, 1.5),
+    min_score: float = 0.35,
+) -> Optional[dict]:
+    """SIFT 定位失败时的兜底：Canny 边缘多尺度模板匹配。"""
+    background_edges = cv2.Canny(background_gray, 50, 150)
+    best = None
+    for scale in scales:
+        template = cv2.resize(
+            template_gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA
+        )
+        if (
+            template.shape[0] >= background_edges.shape[0]
+            or template.shape[1] >= background_edges.shape[1]
+        ):
+            continue
+        result = cv2.matchTemplate(
+            background_edges, cv2.Canny(template, 50, 150), cv2.TM_CCOEFF_NORMED
+        )
+        _, max_value, _, max_loc = cv2.minMaxLoc(result)
+        if best is None or max_value > best["score"]:
+            best = {
+                "box": (
+                    int(max_loc[0]),
+                    int(max_loc[1]),
+                    int(max_loc[0] + template.shape[1]),
+                    int(max_loc[1] + template.shape[0]),
+                ),
+                "score": float(max_value),
+                "scale": scale,
+            }
+    if best is None or best["score"] < min_score:
+        return None
+    return best
+
+
+def _box_area(box: Tuple[int, int, int, int]) -> int:
+    return max(0, box[2] - box[0]) * max(0, box[3] - box[1])
+
+
+def _box_intersection(a: Tuple[int, int, int, int], b: Tuple[int, int, int, int]) -> int:
+    return max(0, min(a[2], b[2]) - max(a[0], b[0])) * max(
+        0, min(a[3], b[3]) - max(a[1], b[1])
+    )
+
+
+def _same_region(a: Tuple[int, int, int, int], b: Tuple[int, int, int, int]) -> bool:
+    """两个框是否指向同一区域：IoU > 0.5，或小框 80% 以上落在大框内。"""
+    intersection = _box_intersection(a, b)
+    if intersection <= 0:
+        return False
+    area_a, area_b = _box_area(a), _box_area(b)
+    union = area_a + area_b - intersection
+    if union > 0 and intersection / union > 0.5:
+        return True
+    smaller = min(area_a, area_b)
+    return smaller > 0 and intersection / smaller > 0.8
+
+
+def _clamp_box(
+    box: Tuple[int, int, int, int], width: int, height: int
+) -> Tuple[int, int, int, int]:
+    x1, y1, x2, y2 = box
+    return (
+        max(0, min(width, x1)),
+        max(0, min(height, y1)),
+        max(0, min(width, x2)),
+        max(0, min(height, y2)),
+    )
+
+
+def build_candidates(
+    background,
+    det_boxes: List[Tuple[int, int, int, int]],
+    templates: List,
+    config: dict,
+) -> List[dict]:
+    """合并 ddddocr 检测框与定位补充框。
+
+    返回的每个候选是 {"box": (...), "scores": {碎片下标: 定位置信度}}；
+    定位置信度只在「该碎片确实由这个框定位到」时存在，用于补足 SIFT
+    在低关键点图标上偏低的相似度。
+    """
+    height, width = background.shape[:2]
+    candidates = []
+    for box in det_boxes:
+        clamped = _clamp_box(box, width, height)
+        if _box_area(clamped) > 0:
+            candidates.append({"box": clamped, "scores": {}})
+
+    background_gray = cv2.cvtColor(background, cv2.COLOR_BGR2GRAY)
+    use_sift = config.get("captcha_sift_localize", True)
+    use_template = config.get("captcha_template_fallback", True)
+
+    for sprite_idx, template in enumerate(templates):
+        if template is None or template.size == 0:
+            continue
+        located = sift_localize(background_gray, template) if use_sift else None
+        if located is None and use_template:
+            located = template_localize(background_gray, template)
+        if located is None:
+            continue
+
+        box = _clamp_box(located["box"], width, height)
+        if _box_area(box) <= 0:
+            continue
+        _add_candidate(candidates, box, sprite_idx, located["score"])
+        logger.info(
+            f"   图案 {sprite_idx+1} 定位补充: 位置={box}, "
+            f"置信度={located['score']:.4f}"
+        )
+
+    _drop_contained(candidates)
+    return candidates
+
+
+def _add_candidate(candidates: List[dict], box, sprite_idx: int, score: float) -> None:
+    """把定位框并入已有候选（同一区域则合并分数），否则新增。"""
+    for candidate in candidates:
+        if _same_region(candidate["box"], box):
+            candidate["scores"][sprite_idx] = max(
+                candidate["scores"].get(sprite_idx, 0.0), score
+            )
+            return
+    candidates.append({"box": box, "scores": {sprite_idx: score}})
+
+
+def _drop_contained(candidates: List[dict]) -> None:
+    """去掉被更大候选框包含的小框（检测框里常见的嵌套子区域），分数转移给大框。"""
+    keep = []
+    for candidate in sorted(
+        candidates, key=lambda item: _box_area(item["box"]), reverse=True
+    ):
+        contained = False
+        for existing in keep:
+            intersection = _box_intersection(candidate["box"], existing["box"])
+            smaller = _box_area(candidate["box"])
+            if smaller > 0 and intersection / smaller > 0.8:
+                for sprite_idx, score in candidate["scores"].items():
+                    existing["scores"][sprite_idx] = max(
+                        existing["scores"].get(sprite_idx, 0.0), score
+                    )
+                contained = True
+                break
+        if not contained:
+            keep.append(candidate)
+    candidates[:] = keep
 
 
 def assign_sprites(
