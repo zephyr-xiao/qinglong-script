@@ -19,7 +19,9 @@ class Config:
         "captcha_retry_limit": 10,  # -1表示无限重试
         "captcha_total_timeout": 1800,  # 无限重试模式的全局时间上限（秒），防止验证码结构变化导致死循环
         "captcha_upscale_fallback": True,  # 候选框不足 3 个时放大背景图重试检测
-        "captcha_debug": True,             # 最终失败时把现场图片存到 captcha_debug/
+        "captcha_sift_localize": True,     # 用 SIFT 特征在整张背景上定位漏检图标，补候选框
+        "captcha_template_fallback": True, # SIFT 定位失败时用 Canny 边缘多尺度模板匹配兜底
+        "captcha_debug": True,             # 每次失败时把现场图片存到 captcha_debug/
         "captcha_debug_keep": 10,          # 调试图最多保留最近 N 次
         
         # 下载配置

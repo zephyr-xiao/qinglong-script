@@ -379,6 +379,16 @@ export PUSH_PLUS_TOKEN="你的token"
 <td>候选框不足 3 个时，把背景图放大 1.5× 重新检测并合并去重</td>
 </tr>
 <tr>
+<td><code>captcha_sift_localize</code></td>
+<td><code>true</code></td>
+<td>用 SIFT 特征在整张背景上定位 ddddocr 漏检的图标，补入候选框</td>
+</tr>
+<tr>
+<td><code>captcha_template_fallback</code></td>
+<td><code>true</code></td>
+<td>SIFT 定位失败时，用 Canny 边缘多尺度模板匹配兜底补候选框</td>
+</tr>
+<tr>
 <td><code>captcha_debug</code></td>
 <td><code>true</code></td>
 <td>验证码每次失败时，把背景图/碎片图/标注图/相似度矩阵存到脚本目录 <code>captcha_debug/</code>，便于排查</td>
@@ -694,6 +704,20 @@ RainYun/
 ---
 
 ## 📝 更新日志
+
+### v2.0.5 (2026-11-14)
+
+<div style="background: #e8f5e9; padding: 15px; border-radius: 8px; border-left: 4px solid #4caf50;">
+
+**🎯 验证码候选框补全**
+
+- 新增 SIFT 特征聚类定位：ddddocr 漏检的细笔画图标（如 `0`/`7`/`9`）直接在整张背景上定位，补入候选框
+- 定位框用「簇匹配数 / 模板关键点数」作为置信度，补足低关键点图标偏低的 SIFT 相似度
+- 候选框增加包含关系去重，去掉检测框里嵌套的小框，避免同一图标重复占位
+- SIFT 定位失败时用 Canny 边缘多尺度模板匹配兜底
+- 用 4 份真实失败样本回放：3 份可直接通过（修改前 0 份）
+
+</div>
 
 ### v2.0.4 (2026-11-12)
 
