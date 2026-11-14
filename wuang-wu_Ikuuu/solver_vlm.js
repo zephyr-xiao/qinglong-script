@@ -476,15 +476,29 @@ async function callModel(imageBuffer, prompt, attempt = 1) {
   throw lastErr || new Error('视觉模型请求失败');
 }
 
-// 从模型输出里取点击数组（{clicks:[[x,y],...]}）
-function pickClicks(parsed, size) {
+// 从模型输出里取点击数组（{clicks:[[x,y],...]}），scale 为坐标除数
+function filterClicks(parsed, size, scale) {
   const arr = Array.isArray(parsed.clicks) ? parsed.clicks : null;
   if (!arr) return null;
   const ok = (n, max) => Number.isFinite(n) && n >= 0 && n <= max;
   const clicks = arr
-    .filter((c) => Array.isArray(c) && c.length === 2 && ok(Number(c[0]), size.w) && ok(Number(c[1]), size.h))
-    .map((c) => [Number(c[0]), Number(c[1])]);
+    .filter((c) => Array.isArray(c) && c.length === 2
+      && ok(Number(c[0]) / scale, size.w) && ok(Number(c[1]) / scale, size.h))
+    .map((c) => (scale === 1
+      ? [Number(c[0]), Number(c[1])]
+      : [Math.round(Number(c[0]) / scale), Math.round(Number(c[1]) / scale)]));
   return clicks.length ? clicks : null;
+}
+
+// 原图坐标系下的点击数组
+function pickClicks(parsed, size) {
+  return filterClicks(parsed, size, 1);
+}
+
+// 兜底：模型偶尔忽略提示词里的网格标签，直接按放大后的合成图作答，
+// 原图空间里全部越界。只在 pickClicks 返回 null 后调用，否则正常坐标会被缩小。
+function pickClicksRescaled(parsed, size, zoom = ZOOM) {
+  return zoom > 1 ? filterClicks(parsed, size, zoom) : null;
 }
 
 // 多轮取中位数；返回 { ok, clicks?, reordered?, msg? }
@@ -719,7 +733,11 @@ async function main() {
       const results = [];
       for (let i = 0; i < VOTES; i++) {
         const parsed = await callModel(composed, prompt, i + 1);
-        const clicks = pickClicks(parsed, size);
+        let clicks = pickClicks(parsed, size);
+        if (!clicks) {
+          clicks = pickClicksRescaled(parsed, size);
+          if (clicks) log(`模型按放大图坐标作答，已按 1/${ZOOM} 折算`);
+        }
         if (!clicks) throw new Error(`第 ${i + 1} 次调用未给出有效坐标: ${JSON.stringify(parsed).substring(0, 160)}`);
         log(`第 ${i + 1}/${VOTES} 次: ${JSON.stringify(clicks)}`);
         results.push(clicks);
@@ -757,6 +775,7 @@ module.exports = {
   vote,
   alignToBase,
   pickClicks,
+  pickClicksRescaled,
   // 限流退避：429 的等待策略（纯函数 + 单次调用，便于单测注入）
   rateLimitBackoffSec,
   parseRetryAfter,

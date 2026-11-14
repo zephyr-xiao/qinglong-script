@@ -59,7 +59,7 @@ const {
 } = require('./ikuuu');
 // 视觉解法器的纯函数（脚本被 require 时不会跑主流程）
 const {
-  parseModelReply, wantedCount, buildPrompt, computeMaxTokens, vote, pickClicks,
+  parseModelReply, wantedCount, buildPrompt, computeMaxTokens, vote, pickClicks, pickClicksRescaled,
   rateLimitBackoffSec, parseRetryAfter, rateLimitWaitMs, callModelOnce,
 } = require('./solver_vlm');
 
@@ -846,6 +846,21 @@ test('pickClicks: 坐标越界过滤与全非法返回 null', () => {
   assert.strictEqual(pickClicks({ clicks: [[999, 999]] }, size), null);
   assert.strictEqual(pickClicks({}, size), null);
   assert.strictEqual(pickClicks({ clicks: 'x' }, size), null);
+});
+
+// 2026-11-12 实测：模型没看提示词里的网格标签，直接按放大后的合成图作答，
+// 坐标上限正好是原图 × ZOOM，原图空间里全部越界，白丢一次抽取机会。
+test('pickClicksRescaled: 按 1/ZOOM 折算救回放大图坐标', () => {
+  const size = { w: 300, h: 200 };
+  const parsed = { clicks: [[770, 360], [450, 150], [495, 345]] };
+  assert.strictEqual(pickClicks(parsed, size), null);
+  assert.deepStrictEqual(pickClicksRescaled(parsed, size, 3),
+    [[257, 120], [150, 50], [165, 115]]);
+  // 折算后仍越界 → 判失败，不能把垃圾坐标交给服务端
+  assert.strictEqual(pickClicksRescaled({ clicks: [[9999, 9999]] }, size, 3), null);
+  assert.strictEqual(pickClicksRescaled({ clicks: 'x' }, size, 3), null);
+  // zoom 无效时不折算（否则原图坐标会被平白缩小）
+  assert.strictEqual(pickClicksRescaled(parsed, size, 1), null);
 });
 
 test('rotateDebugDir: 只保留最近 N 个调试产物', () => {
