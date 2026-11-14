@@ -21,15 +21,40 @@ except ImportError:  # 青龙缺依赖时给出可执行的修复提示，而不
     sys.exit(1)
 
 # ---------------- 统一通知模块加载 ----------------
-hadsend = False
-send = None
-try:
-    from notify import send
+# ---------------- 统一通知模块加载 ----------------
+def load_notify():
+    """青龙的 notify.py 在 scripts 根目录，脚本在子目录里时不在 sys.path 上。
 
-    hadsend = True
+    所以先试原样导入，失败了再把脚本目录、父目录、青龙默认目录逐个补进
+    sys.path 重试——不写死单一路径，本机/容器/自定义目录都能用。
+    """
+    script_path = os.path.abspath(__file__)
+    candidates = [
+        os.path.dirname(script_path),
+        os.path.dirname(os.path.dirname(script_path)),
+        "/ql/data/scripts",
+        "/ql/scripts",
+    ]
+    for path in candidates:
+        if not os.path.isdir(path):
+            continue
+        if path not in sys.path:
+            sys.path.insert(0, path)
+        try:
+            from notify import send as notify_func
+
+            return notify_func
+        except Exception:
+            continue
+    return None
+
+
+send = load_notify()
+hadsend = send is not None
+if hadsend:
     print("✅ 已加载notify.py通知模块")
-except ImportError:
-    print("⚠️  未加载通知模块，跳过通知功能")
+else:
+    print("⚠️  未加载通知模块，通知只写日志")
 
 
 # ============================================================ 常量
