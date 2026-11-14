@@ -31,6 +31,8 @@ xhcyv_checkin/.xhcyv_token.*
 *_state.json
 *_log.txt
 replied_posts.json
+# 百度网盘签到设备号（运行期生成，提交后会换设备导致任务状态漂移）
+baiduwangpan_checkin/.cuid*
 
 # 运行锁（防并发/重复消耗站点登录配额，运行期自动生成）
 pt-checkin/*.lock
