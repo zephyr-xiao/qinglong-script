@@ -1,13 +1,13 @@
 {
-  "fetched_at": "2026-11-12T08:06:57+00:00",
+  "fetched_at": "2026-11-14T07:29:31+00:00",
   "repo": "zephyr-xiao/qinglong-script",
   "views_14d": {
-    "count": 189,
-    "uniques": 55
+    "count": 175,
+    "uniques": 54
   },
   "clones_14d": {
-    "count": 223,
-    "uniques": 87
+    "count": 214,
+    "uniques": 86
   },
   "stars": 6,
   "forks": 2,
@@ -15,25 +15,25 @@
   "referrers": [
     {
       "referrer": "github.com",
-      "views": 55,
-      "uniques": 30
+      "views": 52,
+      "uniques": 28
     },
     {
       "referrer": "Bing",
-      "views": 15,
-      "uniques": 10
+      "views": 18,
+      "uniques": 12
     }
   ],
   "popular_paths": [
     {
       "path": "/zephyr-xiao/qinglong-script",
-      "views": 67,
-      "uniques": 47
+      "views": 66,
+      "uniques": 46
     },
     {
       "path": "/zephyr-xiao/qinglong-script/tree/main",
       "views": 10,
-      "uniques": 7
+      "uniques": 8
     },
     {
       "path": "/zephyr-xiao/qinglong-script/blob/main/laowangfip_checkin/laowangfip_checkin.py",
@@ -41,9 +41,14 @@
       "uniques": 5
     },
     {
-      "path": "/zephyr-xiao/qinglong-script/blob/main/wuang-wu_Ikuuu/README.md",
+      "path": "/zephyr-xiao/qinglong-script/blob/main/xsijishe_checkin/README.md",
       "views": 8,
-      "uniques": 3
+      "uniques": 5
+    },
+    {
+      "path": "/zephyr-xiao/qinglong-script/blob/main/caimogu_checkin/README.md",
+      "views": 7,
+      "uniques": 5
     },
     {
       "path": "/zephyr-xiao/qinglong-script/blob/main/wnflb_checkin/README.md",
@@ -56,16 +61,6 @@
       "uniques": 4
     },
     {
-      "path": "/zephyr-xiao/qinglong-script/blob/main/xsijishe_checkin/README.md",
-      "views": 6,
-      "uniques": 4
-    },
-    {
-      "path": "/zephyr-xiao/qinglong-script/blob/main/caimogu_checkin/README.md",
-      "views": 5,
-      "uniques": 4
-    },
-    {
       "path": "/zephyr-xiao/qinglong-script/blob/main/gptqtcool_checkin/README.md",
       "views": 4,
       "uniques": 3
@@ -74,6 +69,11 @@
       "path": "/zephyr-xiao/qinglong-script/blob/main/mybt-checkin-ql/README.md",
       "views": 4,
       "uniques": 3
+    },
+    {
+      "path": "/zephyr-xiao/qinglong-script/blob/main/sophnet_checkin/README.md",
+      "views": 4,
+      "uniques": 2
     }
   ]
 }
