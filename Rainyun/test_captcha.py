@@ -295,7 +295,8 @@ def test_hybrid_recovery(tmp):
 def test_template_localize(tmp):
     icon = make_icon(50)
     background = _textured_background(51)
-    box = _paste(background, icon, 200, 150)
+    # 按 1.5 倍粘贴，验证多尺度搜索
+    box = _paste(background, icon, 200, 150, scale=1.5)
     gray = cv2.cvtColor(background, cv2.COLOR_BGR2GRAY)
     template = cv2.cvtColor(icon, cv2.COLOR_BGR2GRAY)
     result = captcha.template_localize(gray, template)
@@ -305,6 +306,7 @@ def test_template_localize(tmp):
     expected = ((box[0] + box[2]) // 2, (box[1] + box[3]) // 2)
     assert abs(center[0] - expected[0]) < 30, (center, expected)
     assert abs(center[1] - expected[1]) < 30, (center, expected)
+    assert result["score"] > 0.6, result
 
 
 def test_debug_dump(tmp):
