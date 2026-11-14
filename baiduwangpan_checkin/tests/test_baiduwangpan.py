@@ -712,6 +712,11 @@ class MiscTest(unittest.TestCase):
         data = {"show_msg": "账户已过期", "Cookie": "BDUSS=secret"}
         self.assertEqual(mod.brief_msg(data), "账户已过期")
 
+    def test_load_notify_never_raises(self):
+        # 没有 notify.py 时安静返回 None；有则返回可调用对象
+        notify = mod.load_notify()
+        self.assertTrue(notify is None or callable(notify))
+
 
 # ---------------------------------------------------------------- 多模块隔离
 
