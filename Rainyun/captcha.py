@@ -478,27 +478,33 @@ def sift_localize(
     }
 
 
+# 多尺度灰度模板匹配参数（补 SIFT 定位不到的简单笔画图标）
+TEMPLATE_SCALES = (0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.25, 1.4, 1.6, 1.8, 2.0)
+TEMPLATE_MIN_SCORE = 0.55
+
+
 def template_localize(
     background_gray,
     template_gray,
-    scales: Tuple[float, ...] = (0.7, 0.85, 1.0, 1.15, 1.3, 1.5),
-    min_score: float = 0.35,
+    scales: Tuple[float, ...] = TEMPLATE_SCALES,
+    min_score: float = TEMPLATE_MIN_SCORE,
 ) -> Optional[dict]:
-    """SIFT 定位失败时的兜底：Canny 边缘多尺度模板匹配。"""
-    background_edges = cv2.Canny(background_gray, 50, 150)
+    """多尺度灰度模板匹配：补 SIFT 定位不到的简单笔画图标。
+
+    用灰度归一化互相关（TM_CCOEFF_NORMED）比边缘匹配更稳：细笔画数字在
+    复杂背景上依然能拿到 0.6+ 的分数，而边缘匹配容易被背景纹理干扰。
+    """
     best = None
     for scale in scales:
         template = cv2.resize(
             template_gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA
         )
         if (
-            template.shape[0] >= background_edges.shape[0]
-            or template.shape[1] >= background_edges.shape[1]
+            template.shape[0] >= background_gray.shape[0]
+            or template.shape[1] >= background_gray.shape[1]
         ):
             continue
-        result = cv2.matchTemplate(
-            background_edges, cv2.Canny(template, 50, 150), cv2.TM_CCOEFF_NORMED
-        )
+        result = cv2.matchTemplate(background_gray, template, cv2.TM_CCOEFF_NORMED)
         _, max_value, _, max_loc = cv2.minMaxLoc(result)
         if best is None or max_value > best["score"]:
             best = {
@@ -577,20 +583,27 @@ def build_candidates(
     for sprite_idx, template in enumerate(templates):
         if template is None or template.size == 0:
             continue
-        located = sift_localize(background_gray, template) if use_sift else None
-        if located is None and use_template:
-            located = template_localize(background_gray, template)
-        if located is None:
-            continue
 
-        box = _clamp_box(located["box"], width, height)
-        if _box_area(box) <= 0:
-            continue
-        _add_candidate(candidates, box, sprite_idx, located["score"])
-        logger.info(
-            f"   图案 {sprite_idx+1} 定位补充: 位置={box}, "
-            f"置信度={located['score']:.4f}"
-        )
+        located_list = []
+        if use_sift:
+            sift_result = sift_localize(background_gray, template)
+            if sift_result:
+                located_list.append(("SIFT", sift_result))
+        if use_template:
+            # 模板匹配独立于 SIFT 运行：SIFT 有时能给低分框，但模板能给出更准的高分
+            template_result = template_localize(background_gray, template)
+            if template_result:
+                located_list.append(("模板", template_result))
+
+        for source, located in located_list:
+            box = _clamp_box(located["box"], width, height)
+            if _box_area(box) <= 0:
+                continue
+            _add_candidate(candidates, box, sprite_idx, located["score"])
+            logger.info(
+                f"   图案 {sprite_idx+1} {source}定位: 位置={box}, "
+                f"置信度={located['score']:.4f}"
+            )
 
     _drop_contained(candidates)
     return candidates
