@@ -105,6 +105,30 @@ class TestPageParsing(unittest.TestCase):
         self.assertEqual(w.extract_formhash(PAGE_UNSIGNED), "cccccccc")
         self.assertEqual(w.extract_formhash("<p>无表单</p>"), "")
 
+    def test_page_has_captcha(self):
+        """站点 2026-11-16 起登录页默认带 updateseccode;空 idhash 表示未启用验证码。"""
+        self.assertTrue(w.page_has_captcha(
+            "<script>updateseccode('IDHASH123', '<sec>', 'member::logging');</script>"))
+        self.assertFalse(w.page_has_captcha(
+            "<script>updateseccode('', '<sec>', 'member::logging');</script>"))
+        self.assertFalse(w.page_has_captcha(PAGE_GUEST))
+
+    def test_extract_captcha_idhash_fallback(self):
+        page = ('<input type="hidden" name="formhash" value="dddddddd">'
+                '<input type="hidden" name="seccodehash" value="HASH456">')
+        self.assertEqual(w.extract_captcha_idhash(page), "HASH456")
+
+    def test_parse_login_page_auth_optional(self):
+        """默认验证码流程的登录页没有 auth 字段,解析结果应留空而不是报错。"""
+        page = ('<input type="hidden" name="formhash" value="dddddddd">'
+                "<script>updateseccode('IDHASH123', '<sec>', 'member::logging');</script>"
+                '<a href="member.php?mod=logging&action=login&loginhash=LamiM">')
+        fields = w.parse_login_page(page)
+        self.assertEqual(fields["formhash"], "dddddddd")
+        self.assertEqual(fields["auth"], "")
+        self.assertEqual(fields["idhash"], "IDHASH123")
+        self.assertEqual(fields["loginhash"], "LamiM")
+
     def test_extract_ajax_message(self):
         self.assertEqual(w.extract_ajax_message(RESP_ALREADY_AJAX), "您今日已签到，无需重复签到！")
         self.assertEqual(w.extract_ajax_message(RESP_SUCCESS_AJAX), "签到成功，获得 5 金币！")
@@ -182,6 +206,18 @@ class TestLoginClassification(unittest.TestCase):
         state, detail = w.classify_login_response(text, session)
         self.assertEqual(state, "captcha")
         self.assertIn("auth=TOKEN", detail)
+
+    def test_captcha_error_without_redirect(self):
+        """站点默认验证码时响应里没有 auth 跳转,detail 为空串而不是抛错。"""
+        session = mock.Mock()
+        session.cookies = []
+        text = ('<?xml version="1.0" encoding="utf-8"?><root><![CDATA['
+                '抱歉，验证码填写错误<script type="text/javascript" reload="1">'
+                "if(typeof errorhandle_login=='function') "
+                "{errorhandle_login('抱歉，验证码填写错误', {});}</script>]]></root>")
+        state, detail = w.classify_login_response(text, session)
+        self.assertEqual(state, "captcha")
+        self.assertEqual(detail, "")
 
     def test_login_ok_by_marker(self):
         session = mock.Mock()
@@ -439,12 +475,102 @@ class TestCaptchaLogin(unittest.TestCase):
         )
         self.assertTrue(ok)
 
+    NO_AUTH_PAGE = (
+        '<input type="hidden" name="formhash" value="dddddddd">'
+        "<script>updateseccode('IDHASH', '<sec>', 'member::logging');</script>"
+        '<a href="member.php?mod=logging&action=login&loginhash=LamiM">'
+    )
+
+    def test_success_without_auth_field(self):
+        """默认验证码流程的登录页没有 auth 字段,提交时不应带空 auth。"""
+        calls = []
+        responses = [_FakeResp("PNG"), _FakeResp(self.LOGIN_OK)]
+
+        def fake_http(session, method, url, retry=True, **kwargs):
+            calls.append((method, url, kwargs))
+            return responses.pop(0)
+
+        ocr = self._FakeOCR(["abcd"])
+        with mock.patch.object(w, "_load_ocr", return_value=(ocr, "")), \
+                mock.patch.object(w, "http_request", side_effect=fake_http):
+            ok, err = w._complete_captcha_login(
+                mock.Mock(), "www.example.com", "u", "p",
+                first_page=self.NO_AUTH_PAGE)
+        self.assertTrue(ok, err)
+        post = [c for c in calls if c[0] == "POST"][0]
+        data = post[2]["data"]
+        self.assertNotIn("auth", data)
+        self.assertEqual(data["seccodehash"], "IDHASH")
+        self.assertEqual(data["seccodeverify"], "abcd")
+        self.assertEqual(data["seccodemodid"], "member::logging")
+
+    def test_empty_auth_url_falls_back_to_login_page(self):
+        """auth 跳转不存在时应请求标准登录页,而不是拼成站点根路径。"""
+        seen = []
+        responses = [_FakeResp(self.NO_AUTH_PAGE), _FakeResp("PNG"),
+                     _FakeResp(self.LOGIN_OK)]
+
+        def fake_http(session, method, url, retry=True, **kwargs):
+            seen.append(url)
+            return responses.pop(0)
+
+        ocr = self._FakeOCR(["abcd"])
+        with mock.patch.object(w, "_load_ocr", return_value=(ocr, "")), \
+                mock.patch.object(w, "http_request", side_effect=fake_http):
+            ok, err = w._complete_captcha_login(
+                mock.Mock(), "www.example.com", "u", "p", "")
+        self.assertTrue(ok, err)
+        self.assertEqual(seen[0], f"https://www.example.com{w.LOGIN_PAGE_URL}")
+
     def test_ocr_missing(self):
         with mock.patch.object(w, "_load_ocr", return_value=(None, "未安装 ddddocr")):
             ok, err = w._complete_captcha_login(
                 mock.Mock(), "www.example.com", "u", "p", "member.php?auth=X")
         self.assertFalse(ok)
         self.assertIn("ddddocr", err)
+
+
+class TestLoginWithPassword(unittest.TestCase):
+    """登录入口的分支选择:默认验证码页 vs 普通登录页。"""
+
+    PLAIN_PAGE = (
+        '<input type="hidden" name="formhash" value="dddddddd">'
+        '<a href="member.php?mod=logging&action=login&loginhash=LamiM">'
+    )
+
+    def test_captcha_page_skips_blind_submit(self):
+        """登录页已要求验证码时不能先盲提交(会白扣一次 IP 失败次数)。"""
+        methods = []
+
+        def fake_http(session, method, url, retry=True, **kwargs):
+            methods.append(method)
+            return _FakeResp(TestCaptchaLogin.NO_AUTH_PAGE)
+
+        with mock.patch.object(w, "new_session", return_value=mock.Mock()), \
+                mock.patch.object(w, "http_request", side_effect=fake_http), \
+                mock.patch.object(w, "_complete_captcha_login",
+                                  return_value=(True, "")) as captcha:
+            session, err = w.login_with_password("www.example.com", "u", "p")
+        self.assertEqual(err, "")
+        self.assertIsNotNone(session)
+        captcha.assert_called_once()
+        self.assertEqual(methods, ["GET"])
+
+    def test_plain_page_posts_login(self):
+        """未启用验证码的登录页仍走原来的单步提交。"""
+        responses = [_FakeResp(self.PLAIN_PAGE), _FakeResp("欢迎您回来")]
+        methods = []
+
+        def fake_http(session, method, url, retry=True, **kwargs):
+            methods.append(method)
+            return responses.pop(0)
+
+        with mock.patch.object(w, "new_session", return_value=mock.Mock()), \
+                mock.patch.object(w, "http_request", side_effect=fake_http):
+            session, err = w.login_with_password("www.example.com", "u", "p")
+        self.assertEqual(err, "")
+        self.assertIsNotNone(session)
+        self.assertEqual(methods, ["GET", "POST"])
 
 
 class TestRunOneAccount(unittest.TestCase):
