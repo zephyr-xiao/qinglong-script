@@ -26,6 +26,10 @@ cookies/
 
 # 运行期登录态与运行数据（个人账号信息，严禁提交）
 *_token.json
+# MiniMax 签到 OAuth 凭据（refresh token 轮换制，等同账号登录态，泄露即被顶号）
+minimax_checkin/.auth/
+# 刷新兜底文件（含新 refresh token；自定义 MINIMAX_AUTH_FILE 时也按名字兜住）
+auth-refresh.pending.json
 # 芯幻签到原子写临时文件（中断时可能残留明文 token，必须一并忽略）
 xhcyv_checkin/.xhcyv_token.*
 *_state.json
