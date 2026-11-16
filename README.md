@@ -28,6 +28,7 @@
 | 维咔VikACG签到 | www.vikacg.cc 钱包签到领积分，账密登录换 JWT 双 token（30 天）+ refreshToken 静默续期 + 设备指纹持久化，完整浏览器头模拟免验证码，401 三级降级链，409 已签到幂等，代理支持 | [vikacg_checkin/README.md](vikacg_checkin/README.md) | `task vikacg_checkin/vikacg_checkin.py` |
 | 芯幻签到 | xhcyv.com ACG 社区每日签到，账密登录换 `x_bbs_token`（JWT，3 天）并缓存复用，Bearer 鉴权 + 幂等跳过 + 失效自动重登，登录被风控时 ddddocr 自动过图形验证码，支持 token 直填 / 多账号 / `--check` 自检 | [xhcyv_checkin/README.md](xhcyv_checkin/README.md) | `task xhcyv_checkin/xhcyv_checkin.py` |
 | 百度网盘签到 | 双端签到：网页端会员成长值（签到/答题/成长值广告）+ App 金币任务中心（签到/累计档位奖励）+ 任务中心 + 积分中心 + 补签广告；登录态预检 + 业务码严格判定 + 每步成长值测量 + 幂等复核，多账号，支持 `--probe` / `--check` | [baiduwangpan_checkin/README.md](baiduwangpan_checkin/README.md) | `task baiduwangpan_checkin/baiduwangpan_checkin.py` |
+| 夸克网盘签到 | 移动端签名参数（kps/sign/vcode）签到领空间，支持完整抓包 URL / 三参数 / 裸 URL 三种凭证写法；空 `data` 视为硬错误（旧 Cookie 路径已被夸克关闭）、401 单独识别、POST 不重试改复查、多账号隔离、`--check` 自检 | [quark_checkin/README.md](quark_checkin/README.md) | `task quark_checkin/quark_checkin.py` |
 
 ## 来源与致谢
 
@@ -44,6 +45,7 @@
 | New API 站点签到 | [zhangguoguo1314/quan-zidong-zhushou](https://github.com/zhangguoguo1314/quan-zidong-zhushou) |
 | TG 签到（tg-signer） | [xuanvivo/tg-signer-ql](https://github.com/xuanvivo/tg-signer-ql)（上游 [amchii/tg-signer](https://github.com/amchii/tg-signer)） |
 | 百度网盘签到 | [awakaze/cf-netdisk-signin](https://github.com/awakaze/cf-netdisk-signin)（App 签到/累计奖励接口与幂等思路）+ [jujiunofly/baidu-signin](https://github.com/jujiunofly/baidu-signin)（登录态预检/任务签名/广告与积分接口） |
+| 夸克网盘签到 | [Liu8Can/Quark_Auto_Check_In](https://github.com/Liu8Can/Quark_Auto_Check_In)（签到接口与参数解析）+ [PLA888/kuake_qiandao](https://github.com/PLA888/kuake_qiandao)（`x-u-kps-wg` 请求头对应关系） |
 
 其余脚本为本仓库原创。感谢上述项目作者的开源工作。
 
