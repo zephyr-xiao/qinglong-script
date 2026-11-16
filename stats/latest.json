@@ -1,33 +1,33 @@
 {
-  "fetched_at": "2026-11-14T07:29:31+00:00",
+  "fetched_at": "2026-11-16T07:48:20+00:00",
   "repo": "zephyr-xiao/qinglong-script",
   "views_14d": {
-    "count": 175,
-    "uniques": 54
+    "count": 174,
+    "uniques": 55
   },
   "clones_14d": {
-    "count": 214,
-    "uniques": 86
+    "count": 242,
+    "uniques": 99
   },
-  "stars": 6,
+  "stars": 7,
   "forks": 2,
   "watchers": 0,
   "referrers": [
     {
       "referrer": "github.com",
-      "views": 52,
+      "views": 49,
       "uniques": 28
     },
     {
       "referrer": "Bing",
-      "views": 18,
-      "uniques": 12
+      "views": 19,
+      "uniques": 13
     }
   ],
   "popular_paths": [
     {
       "path": "/zephyr-xiao/qinglong-script",
-      "views": 66,
+      "views": 63,
       "uniques": 46
     },
     {
@@ -61,6 +61,11 @@
       "uniques": 4
     },
     {
+      "path": "/zephyr-xiao/qinglong-script/blob/main/wuang-wu_Ikuuu/README.md",
+      "views": 4,
+      "uniques": 4
+    },
+    {
       "path": "/zephyr-xiao/qinglong-script/blob/main/gptqtcool_checkin/README.md",
       "views": 4,
       "uniques": 3
@@ -69,11 +74,6 @@
       "path": "/zephyr-xiao/qinglong-script/blob/main/mybt-checkin-ql/README.md",
       "views": 4,
       "uniques": 3
-    },
-    {
-      "path": "/zephyr-xiao/qinglong-script/blob/main/sophnet_checkin/README.md",
-      "views": 4,
-      "uniques": 2
     }
   ]
 }
