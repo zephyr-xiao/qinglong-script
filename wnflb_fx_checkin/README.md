@@ -8,7 +8,7 @@
 
 - 两种认证方式：**账号密码** 或 **Cookie 直签**
 - 账号密码模式带 Cookie 缓存：首次登录后缓存凭证，之后优先复用，缓存失效才重新登录
-- 登录遇到图片验证码时自动用 **ddddocr** 本地识别（识别错会重新取图重试）
+- 站点登录页默认要求图片验证码，脚本自动用 **ddddocr** 本地识别（识别错会重新取图重试，最多 3 次）
 - 已签到自动跳过，可安全重复执行（幂等）
 - 签到后输出今日排名 / 连续天数 / 累计天数
 - 成功判定采用**正向证据制**：签到后重新拉取列表页，确认页面确实变为「已签到」才算成功，不单凭关键词冒报
@@ -68,26 +68,28 @@
 
 ### 登录（仅账号密码模式）
 
-正常情况一步到位：
+> **2026-11-16 站点变更**：登录页现在**默认就要求图片验证码**（页面内联
+> `updateseccode('<idhash>', ...)`），不再依赖「同一 IP 失败 5 次后才出现」的老逻辑。
+> 脚本因此改为：先读登录页，发现验证码表单就直接识别提交，不再做一次必然失败的盲提交
+> （该站登录失败按 IP 计数，盲提交只会白扣次数）。老流程的 `auth` 跳转仍兼容，但已不是必需。
 
 | 步骤 | 请求 | 说明 |
 |---|---|---|
-| 1 | `GET member.php?mod=logging&action=login&...&inajax=1` | 取 `formhash` + `loginhash` |
-| 2 | `POST member.php?mod=logging&action=login&loginsubmit=yes&...&loginhash=<x>&inajax=1` | body `formhash` / `referer` / `username` / `password` / `questionid=0` / `answer=` / `cookietime=2592000` |
+| 1 | `GET member.php?mod=logging&action=login&...&inajax=1` | 取 `formhash`、`loginhash`、验证码 `idhash`（老流程才有 `auth`） |
+| 2a | 页面带验证码 → `GET misc.php?mod=seccode&update=<时间戳>&idhash=<idhash>` | 取验证码 PNG，交给 ddddocr |
+| 2b | 页面无验证码 → `POST member.php?mod=logging&action=login&loginsubmit=yes&...&loginhash=<x>&inajax=1` | body `formhash` / `referer` / `username` / `password` / `questionid=0` / `answer=` / `cookietime=2592000` |
+| 3 | `POST` 同 2b，额外带 `seccodehash=<idhash>` / `seccodemodid=member::logging` / `seccodeverify=<OCR 结果>`（有 `auth` 才带） | 识别错会重新取图，最多 3 次 |
 
 登录成功判定：响应含「欢迎您回来」或会话拿到 `S5r8_2132_auth` Cookie。
-
-**同一 IP 连续失败 5 次后**，第 2 步返回「请输入验证码后继续登录」并给出 `auth` 令牌，进入两步验证：
-
-| 步骤 | 请求 | 说明 |
-|---|---|---|
-| 3 | `GET member.php?mod=logging&action=login&auth=<令牌>&...` | 取该页 `formhash`、`auth`、`loginhash`、`idhash` |
-| 4 | `GET misc.php?mod=seccode&update=<时间戳>&idhash=<idhash>` | 取验证码 PNG |
-| 5 | `POST` 同第 2 步，额外带 `auth` / `seccodehash=<idhash>` / `seccodemodid=member::logging` / `seccodeverify=<OCR 结果>` | 识别错会重新取图，最多 3 次 |
 
 > ⚠️ **坑（脚本已处理）**：进入「待验证码」状态时，服务端**也会下发 `S5r8_2132_auth` Cookie**。
 > 如果只用「拿到 auth Cookie」判登录成功，会把「待验证码」误判成「登录成功」。
 > 脚本把「需要验证码」的判定放在最前面。
+>
+> ⚠️ **坑（脚本已处理）**：验证码失败的响应是「抱歉，验证码填写错误」+ `errorhandle_login(...)`，
+> **没有** `location.href` 跳转。早期版本靠 `location.href` 取 `auth` 令牌，取不到就把空地址
+> 拼成站点根路径，最终表现为 `验证码页结构解析失败(站点可能已改版)`。
+> 现在 `auth` 改为可选字段，缺失时回退到标准登录页。
 
 ## 快速开始
 
@@ -96,7 +98,7 @@
 在青龙「依赖管理」-「Python」中安装：
 
 - `requests`（必需）
-- `ddddocr`（可选；仅在站点要求登录验证码时需要）
+- `ddddocr`（**账号密码模式必需**；站点登录页默认要求图片验证码。只用 `WNFX_COOKIE` 模式可以不装）
 
 ### 2. 配置环境变量
 
@@ -147,7 +149,7 @@ cd qinglong-script/wnflb_fx_checkin
 python -m unittest discover -s tests -v
 ```
 
-当前共 42 项用例，覆盖页面状态判据、签到状态机（含幂等/未知文案/回查失败/业务重试）、登录响应分类、验证码流程、Cookie 缓存、运行锁与重试边界。
+当前共 50 项用例，覆盖页面状态判据、签到状态机（含幂等/未知文案/回查失败/业务重试）、登录响应分类、验证码流程（含 auth 可选与回退登录页）、Cookie 缓存、运行锁与重试边界。
 
 ## 重试策略
 
@@ -175,6 +177,8 @@ python -m unittest discover -s tests -v
 | 现象 | 原因与处理 |
 |---|---|
 | `站点要求输入登录验证码,但 未安装 ddddocr` | 安装 `ddddocr`，或改用 `WNFX_COOKIE` |
+| `验证码连续 3 次未通过(OCR 识别率不足)` | ddddocr 没认对图；直接重跑一次（每轮都会重新取图），长期失败改用 `WNFX_COOKIE` |
+| `验证码页结构解析失败(缺 formhash/idhash/loginhash)` | 登录页结构真的变了；开 `WNFX_DEBUG=true` 看响应，对照 README「登录」章节的字段 |
 | `账号或密码错误(该 IP 剩余尝试 N 次)` | 核对密码；**不要反复试**，失败次数按 IP 累计 |
 | `Cookie 已失效,请重新抓取` | 浏览器登录后 F12 复制完整 Cookie 更新 `WNFX_COOKIE` |
 | `签到失败: 系统繁忙...` | 站点临时异常；脚本会重试网络错误，业务失败需看下一次定时任务 |

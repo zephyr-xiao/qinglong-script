@@ -330,6 +330,45 @@ def extract_formhash(page: str) -> str:
     return ""
 
 
+# 登录页验证码表单。站点 2026-11-16 起登录页默认就带验证码:页面内联
+# updateseccode('idhash', ...),前端 JS 用 idhash 渲染图片与输入框;
+# 不再需要「失败若干次后跳 auth 页」的老流程,因此 auth 字段是可选的。
+CAPTCHA_IDHASH_PATTERNS = (
+    r"updateseccode\('([A-Za-z0-9]+)'",
+    r'name=["\']seccodehash["\']\s+value=["\']([A-Za-z0-9]+)["\']',
+    r"seccodehash=([A-Za-z0-9]+)",
+)
+
+
+def extract_captcha_idhash(page: str) -> str:
+    """提取验证码 idhash;取不到或为空表示该页面当前没有验证码表单。"""
+    for pattern in CAPTCHA_IDHASH_PATTERNS:
+        m = re.search(pattern, page)
+        if m:
+            return m.group(1)
+    return ""
+
+
+def page_has_captcha(page: str) -> bool:
+    """页面是否已要求验证码。空 idhash 是站点未启用验证码时的正常输出。"""
+    return bool(extract_captcha_idhash(page))
+
+
+def parse_login_page(page: str) -> dict:
+    """
+    解析 Discuz 登录页提交所需字段。
+    auth 只出现在老流程的 auth 页,新流程为空,提交时按需携带。
+    """
+    m_auth = re.search(r'name=["\']auth["\']\s+value=["\']([^"\']*)["\']', page)
+    m_lh = re.search(r"loginhash=([A-Za-z0-9]+)", page)
+    return {
+        "formhash": extract_formhash(page),
+        "auth": m_auth.group(1) if m_auth else "",
+        "idhash": extract_captcha_idhash(page),
+        "loginhash": m_lh.group(1) if m_lh else "",
+    }
+
+
 def extract_discuz_message(page: str) -> str:
     """提取 Discuz 通用提示页(id=messagetext)的文案。"""
     m = re.search(r'id="messagetext"[^>]*>\s*<p>(.*?)</p>', page, re.S)
@@ -581,29 +620,39 @@ def _post_login(session: requests.Session, host: str, username: str, password: s
 
 
 def _complete_captcha_login(session: requests.Session, host: str, username: str,
-                            password: str, auth_url: str) -> tuple:
-    """完成「需要验证码」的登录:取图 -> ddddocr -> 带验证码二次提交。"""
+                            password: str, auth_url: str = "",
+                            first_page: str = "") -> tuple:
+    """
+    完成「需要验证码」的登录:取图 -> ddddocr -> 带验证码提交。
+
+    auth_url 是站点老流程(登录失败后跳转)给出的地址。站点默认要求验证码时
+    响应里没有这个跳转,此时回退到标准登录页,而不是拼出根路径。
+    first_page 用于复用调用方已取到的登录页,省掉一次重复请求。
+    """
     ocr, ocr_err = _load_ocr()
     if ocr is None:
         return False, (f"站点要求输入登录验证码,但 {ocr_err}。"
                        f"请先在青龙「依赖管理」-「Python」安装 ddddocr,或改用 Cookie 模式")
 
-    for attempt in range(1, CAPTCHA_MAX_TRY + 1):
+    page_url = f"https://{host}{LOGIN_PAGE_URL}"
+    if auth_url:
         page_url = auth_url if auth_url.startswith("http") \
             else f"https://{host}/{auth_url.lstrip('/')}"
-        try:
-            page = http_request(session, "GET", page_url).text
-        except Exception as e:
-            return False, f"验证码页获取失败: {type(e).__name__}"
 
-        formhash = extract_formhash(page)
-        m_auth = re.search(r'name="auth" value="([^"]+)"', page)
-        m_idhash = re.search(r"updateseccode\('([^']+)'", page)
-        m_lh = re.search(r"loginhash=([A-Za-z0-9]+)", page)
-        if not (formhash and m_auth and m_idhash and m_lh):
-            return False, "验证码页结构解析失败(站点可能已改版)"
+    for attempt in range(1, CAPTCHA_MAX_TRY + 1):
+        if first_page and attempt == 1:
+            page = first_page
+        else:
+            try:
+                page = http_request(session, "GET", page_url).text
+            except Exception as e:
+                return False, f"验证码页获取失败: {type(e).__name__}"
 
-        idhash = m_idhash.group(1)
+        fields = parse_login_page(page)
+        if not (fields["formhash"] and fields["idhash"] and fields["loginhash"]):
+            return False, "验证码页结构解析失败(缺 formhash/idhash/loginhash)"
+
+        idhash = fields["idhash"]
         img_url = (f"https://{host}/misc.php?mod=seccode"
                    f"&update={int(time.time())}&idhash={idhash}")
         try:
@@ -616,20 +665,25 @@ def _complete_captcha_login(session: requests.Session, host: str, username: str,
             print(f"   🔍 验证码 idhash={idhash} 识别={code!r} ({len(img.content)}B)")
         if not code:
             print(f"   ⚠️ 第 {attempt}/{CAPTCHA_MAX_TRY} 次验证码识别为空,重试...")
+            first_page = ""
             continue
 
-        resp = _post_login(session, host, username, password, formhash, m_lh.group(1),
-                           extra={"auth": m_auth.group(1), "seccodehash": idhash,
-                                  "seccodemodid": "member::logging",
-                                  "seccodeverify": code},
-                           referer=page_url)
+        extra = {"seccodehash": idhash, "seccodemodid": "member::logging",
+                 "seccodeverify": code}
+        if fields["auth"]:
+            extra["auth"] = fields["auth"]
+        resp = _post_login(session, host, username, password, fields["formhash"],
+                           fields["loginhash"], extra=extra, referer=page_url)
         state, detail = classify_login_response(resp.text, session)
         if state == "ok":
             return True, ""
         if state == "captcha":
             print(f"   ⚠️ 第 {attempt}/{CAPTCHA_MAX_TRY} 次验证码未通过,重试...")
+            # 站点若给出新的 auth 跳转就跟着走,否则留在登录页重新取图
             if detail:
-                auth_url = detail
+                page_url = detail if detail.startswith("http") \
+                    else f"https://{host}/{detail.lstrip('/')}"
+            first_page = ""
             rand_sleep(1, 2)
             continue
         return False, detail
@@ -648,15 +702,21 @@ def login_with_password(host: str, username: str, password: str) -> tuple:
     except Exception as e:
         return None, f"登录页获取失败: {type(e).__name__}"
 
-    formhash = extract_formhash(resp.text)
-    m = re.search(r"loginhash=([A-Za-z0-9]+)", resp.text)
-    loginhash = m.group(1) if m else ""
-    if not formhash or not loginhash:
+    fields = parse_login_page(resp.text)
+    if not (fields["formhash"] and fields["loginhash"]):
         return None, "登录页未取到 formhash/loginhash(页面结构可能已变化)"
 
+    # 登录页已带验证码时,不带验证码的盲提交必然被拒且白扣一次 IP 失败次数,
+    # 直接用本次已取到的页面进验证码流程。
+    if page_has_captcha(resp.text):
+        print("   🧩 站点登录页要求验证码,尝试 ddddocr 自动识别...")
+        ok, err = _complete_captcha_login(session, host, username, password,
+                                          first_page=resp.text)
+        return (session, "") if ok else (None, err)
+
     try:
-        resp2 = _post_login(session, host, username, password, formhash, loginhash,
-                            referer=resp.url)
+        resp2 = _post_login(session, host, username, password, fields["formhash"],
+                            fields["loginhash"], referer=resp.url)
     except Exception as e:
         return None, f"登录请求失败: {type(e).__name__}"
 
@@ -667,6 +727,7 @@ def login_with_password(host: str, username: str, password: str) -> tuple:
     if state == "ok":
         return session, ""
     if state == "captcha":
+        # 老流程:提交后被要求验证码,detail 可能带 auth 跳转,也可能为空
         print("   🧩 站点要求输入验证码,尝试 ddddocr 自动识别...")
         ok, err = _complete_captcha_login(session, host, username, password, detail)
         return (session, "") if ok else (None, err)
@@ -1050,7 +1111,12 @@ def main():
         if r["cookie_invalid"]:
             line += "\n  - 💡 请浏览器登录后 F12 重新抓取 Cookie 更新 `WNFX_COOKIE`"
         if r.get("auth_failed"):
-            line += "\n  - 💡 请核对 `WNFX_ACCOUNTS` 的密码(该站登录失败按 IP 计数,勿反复试)"
+            # 验证码识别失败与密码错误是两类问题,分开给建议,避免误导用户去改密码
+            if "验证码" in r["message"]:
+                line += ("\n  - 💡 登录验证码未通过:可重跑一次(每轮都会重新取图),"
+                         "若长期识别失败请改用 `WNFX_COOKIE` 模式")
+            else:
+                line += "\n  - 💡 请核对 `WNFX_ACCOUNTS` 的密码(该站登录失败按 IP 计数,勿反复试)"
         (ok_lines if r["success"] else fail_lines).append(line)
 
     if ok_lines:
