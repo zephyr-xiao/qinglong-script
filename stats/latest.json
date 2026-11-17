@@ -1,13 +1,13 @@
 {
-  "fetched_at": "2026-11-16T07:48:20+00:00",
+  "fetched_at": "2026-11-17T08:57:29+00:00",
   "repo": "zephyr-xiao/qinglong-script",
   "views_14d": {
-    "count": 174,
-    "uniques": 55
+    "count": 186,
+    "uniques": 63
   },
   "clones_14d": {
-    "count": 242,
-    "uniques": 99
+    "count": 231,
+    "uniques": 96
   },
   "stars": 7,
   "forks": 2,
@@ -15,25 +15,30 @@
   "referrers": [
     {
       "referrer": "github.com",
-      "views": 49,
-      "uniques": 28
+      "views": 53,
+      "uniques": 31
     },
     {
       "referrer": "Bing",
-      "views": 19,
-      "uniques": 13
+      "views": 22,
+      "uniques": 16
     }
   ],
   "popular_paths": [
     {
       "path": "/zephyr-xiao/qinglong-script",
-      "views": 63,
-      "uniques": 46
+      "views": 69,
+      "uniques": 51
+    },
+    {
+      "path": "/zephyr-xiao/qinglong-script/blob/main/wnflb_checkin/README.md",
+      "views": 9,
+      "uniques": 9
     },
     {
       "path": "/zephyr-xiao/qinglong-script/tree/main",
-      "views": 10,
-      "uniques": 8
+      "views": 9,
+      "uniques": 7
     },
     {
       "path": "/zephyr-xiao/qinglong-script/blob/main/laowangfip_checkin/laowangfip_checkin.py",
@@ -51,11 +56,6 @@
       "uniques": 5
     },
     {
-      "path": "/zephyr-xiao/qinglong-script/blob/main/wnflb_checkin/README.md",
-      "views": 6,
-      "uniques": 6
-    },
-    {
       "path": "/zephyr-xiao/qinglong-script/blob/main/laowangfip_checkin/README.md",
       "views": 6,
       "uniques": 4
@@ -66,14 +66,14 @@
       "uniques": 4
     },
     {
-      "path": "/zephyr-xiao/qinglong-script/blob/main/gptqtcool_checkin/README.md",
+      "path": "/zephyr-xiao/qinglong-script/blob/main/newapi_checkin/README.md",
       "views": 4,
       "uniques": 3
     },
     {
-      "path": "/zephyr-xiao/qinglong-script/blob/main/mybt-checkin-ql/README.md",
+      "path": "/zephyr-xiao/qinglong-script/blob/main/sophnet_checkin/README.md",
       "views": 4,
-      "uniques": 3
+      "uniques": 2
     }
   ]
 }
