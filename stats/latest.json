@@ -1,13 +1,13 @@
 {
-  "fetched_at": "2026-11-18T08:22:26+00:00",
+  "fetched_at": "2026-11-19T08:34:19+00:00",
   "repo": "zephyr-xiao/qinglong-script",
   "views_14d": {
-    "count": 202,
-    "uniques": 68
+    "count": 204,
+    "uniques": 71
   },
   "clones_14d": {
-    "count": 226,
-    "uniques": 97
+    "count": 204,
+    "uniques": 88
   },
   "stars": 8,
   "forks": 2,
@@ -15,20 +15,20 @@
   "referrers": [
     {
       "referrer": "github.com",
-      "views": 58,
-      "uniques": 32
+      "views": 61,
+      "uniques": 35
     },
     {
       "referrer": "Bing",
-      "views": 22,
+      "views": 21,
       "uniques": 16
     }
   ],
   "popular_paths": [
     {
       "path": "/zephyr-xiao/qinglong-script",
-      "views": 79,
-      "uniques": 56
+      "views": 83,
+      "uniques": 59
     },
     {
       "path": "/zephyr-xiao/qinglong-script/tree/main",
