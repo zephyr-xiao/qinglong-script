@@ -1,149 +1,72 @@
 # 青龙脚本合集
 
-本目录收集适配青龙面板的 Python 定时任务脚本。每个脚本已放入同名文件夹，并提供独立 `README.md`。
+适配青龙面板的定时任务脚本合集。每个脚本一个子目录，完整环境变量与用法见子目录 `README.md`。
 
 ## 脚本列表
 
-| 脚本 | 说明 | 文档 | 青龙任务命令 |
-|---|---|---|---|
-| E-Hentai 自动签到 | E-Hentai 每日签到领 Exp/Credits，Cookie 认证，TLS 1.2 回退 + Cookie 过期预警 | [AkiyaKiko_EhentaiAutoSignIn/autosignin.py](AkiyaKiko_EhentaiAutoSignIn/autosignin.py) | `task AkiyaKiko_EhentaiAutoSignIn/autosignin.py` |
-| 老王FIP签到 | Discuz + tncode 滑块（XOR + FNV-1a 签名本地复现），requests + OpenCV 自动登录签到 | [laowangfip_checkin/README.md](laowangfip_checkin/README.md) | `task laowangfip_checkin/laowangfip_checkin.py` |
-| New API 站点自动签到 | 多站点 API/Discuz 签到，内置可萌/哈基米/DZZI.AI 等站点并支持 `QZD_CUSTOM` 自定义站点，凭证 token/Cookie 缓存复用 | [newapi_checkin/README.md](newapi_checkin/README.md) | `task newapi_checkin/newapi_checkin.py` |
-| whos.tv 签到 | Patchright 驱动真实浏览器过 Cloudflare 托管挑战，Cookie / 账号密码双认证，多账号 + 运行锁防并发 + 挑战失效自愈 | [whos_tv_checkin/README.md](whos_tv_checkin/README.md) | `xvfb-run -a task whos_tv_checkin/whos_tv_checkin.py` |
-| SophNet 签到 | www.sophnet.com 福利中心签到，refreshToken 换 accessToken，纯 API 免验证码 | [sophnet_checkin/README.md](sophnet_checkin/README.md) | `task sophnet_checkin/sophnet_checkin.py` |
-| iKuuu 签到（Node.js） | ikuuu 机场签到，账号密码自动登录（Geetest 点选验证码由视觉大模型解法器过码，支持备用模型/备用解法器链）+ Cookie 缓存续期 + cookie 直填双模式 + 动态域名（登录前可达性探测）+ 多账号 + 失败延迟重试 + 推送重试 | [wuang-wu_Ikuuu/README.md](wuang-wu_Ikuuu/README.md) | `task wuang-wu_Ikuuu/ikuuu.js` |
-| gpt.qt.cool 签到 | gpt.qt.cool 签到，Playwright + OpenCV 滑动验证码自动识别（高亮/模板/边缘多候选缺口定位），登录态 storage_state 缓存复用 + 401 自愈，整轮重试可配，支持 `--check` 自检 | [gptqtcool_checkin/README.md](gptqtcool_checkin/README.md) | `task gptqtcool_checkin/gptqtcool_checkin.py` |
-| 司机社签到 | 司机社（xsijishe / dlsjs / sjs66 等多镜像）Discuz 签到，Cookie 直签或邮箱密码登录（ddddocr 仅作验证码防御路径），内置实测可用域名 + 403/5xx 同域名退避重试 + 失败自动切换 + 运行时域名排序学习 + 仅真实登录失败才熔断，Cookie 缓存复用 | [xsijishe_checkin/README.md](xsijishe_checkin/README.md) | `task xsijishe_checkin/xsijishe_checkin.py` |
-| 采蘑菇论坛回帖签到 | caimogu.cc 自动回帖刷活跃度，Playwright 驱动 + AI/模板双模式评论生成（反套话词库、REPLY/SKIP 判定、防重复回帖） | [caimogu_checkin/README.md](caimogu_checkin/README.md) | `task caimogu_checkin/caimogu_checkin.py` |
-| 雨云自动签到 | 雨云服务器签到 + 自动续费，多账号 + 验证码识别，专为青龙面板优化 | [Rainyun/README.md](Rainyun/README.md) | `task Rainyun/main.py` |
-| 天翼云盘签到 | cloud189-sdk 登录签到，多账号 + 个人/家庭容量统计，复用 sendNotify.js 全通道推送 | [Cloud189Checkin/README.md](Cloud189Checkin/README.md) | `task Cloud189Checkin/src/app.js` |
-| PT 签到（Node.js） | NovaHD / HDArea / BTSchool / CrabPT 四站签到，Cookie 失效自动登录兜底（视觉模型识别验证码），正向证据制判定 + 登录限次保护 + 运行锁防并发 | [pt-checkin/README.md](pt-checkin/README.md) | `task pt-checkin/pt_checkin.js` |
-| TG签到（tg-signer） | Telegram 群/机器人自动签到，基于 tg-signer 封装，扫码登录多账号，支持发消息+点按钮+定时撤回 | [tg-signer-ql/README.md](tg-signer-ql/README.md) | `task tg-signer-ql/tg_signer_ql.py` |
-| ZodGame 签到 | zodgame.xyz 每日签到 + BUX 广告任务，Cookie 认证，广告任务按 `do=check` 接口判定成败（动态倒计时），Cookie 失效/CF 拦截/网络异常/疑似改版四类分开告警，代理回退，`--check` 自检，退出码三档 | [zodgame_checkin/README.md](zodgame_checkin/README.md) | `task zodgame_checkin/zodgame_checkin.py` |
-| 嘉立创签到 | m.jlc.com 每日签到领金豆，第七天自动领 8 金豆券，AccessToken 认证，幂等跳过，Token 失效告警 | [jlc_checkin/README.md](jlc_checkin/README.md) | `task jlc_checkin/jlc_checkin.py` |
-| 纸鸢下载签到 | mybt.kiteyuan.info 每日签到 + 访问任务，Casdoor 账号密码自动登录换 JWT，JWT 缓存原子复用（401/403 才重登），多账号 + 网络重试，分层判定 + 未确认档位 | [mybt-checkin-ql/README.md](mybt-checkin-ql/README.md) | `task mybt-checkin-ql/mybt_checkin.py` |
-| 福利吧预注册签到 | wnflb2023.com「游客预注册签到」插件，连续签到 30 天转正，Cookie 直签或账号密码登录（验证码 ddddocr 自动识别 + Cookie 缓存），幂等跳过 + 进度统计 | [wnflb_checkin/README.md](wnflb_checkin/README.md) | `task wnflb_checkin/wnflb_checkin.py` |
-| 福利吧每日签到 | wnflb2023.com「每日签到」插件(fx_checkin)，Cookie 直签或账号密码登录（验证码 ddddocr 自动识别 + Cookie 缓存），页面状态正向确认 + 幂等跳过 + 业务失败自动重试 + 今日排名/连续天数统计 + 运行锁 | [wnflb_fx_checkin/README.md](wnflb_fx_checkin/README.md) | `task wnflb_fx_checkin/wnflb_fx_checkin.py` |
-| 尚香书苑签到 | Discuz sx_signin 签到（2026-11 站点自研插件替代 k_misign），登录验证码与签到 4 位图形验证码均由 ddddocr 自动识别，Cookie 直签或账密登录（Cookie 缓存复用），域名自动发现（站点换域名无需改代码），幂等跳过 + 连续/累计统计 | [sxsy45_checkin/README.md](sxsy45_checkin/README.md) | `task sxsy45_checkin/sxsy45_checkin.py` |
-| 维咔VikACG签到 | www.vikacg.cc 钱包签到领积分，账密登录换 JWT 双 token（30 天）+ refreshToken 静默续期 + 设备指纹持久化，完整浏览器头模拟免验证码，401 三级降级链，409 已签到幂等，代理支持 | [vikacg_checkin/README.md](vikacg_checkin/README.md) | `task vikacg_checkin/vikacg_checkin.py` |
-| 芯幻签到 | xhcyv.com ACG 社区每日签到，账密登录换 `x_bbs_token`（JWT，3 天）并缓存复用，Bearer 鉴权 + 幂等跳过 + 失效自动重登，登录被风控时 ddddocr 自动过图形验证码，支持 token 直填 / 多账号 / `--check` 自检 | [xhcyv_checkin/README.md](xhcyv_checkin/README.md) | `task xhcyv_checkin/xhcyv_checkin.py` |
-| 百度网盘签到 | 双端签到：网页端会员成长值（签到/答题/成长值广告）+ App 金币任务中心（签到/累计档位奖励）+ 任务中心 + 积分中心 + 补签广告；登录态预检 + 业务码严格判定 + 每步成长值测量 + 幂等复核，多账号，支持 `--probe` / `--check` | [baiduwangpan_checkin/README.md](baiduwangpan_checkin/README.md) | `task baiduwangpan_checkin/baiduwangpan_checkin.py` |
-| 夸克网盘签到 | 移动端签名参数（kps/sign/vcode）签到领空间，支持完整抓包 URL / 三参数 / 裸 URL 三种凭证写法；空 `data` 视为硬错误（旧 Cookie 路径已被夸克关闭）、401 单独识别、POST 不重试改复查、多账号隔离、`--check` 自检 | [quark_checkin/README.md](quark_checkin/README.md) | `task quark_checkin/quark_checkin.py` |
-| MiniMax Code 签到 | 每日 400 积分（连签第 4/7 天 1000），自带 OAuth device flow 授权（零客户端零订阅），refresh token 轮换后原子写回、与客户端目录锁互斥，登录态失效单独识别，`--check` 自检 | [minimax_checkin/README.md](minimax_checkin/README.md) | `task minimax_checkin/minimax_checkin.py` |
+| 脚本 | 说明 | 青龙任务命令 |
+|---|---|---|
+| [E-Hentai 自动签到](AkiyaKiko_EhentaiAutoSignIn/autosignin.py) | E-Hentai 每日签到领 Exp/Credits | `task AkiyaKiko_EhentaiAutoSignIn/autosignin.py` |
+| [老王FIP签到](laowangfip_checkin/README.md) | Discuz + tncode 滑块自动登录签到 | `task laowangfip_checkin/laowangfip_checkin.py` |
+| [New API 站点自动签到](newapi_checkin/README.md) | 多站点 API/Discuz 签到，支持自定义站点 | `task newapi_checkin/newapi_checkin.py` |
+| [whos.tv 签到](whos_tv_checkin/README.md) | Patchright 过 Cloudflare 挑战，Cookie/账密双认证 | `xvfb-run -a task whos_tv_checkin/whos_tv_checkin.py` |
+| [SophNet 签到](sophnet_checkin/README.md) | 福利中心签到，refreshToken 换 accessToken | `task sophnet_checkin/sophnet_checkin.py` |
+| [iKuuu 签到（Node.js）](wuang-wu_Ikuuu/README.md) | 机场签到，Geetest 点选由视觉模型过码 | `task wuang-wu_Ikuuu/ikuuu.js` |
+| [gpt.qt.cool 签到](gptqtcool_checkin/README.md) | Playwright + OpenCV 滑块，登录态缓存复用 | `task gptqtcool_checkin/gptqtcool_checkin.py` |
+| [司机社签到](xsijishe_checkin/README.md) | Discuz 多镜像签到，域名自动切换学习 | `task xsijishe_checkin/xsijishe_checkin.py` |
+| [采蘑菇论坛回帖签到](caimogu_checkin/README.md) | 自动回帖刷活跃度，AI/模板评论生成 | `task caimogu_checkin/caimogu_checkin.py` |
+| [雨云自动签到](Rainyun/README.md) | 服务器签到 + 自动续费 | `task Rainyun/main.py` |
+| [天翼云盘签到](Cloud189Checkin/README.md) | cloud189-sdk 登录签到 + 容量统计 | `task Cloud189Checkin/src/app.js` |
+| [PT 签到（Node.js）](pt-checkin/README.md) | 四站 PT 签到，Cookie 失效自动登录 | `task pt-checkin/pt_checkin.js` |
+| [TG签到（tg-signer）](tg-signer-ql/README.md) | Telegram 群/机器人自动签到 | `task tg-signer-ql/tg_signer_ql.py` |
+| [ZodGame 签到](zodgame_checkin/README.md) | 每日签到 + BUX 广告任务 | `task zodgame_checkin/zodgame_checkin.py` |
+| [嘉立创签到](jlc_checkin/README.md) | 每日签到领金豆，第 7 天自动领券 | `task jlc_checkin/jlc_checkin.py` |
+| [纸鸢下载签到](mybt-checkin-ql/README.md) | 每日签到 + 访问任务，Casdoor 登录 | `task mybt-checkin-ql/mybt_checkin.py` |
+| [福利吧预注册签到](wnflb_checkin/README.md) | 游客预注册，连续签到 30 天转正 | `task wnflb_checkin/wnflb_checkin.py` |
+| [福利吧每日签到](wnflb_fx_checkin/README.md) | 每日签到插件，幂等跳过 + 排名统计 | `task wnflb_fx_checkin/wnflb_fx_checkin.py` |
+| [尚香书苑签到](sxsy45_checkin/README.md) | Discuz sx_signin 签到，域名自动发现 | `task sxsy45_checkin/sxsy45_checkin.py` |
+| [维咔VikACG签到](vikacg_checkin/README.md) | 钱包签到领积分，JWT 双 token 自动续期 | `task vikacg_checkin/vikacg_checkin.py` |
+| [芯幻签到](xhcyv_checkin/README.md) | ACG 社区签到，JWT 缓存 + 验证码识别 | `task xhcyv_checkin/xhcyv_checkin.py` |
+| [百度网盘签到](baiduwangpan_checkin/README.md) | 网页端成长值 + App 金币任务中心 | `task baiduwangpan_checkin/baiduwangpan_checkin.py` |
+| [夸克网盘签到](quark_checkin/README.md) | 移动端签名参数签到领空间 | `task quark_checkin/quark_checkin.py` |
+| [MiniMax Code 签到](minimax_checkin/README.md) | 每日 400 积分，自带 OAuth device flow | `task minimax_checkin/minimax_checkin.py` |
+
+## 使用方式
+
+1. 上传或订阅本仓库脚本到青龙
+2. 「环境变量」配置脚本所需变量（见子目录 README）
+3. 「定时任务」新建任务，命令见上表（形如 `task 目录/脚本.py`；从旧版根目录迁移的任务需同步改路径）
+4. 先手动运行一次确认日志正常，再启用定时
+
+本地调试：`python path/to/script.py`。
+
+通知复用青龙自带 `notify.py`（Server酱、PushPlus、企业微信、钉钉、飞书、Bark、Telegram 等），各脚本有独立开关，详见子目录 README。
+
+## 代理配置
+
+取值优先级：脚本专属变量（如 `IKUUU_PROXY`）> 青龙全局 `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` > 直连。
+
+`config.sh` 的 `ProxyUrl` 只作用于面板自身（拉库、装依赖），不会注入任务环境。要全局生效，在「环境变量」页加 `HTTP_PROXY`、`HTTPS_PROXY`（如 `http://192.168.1.100:7890`；代理跑在宿主机时容器内常用 `http://172.17.0.1:7890`），新运行的任务即生效。
+
+建议代理开规则模式：国内站（嘉立创、雨云等）直连；司机社、老王FIP 等被 DNS 污染/SNI 阻断的站点必须走代理。
 
 ## 来源与致谢
 
-以下脚本改写/移植自开源项目，按青龙面板规范适配后在本仓库维护，原项目地址一并列出：
+部分脚本改写/移植自开源项目（其余为本仓库原创）：
 
 | 脚本 | 原项目 |
 |---|---|
-| 雨云自动签到 | [SerendipityR-2022/Rainyun-Qiandao](https://github.com/SerendipityR-2022/Rainyun-Qiandao) → [fatekey/Rainyun-Qiandao](https://github.com/fatekey/Rainyun-Qiandao) → [Jielumoon/Rainyun-Qiandao](https://github.com/Jielumoon/Rainyun-Qiandao) |
-| 天翼云盘签到 | [wes-lin/Cloud189Checkin](https://github.com/wes-lin/Cloud189Checkin)（登录依赖 [wes-lin/cloud189-sdk](https://github.com/wes-lin/cloud189-sdk)） |
+| 雨云自动签到 | [SerendipityR-2022](https://github.com/SerendipityR-2022/Rainyun-Qiandao) → [fatekey](https://github.com/fatekey/Rainyun-Qiandao) → [Jielumoon](https://github.com/Jielumoon/Rainyun-Qiandao) |
+| 天翼云盘签到 | [wes-lin/Cloud189Checkin](https://github.com/wes-lin/Cloud189Checkin)（登录依赖 [cloud189-sdk](https://github.com/wes-lin/cloud189-sdk)） |
 | iKuuu 签到 | [wuang-wu/Ikuuu](https://github.com/wuang-wu/Ikuuu) |
 | E-Hentai 自动签到 | [AkiyaKiko/EhentaiAutoSignIn](https://github.com/AkiyaKiko/EhentaiAutoSignIn) |
 | 嘉立创签到 | [Foticing/LC-AutoSign](https://github.com/Foticing/LC-AutoSign) |
 | 纸鸢下载签到 | [elongou-checkin/mybt-signin](https://github.com/elongou-checkin/mybt-signin) |
 | New API 站点签到 | [zhangguoguo1314/quan-zidong-zhushou](https://github.com/zhangguoguo1314/quan-zidong-zhushou) |
-| TG 签到（tg-signer） | [xuanvivo/tg-signer-ql](https://github.com/xuanvivo/tg-signer-ql)（上游 [amchii/tg-signer](https://github.com/amchii/tg-signer)） |
-| 百度网盘签到 | [awakaze/cf-netdisk-signin](https://github.com/awakaze/cf-netdisk-signin)（App 签到/累计奖励接口与幂等思路）+ [jujiunofly/baidu-signin](https://github.com/jujiunofly/baidu-signin)（登录态预检/任务签名/广告与积分接口） |
-| 夸克网盘签到 | [Liu8Can/Quark_Auto_Check_In](https://github.com/Liu8Can/Quark_Auto_Check_In)（签到接口与参数解析）+ [PLA888/kuake_qiandao](https://github.com/PLA888/kuake_qiandao)（`x-u-kps-wg` 请求头对应关系） |
-| MiniMax Code 签到 | [Minatoxiaohu/agent-auto-signin](https://github.com/Minatoxiaohu/agent-auto-signin)（`minimax_signin.py`：device flow 协议、签名算法、凭据格式） |
-
-其余脚本为本仓库原创。感谢上述项目作者的开源工作。
-
-## 迁移提醒
-
-脚本已从根目录移动到子目录。若青龙中已有旧任务，需要同步修改命令：
-
-```text
-# 旧
- task xxx.py
-
-# 新
- task xxx/xxx.py
-```
-
-例如：
-
-```text
-task laowangfip_checkin/laowangfip_checkin.py
-task newapi_checkin/newapi_checkin.py
-task whos_tv_checkin/whos_tv_checkin.py
-```
-
-如果使用 `ql repo` 拉库，请确认订阅过滤规则能扫描到子目录内的 `.py` 文件。
-
-## 通知说明
-
-脚本在青龙环境中会尽量复用青龙自带的 `notify.py`，支持你在青龙里已经配置好的通知渠道，例如 Server酱、PushPlus、企业微信、钉钉、飞书、Bark、Telegram 等。
-
-各脚本都提供独立的通知开关环境变量，详见对应子目录 README。
-
-## 通用运行方式
-
-青龙面板：
-
-1. 上传或订阅本目录脚本。
-2. 在「环境变量」中配置对应脚本的变量。
-3. 在「定时任务」中新建任务，命令使用上方表格中的新路径。
-4. 先手动运行一次，确认日志正常后再启用定时。
-
-本地调试：
-
-```bash
-python path/to/script.py
-```
-
-Windows PowerShell 中设置环境变量示例：
-
-```powershell
-$env:XXX_NOTIFY="false"
-python path\to\script.py
-```
-
-## 代理配置（重要）
-
-脚本的代理取值优先级固定为三段：
-
-1. 脚本专属变量（如 `LWFIP_PROXY`、`IKUUU_PROXY`、`TG_PROXY`）
-2. 青龙全局代理：`HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY`（大小写均可）
-3. 都为空则直连（不报错退出）
-
-### 注意：`config.sh` 里的 `ProxyUrl` 对脚本无效
-
-`ProxyUrl` 是**青龙面板自身**的配置项，只用于面板拉库、安装依赖，**不会注入任务脚本的运行环境**。
-脚本读不到它，因此「配了 ProxyUrl 却仍提示未配置代理」是正常现象，不是脚本的问题。
-
-要让所有脚本共用一份代理配置，任选其一。
-
-**方式一：青龙「环境变量」页（推荐）**
-
-新增两条，值改成你自己的代理地址：
-
-| 名称 | 值 |
-|---|---|
-| `HTTP_PROXY` | `http://192.168.1.100:7890` |
-| `HTTPS_PROXY` | `http://192.168.1.100:7890` |
-
-> 代理跑在宿主机上时容器内常用 `http://172.17.0.1:7890`；跑在局域网其它机器上则填其实际 IP。
-> 保存后新运行的任务即生效。
-
-**方式二：容器级环境变量（docker 部署）**
-
-在 `docker-compose.yml` 的青龙服务下追加：
-
-```yaml
-environment:
-  - HTTP_PROXY=http://192.168.1.100:7890
-  - HTTPS_PROXY=http://192.168.1.100:7890
-  - NO_PROXY=localhost,127.0.0.1,192.168.0.0/16,10.0.0.0/8,172.16.0.0/12
-```
-
-`NO_PROXY` 用于排除内网，避免青龙访问数据库、NAS 时也被绕进代理。
-
-> 建议代理软件开启**规则模式**：国内域名直连、境外域名走代理。否则国内站脚本（嘉立创、雨云等）会因绕行而变慢甚至失败。
->
-> 反过来，司机社、老王FIP 这类站点在国内会被 DNS 污染/SNI 阻断，**必须走代理**；直连只会拿到错误的 IP。
+| TG 签到 | [xuanvivo/tg-signer-ql](https://github.com/xuanvivo/tg-signer-ql)（上游 [amchii/tg-signer](https://github.com/amchii/tg-signer)） |
+| 百度网盘签到 | [awakaze/cf-netdisk-signin](https://github.com/awakaze/cf-netdisk-signin) + [jujiunofly/baidu-signin](https://github.com/jujiunofly/baidu-signin) |
+| 夸克网盘签到 | [Liu8Can/Quark_Auto_Check_In](https://github.com/Liu8Can/Quark_Auto_Check_In) + [PLA888/kuake_qiandao](https://github.com/PLA888/kuake_qiandao) |
+| MiniMax Code 签到 | [Minatoxiaohu/agent-auto-signin](https://github.com/Minatoxiaohu/agent-auto-signin) |
 
 ## 仓库流量
 
