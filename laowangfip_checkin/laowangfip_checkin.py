@@ -19,7 +19,9 @@ cron: 30 8 * * *
   LWFIP_PROXY             可选 HTTP 代理（站点被墙，建议配置），如 http://172.17.0.1:7890；
                           留空时自动回退青龙全局代理（HTTPS_PROXY/HTTP_PROXY/ALL_PROXY）
   LWFIP_PROXY_REQUIRED    可选 默认 false，true 时缺代理直接报错退出
-  LWFIP_BASE_URL          可选 默认 https://laowang.vip
+  LWFIP_BASE_URLS         可选 逗号分隔的候选域名，按顺序探测，首个可用即采用；
+                          默认 https://laowang.vip,https://laowangfip372.vip
+  LWFIP_BASE_URL          可选 兼容旧配置；设置后只用该域名、不做降级
   LWFIP_NOTIFY            可选 默认 true
   LWFIP_NOTIFY_ONLY_FAIL  可选 默认 false，true 时仅在有失败时推送
   LWFIP_TIMEOUT           可选 默认 30（秒）
@@ -103,12 +105,19 @@ def send_notify(title: str, content: str) -> bool:
     return False
 
 
-# ---------------- 站点常量（2026-10-10 实测） ----------------
+# ---------------- 站点常量（2026-11-21 复测） ----------------
 DEFAULT_BASE_URL = "https://laowang.vip"
+# 主域名对部分代理出口被 Cloudflare 整站拦截（403 Just a moment），备用域名同后端不拦
+DEFAULT_BASE_URLS = ("https://laowang.vip", "https://laowangfip372.vip")
 LOGIN_PAGE_PATH = "/member.php?mod=logging&action=login"
 SIGN_PAGE_PATH = "/plugin.php?id=k_misign:sign"
 CAPTCHA_IMG_PATH = "/captcha/tncode.php"
 CAPTCHA_CHECK_PATH = "/captcha/check.php"
+
+# 年龄确认网关：站点在根路径投放「性材料警告」页，需置 is_agree=1 才放行。
+# 实测该 cookie 只解网关，对 Cloudflare 403 无效（两者独立）。
+AGE_GATE_COOKIE_NAME = "is_agree"
+AGE_GATE_COOKIE_VALUE = "1"
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
@@ -155,6 +164,92 @@ def resolve_proxy(*specific_keys: str) -> tuple:
     return "", ""
 
 
+# ---------------- 候选域名 ----------------
+def _normalize_base_url(raw: str) -> str:
+    """归一化单个域名：去空白与尾斜杠；非 http(s) scheme 视为非法返回空串。"""
+    value = (raw or "").strip().rstrip("/")
+    if not value:
+        return ""
+    if not value.lower().startswith(("http://", "https://")):
+        return ""
+    return value
+
+
+def parse_base_urls() -> list:
+    """
+    解析候选域名列表（按优先级排序，首个可用即采用）。
+
+    优先级：LWFIP_BASE_URLS（多域名）> LWFIP_BASE_URL（单域名，禁用降级）
+            > DEFAULT_BASE_URLS（内置主域名 + 备用域名）。
+    LWFIP_BASE_URL 单独保留是为了兼容旧配置：用户显式指定了就尊重，不擅自换成别的域名。
+    """
+    multi = (os.getenv("LWFIP_BASE_URLS") or "").strip()
+    if multi:
+        raw_items = re.split(r"[,\s]+", multi)
+        source = "LWFIP_BASE_URLS"
+    else:
+        single = (os.getenv("LWFIP_BASE_URL") or "").strip()
+        if single:
+            raw_items = [single]
+            source = "LWFIP_BASE_URL"
+        else:
+            raw_items = list(DEFAULT_BASE_URLS)
+            source = "默认"
+
+    urls = []
+    for item in raw_items:
+        if not item.strip():
+            continue
+        normalized = _normalize_base_url(item)
+        if not normalized:
+            print(f"  ⚠️ 忽略非法域名（需以 http:// 或 https:// 开头）: {item.strip()[:60]}")
+            continue
+        if normalized not in urls:   # 去重，保留首次出现的顺序
+            urls.append(normalized)
+
+    if not urls:
+        print("  ⚠️ 候选域名全部非法，回退到默认域名列表")
+        urls = [_normalize_base_url(u) for u in DEFAULT_BASE_URLS]
+        source = "默认（回退）"
+
+    if len(urls) == 1:
+        print(f"  ℹ️ 候选域名（来源: {source}）仅 1 个，不会做域名降级")
+    return urls
+
+
+def next_base_url(current: str, candidates: list) -> str:
+    """环形取下一个候选域名；单域名时原样返回（无可降级目标）。"""
+    if len(candidates) <= 1:
+        return current
+    try:
+        idx = candidates.index(current)
+    except ValueError:
+        return candidates[0]
+    return candidates[(idx + 1) % len(candidates)]
+
+
+# ---------------- 页面类型判定 ----------------
+def is_cloudflare_challenge(html: str) -> bool:
+    """Cloudflare 拦截页（Just a moment / 托管质询）。"""
+    return "Just a moment..." in html or "window._cf_chl_opt" in html
+
+
+def is_age_gate_page(html: str) -> bool:
+    """
+    年龄确认网关页（「性材料警告」+ is_agree 按钮脚本）。
+
+    两个特征串同时命中才判定，避免把普通页面里偶然出现的 is_agree 误判。
+    实测该页含 is_agree/agree() 各 2 次、formhash 0 次；登录页两者均为 0 次。
+    """
+    return "is_agree" in html and "agree()" in html
+
+
+def is_domain_block_error(err_text: str) -> bool:
+    """错误是否属于「换域名可恢复」的拦截类。"""
+    text = err_text or ""
+    return "cloudflare" in text.lower() or "年龄确认网关" in text
+
+
 def is_retryable_error(err_text: str) -> bool:
     """
     判断错误是否可重试。
@@ -172,6 +267,8 @@ def is_retryable_error(err_text: str) -> bool:
         "验证码", "滑块", "captcha", "tncode",
         # 签到流程类
         "未到达验证页", "提交后仍在验证页", "签到结果未知", "找不到签到",
+        # 域名拦截类（换域名即可恢复，值得重试）
+        "cloudflare", "年龄确认网关",
     ]
     lower = err_text.lower()
     return any(kw in lower for kw in retry_keywords)
@@ -223,20 +320,27 @@ def mask_proxy(proxy: str) -> str:
 
 
 # ---------------- 会话 Cookie 缓存 ----------------
-def cookie_cache_path(username: str) -> Path:
-    """缓存文件路径：脚本同目录，文件名用用户名 hash（不含明文）。"""
-    digest = hashlib.sha1(username.encode("utf-8")).hexdigest()[:12]
+def cookie_cache_path(username: str, base_url: str = "") -> Path:
+    """
+    缓存文件路径：脚本同目录，文件名用 (用户名 + 域名) hash（不含明文）。
+
+    带上域名是因为 Cookie 与域名绑定：两个候选域名切换时若共用一份缓存，会互相
+    覆盖且加载后对当前域名无效，导致每次都要重登。base_url 留空时退化为只哈希
+    用户名，保持与旧版本缓存文件兼容。
+    """
+    key = f"{username}|{base_url}" if base_url else username
+    digest = hashlib.sha1(key.encode("utf-8")).hexdigest()[:12]
     return COOKIE_CACHE_DIR / f"cookie_{digest}.json"
 
 
-def save_cookies_to_cache(session, username: str) -> bool:
+def save_cookies_to_cache(session, username: str, base_url: str = "") -> bool:
     """把会话 Cookie 落盘，供后续任务/重试直通签到（跳过滑块）。"""
     try:
         cookies = [
             {"name": c.name, "value": c.value, "domain": c.domain, "path": c.path}
             for c in session.cookies
         ]
-        cookie_cache_path(username).write_text(
+        cookie_cache_path(username, base_url).write_text(
             json.dumps(cookies, ensure_ascii=False), encoding="utf-8"
         )
         print(f"🍪 已保存会话 Cookie 缓存（{len(cookies)} 条）")
@@ -246,10 +350,10 @@ def save_cookies_to_cache(session, username: str) -> bool:
         return False
 
 
-def load_cookies_from_cache(username: str):
+def load_cookies_from_cache(username: str, base_url: str = ""):
     """读取 Cookie 缓存；缺失或损坏返回 None。"""
     try:
-        data = json.loads(cookie_cache_path(username).read_text(encoding="utf-8"))
+        data = json.loads(cookie_cache_path(username, base_url).read_text(encoding="utf-8"))
         if isinstance(data, list) and data:
             return data
     except Exception:
@@ -257,10 +361,10 @@ def load_cookies_from_cache(username: str):
     return None
 
 
-def remove_cookie_cache(username: str) -> None:
+def remove_cookie_cache(username: str, base_url: str = "") -> None:
     """删除失效缓存，避免反复复用坏 Cookie。"""
     try:
-        cookie_cache_path(username).unlink(missing_ok=True)
+        cookie_cache_path(username, base_url).unlink(missing_ok=True)
     except Exception:
         pass
 
@@ -524,11 +628,57 @@ def parse_form(html: str, form_id: str):
     return p.action, p.fields
 
 
+# ---------------- 页面获取（含年龄网关自动放行） ----------------
+class AgeGateBlocked(Exception):
+    """置了 is_agree 仍返回年龄网关页：站点改了放行机制，需人工介入。"""
+
+
+def _base_domain(base_url: str) -> str:
+    """从 base_url 取主机名，供 cookie 域精确匹配（避免把 is_agree 发给别的域）。"""
+    return re.sub(r"^https?://", "", (base_url or "").strip().rstrip("/")).split("/")[0]
+
+
+def set_age_gate_cookie(session, base_url: str) -> None:
+    """给当前站点置年龄确认 cookie（等价于网关页「同意 / I Agree」按钮）。"""
+    domain = _base_domain(base_url)
+    if not domain:
+        return
+    session.cookies.set(AGE_GATE_COOKIE_NAME, AGE_GATE_COOKIE_VALUE, domain=domain, path="/")
+
+
+def fetch_page(session, url: str, base_url: str, debug: bool = False, **kwargs):
+    """
+    GET 页面，自动放行年龄确认网关。
+
+    为什么需要包装：站点在部分路径投放「性材料警告」网关页，页面里没有业务内容。
+    命中网关时置 is_agree=1 后重试一次；仍命中则抛 AgeGateBlocked，交由上层换域名
+    或报错，避免把网关页当业务页继续解析出「formhash 缺失」这类误导性错误。
+
+    注意：Cloudflare 拦截页不在这里处理（is_agree 对它无效），由调用方按错误文本识别。
+    """
+    r = session.get(url, timeout=session._timeout, **kwargs)
+    if not is_age_gate_page(r.text):
+        return r
+
+    if debug:
+        print("   [gate] 命中年龄确认网关，置 is_agree=1 后重试")
+    set_age_gate_cookie(session, base_url)
+    r = session.get(url, timeout=session._timeout, **kwargs)
+    if is_age_gate_page(r.text):
+        raise AgeGateBlocked("年龄确认网关拦截（置 is_agree 后仍被拦）")
+    return r
+
+
 # ---------------- 登录 ----------------
 def check_logged_in(session, base_url: str, debug: bool = False) -> bool:
-    """GET forum.php，按 discuz_uid>0 / 退出链接判定登录态。"""
+    """
+    GET forum.php，按 discuz_uid>0 / 退出链接判定登录态。
+
+    被 Cloudflare 拦截时这里只会返回 False（等同「Cookie 失效」），随后走正常登录
+    流程即可由 login_with_requests 报出明确的 CF 拦截错误并触发换域名，故不在此单独区分。
+    """
     try:
-        r = session.get(base_url + "/forum.php", timeout=session._timeout)
+        r = fetch_page(session, base_url + "/forum.php", base_url, debug)
         m = re.search(r"discuz_uid\s*=\s*'(\d+)'", r.text)
         if m and m.group(1) != "0":
             return True
@@ -544,7 +694,10 @@ def login_with_requests(session, base_url: str, username: str, password: str,
                         debug: bool, max_captcha_retry: int):
     """浏览器登录页 -> 过 tncode -> 提交登录表单。返回 (success: bool, msg: str)。"""
     try:
-        r = session.get(base_url + LOGIN_PAGE_PATH, timeout=session._timeout)
+        r = fetch_page(session, base_url + LOGIN_PAGE_PATH, base_url, debug)
+        # 先判拦截：否则会落到下面的「formhash 缺失」，把 IP 被封误报成页面结构变化
+        if is_cloudflare_challenge(r.text):
+            return False, "Cloudflare 拦截（当前出口 IP 被质询，可尝试切换域名）"
         fh = re.search(r'name="formhash" value="([0-9a-f]+)"', r.text)
         lh = re.search(r"loginhash=([A-Za-z0-9]+)", r.text)
         if not fh or not lh:
@@ -597,7 +750,7 @@ def fetch_sign_stats(session, base_url: str, debug: bool = False) -> dict:
     """读取签到页 countqian 统计（连续签到/签到等级/积分奖励/总天数）。失败返回 {}。"""
     wanted = {"连续签到": "天", "签到等级": "级", "积分奖励": "分", "总天数": "天"}
     try:
-        r = session.get(base_url + SIGN_PAGE_PATH, timeout=session._timeout)
+        r = fetch_page(session, base_url + SIGN_PAGE_PATH, base_url, debug)
         block = re.search(r'<ul class="countqian[^"]*"[^>]*>(.*?)</ul>', r.text, re.S)
         if not block:
             return {}
@@ -629,7 +782,7 @@ def sign_with_requests(session, base_url: str, debug: bool, max_captcha_retry: i
     返回 {"success": bool, "message"/"error": str}。
     """
     try:
-        r = session.get(base_url + SIGN_PAGE_PATH, timeout=session._timeout)
+        r = fetch_page(session, base_url + SIGN_PAGE_PATH, base_url, debug)
         html = r.text
 
         # 已签到：span.btn.btnvisted（k_misign 的"已签到"标记）
@@ -644,7 +797,7 @@ def sign_with_requests(session, base_url: str, debug: bool, max_captcha_retry: i
             return {"success": False, "error": "找不到签到按钮（可能页面结构变化或未登录）"}
 
         qiandao_url = urljoin(base_url + "/", m.group(1).replace("&amp;", "&"))
-        r = session.get(qiandao_url, timeout=session._timeout)
+        r = fetch_page(session, qiandao_url, base_url, debug)
         page = r.text
 
         # 签到验证页：解析 #v2_captcha_form 的 action 与全部字段
@@ -677,7 +830,7 @@ def sign_with_requests(session, base_url: str, debug: bool, max_captcha_retry: i
 
         # 权威成功信号：重新拉签到页，k_misign 在已签到时渲染 span.btnvisted
         try:
-            verify_text = session.get(base_url + SIGN_PAGE_PATH, timeout=session._timeout).text
+            verify_text = fetch_page(session, base_url + SIGN_PAGE_PATH, base_url, debug).text
         except Exception:
             verify_text = result
         if "btnvisted" in verify_text:
@@ -702,6 +855,42 @@ def sign_with_requests(session, base_url: str, debug: bool, max_captcha_retry: i
         return {"success": False, "error": f"签到异常: {compact_error(e)}"}
 
 
+# ---------------- 候选域名探测 ----------------
+def probe_base_urls(candidates: list, proxy: str, timeout: int, debug: bool = False) -> tuple:
+    """
+    按顺序探测候选域名，返回 (可用域名, [(域名, 结论), ...])。
+
+    判定为可用的标准：登录页能同时解析出 formhash 与 loginhash。
+    失败原因区分「Cloudflare 拦截」「年龄确认网关」「页面结构异常」「网络异常」，
+    便于日志里一眼看出该换域名还是该查脚本。
+    全部候选都不可用时返回 ("", 探测记录)，由调用方决定降级还是报错。
+    """
+    records = []
+    for base_url in candidates:
+        session = build_session(proxy, timeout)
+        try:
+            r = fetch_page(session, base_url + LOGIN_PAGE_PATH, base_url, debug)
+        except AgeGateBlocked as e:
+            records.append((base_url, str(e)))
+            continue
+        except requests.exceptions.RequestException as e:
+            records.append((base_url, f"网络异常: {compact_error(e)}"))
+            continue
+
+        if is_cloudflare_challenge(r.text):
+            records.append((base_url, f"Cloudflare 拦截（HTTP {r.status_code}）"))
+            continue
+        if r.status_code >= 400:
+            records.append((base_url, f"HTTP {r.status_code}"))
+            continue
+        if (re.search(r'name="formhash" value="([0-9a-f]+)"', r.text)
+                and re.search(r"loginhash=([A-Za-z0-9]+)", r.text)):
+            records.append((base_url, "可用"))
+            return base_url, records
+        records.append((base_url, "登录页结构异常（无 formhash/loginhash）"))
+    return "", records
+
+
 # ---------------- 单账号编排 ----------------
 def build_session(proxy: str, timeout: int):
     """构造 requests.Session（UA/代理/超时统一挂载）。"""
@@ -722,29 +911,36 @@ def run_one_account(username: str, password: str, base_url: str, proxy: str,
                     use_cookie_cache: bool) -> dict:
     """登录（或复用 Cookie）+ 签到一条龙。"""
     session = build_session(proxy, timeout)
+    # 预先置年龄确认 cookie：网关若扩大拦截范围也不会卡在网关页
+    set_age_gate_cookie(session, base_url)
     label = mask_account(username)
 
     # 会话 Cookie 复用：命中且登录态有效则直通签到，跳过登录与滑块
+    # 注意：必须用 authenticated 标志判断是否已登录，不能看 session.cookies 是否为空
+    # —— 上面预置的 is_agree 会让 cookies 永远非空，导致登录被静默跳过。
+    authenticated = False
     if use_cookie_cache:
-        cached = load_cookies_from_cache(username)
+        cached = load_cookies_from_cache(username, base_url)
         if cached:
             for c in cached:
                 session.cookies.set(c["name"], c["value"],
                                     domain=c.get("domain") or "", path=c.get("path") or "/")
             if check_logged_in(session, base_url, debug):
+                authenticated = True
                 print(f"    🍪 {label} 命中会话 Cookie，直通签到")
             else:
                 print(f"    🍪 {label} Cookie 已失效，重新登录")
                 session.cookies.clear()
-                remove_cookie_cache(username)
+                set_age_gate_cookie(session, base_url)
+                remove_cookie_cache(username, base_url)
 
-    if not session.cookies:
+    if not authenticated:
         ok, msg = login_with_requests(session, base_url, username, password,
                                       debug, max_captcha_retry)
         if not ok:
             return {"success": False, "error": msg}
         if use_cookie_cache:
-            save_cookies_to_cache(session, username)
+            save_cookies_to_cache(session, username, base_url)
 
     sign_result = sign_with_requests(session, base_url, debug, max_captcha_retry)
     if sign_result.get("success"):
@@ -757,7 +953,6 @@ def run_one_account(username: str, password: str, base_url: str, proxy: str,
 # ---------------- 主流程 ----------------
 def main():
     title = "老王FIP签到"
-    base_url = (os.getenv("LWFIP_BASE_URL") or DEFAULT_BASE_URL).strip().rstrip("/")
     proxy, proxy_source = resolve_proxy("LWFIP_PROXY")
     notify_enabled = env_bool("LWFIP_NOTIFY", True)
     notify_only_fail = env_bool("LWFIP_NOTIFY_ONLY_FAIL", False)
@@ -796,9 +991,29 @@ def main():
 
     proxy_desc = "未配置（直连）" if not proxy else (
         mask_proxy(proxy) if proxy_source == "LWFIP_PROXY" else f"{mask_proxy(proxy)}（来源: {proxy_source}）")
-    print(f"📋 共 {len(accounts)} 个账号 | 代理: {proxy_desc} | 站点: {base_url}")
+    print(f"📋 共 {len(accounts)} 个账号 | 代理: {proxy_desc}")
     print(f"   debug={debug}, timeout={timeout}s, captcha_retry={max_captcha_retry}, "
           f"task_retry={max_retry}次/间隔{retry_interval}s, cookie_cache={use_cookie_cache}\n")
+
+    # 启动探测：按候选顺序找第一个没被拦的域名（主域名对部分出口会被 CF 整站拦）
+    candidates = parse_base_urls()
+    print(f"🔍 探测候选域名（共 {len(candidates)} 个）...")
+    base_url, probe_records = probe_base_urls(candidates, proxy, timeout, debug)
+    for domain, reason in probe_records:
+        icon = "✅" if reason == "可用" else "⛔"
+        print(f"   {icon} {domain} -> {reason}")
+
+    if not base_url:
+        detail = "\n".join(f"  - {d}: {r}" for d, r in probe_records)
+        msg = f"⚠️ 所有候选域名均不可用，无法登录。\n{detail}"
+        print(msg)
+        if notify_enabled:
+            send_notify(f"❌ {title}", msg)
+        sys.exit(1)
+
+    if base_url != candidates[0]:
+        print(f"⚠️ 主域名 {candidates[0]} 不可用，已降级到 {base_url}")
+    print(f"🌐 本次使用域名: {base_url}\n")
 
     results, success_cnt = [], 0
 
@@ -830,6 +1045,15 @@ def main():
 
             err = result.get("error", "未知错误")
             print(f"           ❌ {err}  (耗时 {cost:.1f}s)")
+
+            # 运行中被拦截（如代理节点轮换后 IP 变了）：换域名后立即重试，不空等
+            if attempt < max_retry and is_domain_block_error(err):
+                switched = next_base_url(base_url, candidates)
+                if switched != base_url:
+                    base_url = switched
+                    print(f"           🔀 域名被拦截，切换到 {base_url} 立即重试...")
+                    continue
+
             if attempt < max_retry and is_retryable_error(err):
                 print("           🔄 检测到可重试错误，准备重试...")
                 continue
@@ -852,6 +1076,7 @@ def main():
 
     lines = [f"# {notify_title} - 执行报告", ""]
     lines.append(f"⏰ {datetime.now():%Y-%m-%d %H:%M:%S}")
+    lines.append(f"🌐 使用域名: {base_url}")
     lines.append(f"📊 总计 {total} 账号，✅ {success_cnt} / ❌ {fail_cnt}")
     lines.append("\n## 详细结果")
     for r in results:
