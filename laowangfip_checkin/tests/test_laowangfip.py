@@ -5,6 +5,7 @@
 """
 import importlib.util
 import json
+import os
 import sys
 import tempfile
 import types
@@ -249,9 +250,10 @@ class TestMaskProxy(unittest.TestCase):
 
 
 class _FakeResp:
-    def __init__(self, text, url=""):
+    def __init__(self, text, url="", status_code=200):
         self.text = text
         self.url = url
+        self.status_code = status_code
         self.content = text.encode("utf-8")
 
 
@@ -348,6 +350,318 @@ class TestFingerprint(unittest.TestCase):
         self.assertEqual(fp, m.compute_fingerprint())  # 确定性
         self.assertEqual(len(fp), 32)                  # 4 段 8 位十六进制
         int(fp, 16)                                    # 全部为十六进制
+
+
+# ---- 页面类型判定（真实页面特征串，取自 2026-11-21 实测） ----
+_CF_PAGE = ('<!DOCTYPE html><html lang="en-US"><head><title>Just a moment...</title>'
+            '<script>window._cf_chl_opt = {cRay: "abc"};</script></head></html>')
+_AGE_GATE_PAGE = (
+    '<html><body><h2>性材料警告:</h2>'
+    '<button class="agree" onclick="agree();">同意 / I Agree</button>'
+    '<script>function agree() { setCookie("is_agree", "1", 30); }</script>'
+    '</body></html>'
+)
+_LOGIN_PAGE = (
+    '<html><head><title>登录老王论坛</title></head><body>'
+    '<form method="post" action="member.php?mod=logging&amp;action=login&amp;loginhash=Lx8Es">'
+    '<input type="hidden" name="formhash" value="daa0efa8">'
+    '</form></body></html>'
+)
+
+
+class TestCloudflareDetection(unittest.TestCase):
+    def test_detects_challenge_page(self):
+        self.assertTrue(m.is_cloudflare_challenge(_CF_PAGE))
+
+    def test_detects_by_cf_opt_only(self):
+        # 只有 _cf_chl_opt 没有 title 也算（CF 页面结构会变）
+        self.assertTrue(m.is_cloudflare_challenge('<script>window._cf_chl_opt={}</script>'))
+
+    def test_login_and_gate_pages_are_not_cf(self):
+        self.assertFalse(m.is_cloudflare_challenge(_LOGIN_PAGE))
+        self.assertFalse(m.is_cloudflare_challenge(_AGE_GATE_PAGE))
+
+
+class TestAgeGateDetection(unittest.TestCase):
+    def test_detects_gate_page(self):
+        self.assertTrue(m.is_age_gate_page(_AGE_GATE_PAGE))
+
+    def test_login_page_not_gate(self):
+        self.assertFalse(m.is_age_gate_page(_LOGIN_PAGE))
+
+    def test_requires_both_markers(self):
+        # 只有 is_agree 没有 agree() 不算，避免普通页面误判
+        self.assertFalse(m.is_age_gate_page('<span>is_agree</span>'))
+
+
+class TestDomainBlockError(unittest.TestCase):
+    def test_cloudflare_error(self):
+        self.assertTrue(m.is_domain_block_error("Cloudflare 拦截（当前出口 IP 被质询）"))
+
+    def test_age_gate_error(self):
+        self.assertTrue(m.is_domain_block_error("年龄确认网关拦截（置 is_agree 后仍被拦）"))
+
+    def test_business_error_not_domain_block(self):
+        self.assertFalse(m.is_domain_block_error("登录失败: 密码错误"))
+        self.assertFalse(m.is_domain_block_error("验证码识别失败（滑块多次未通过）"))
+
+
+class TestParseBaseUrls(unittest.TestCase):
+    def setUp(self):
+        self._saved = {k: os.environ.get(k) for k in ("LWFIP_BASE_URLS", "LWFIP_BASE_URL")}
+        for k in self._saved:
+            os.environ.pop(k, None)
+
+    def tearDown(self):
+        for k, v in self._saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    def test_default_both_domains(self):
+        self.assertEqual(m.parse_base_urls(), list(m.DEFAULT_BASE_URLS))
+        self.assertEqual(len(m.DEFAULT_BASE_URLS), 2)   # 主域名 + 备用域名
+
+    def test_multi_env_overrides(self):
+        os.environ["LWFIP_BASE_URLS"] = "https://a.com, https://b.com"
+        self.assertEqual(m.parse_base_urls(), ["https://a.com", "https://b.com"])
+
+    def test_legacy_single_env_disables_failover(self):
+        os.environ["LWFIP_BASE_URL"] = "https://only.example.com/"
+        self.assertEqual(m.parse_base_urls(), ["https://only.example.com"])  # 尾斜杠被去掉
+
+    def test_multi_env_wins_over_legacy(self):
+        os.environ["LWFIP_BASE_URLS"] = "https://a.com,https://b.com"
+        os.environ["LWFIP_BASE_URL"] = "https://legacy.com"
+        self.assertEqual(m.parse_base_urls(), ["https://a.com", "https://b.com"])
+
+    def test_dedup_preserves_order(self):
+        os.environ["LWFIP_BASE_URLS"] = "https://a.com,https://b.com,https://a.com"
+        self.assertEqual(m.parse_base_urls(), ["https://a.com", "https://b.com"])
+
+    def test_invalid_scheme_dropped(self):
+        os.environ["LWFIP_BASE_URLS"] = "a.com,https://good.com"
+        self.assertEqual(m.parse_base_urls(), ["https://good.com"])
+
+    def test_all_invalid_falls_back_to_default(self):
+        os.environ["LWFIP_BASE_URLS"] = "a.com,b.com"
+        self.assertEqual(m.parse_base_urls(), list(m.DEFAULT_BASE_URLS))
+
+
+class TestNextBaseUrl(unittest.TestCase):
+    CANDIDATES = ["https://a.com", "https://b.com", "https://c.com"]
+
+    def test_cycles_through_candidates(self):
+        self.assertEqual(m.next_base_url("https://a.com", self.CANDIDATES), "https://b.com")
+        self.assertEqual(m.next_base_url("https://b.com", self.CANDIDATES), "https://c.com")
+        self.assertEqual(m.next_base_url("https://c.com", self.CANDIDATES), "https://a.com")
+
+    def test_single_candidate_returns_same(self):
+        self.assertEqual(m.next_base_url("https://a.com", ["https://a.com"]), "https://a.com")
+
+    def test_unknown_current_returns_first(self):
+        self.assertEqual(m.next_base_url("https://zzz.com", self.CANDIDATES), "https://a.com")
+
+
+class TestCookieCachePerDomain(unittest.TestCase):
+    def test_different_domains_get_different_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            m.COOKIE_CACHE_DIR = Path(tmp)
+            p1 = m.cookie_cache_path("user1", "https://a.com")
+            p2 = m.cookie_cache_path("user1", "https://b.com")
+            self.assertNotEqual(p1, p2)
+
+    def test_same_domain_same_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            m.COOKIE_CACHE_DIR = Path(tmp)
+            self.assertEqual(m.cookie_cache_path("u", "https://a.com"),
+                             m.cookie_cache_path("u", "https://a.com"))
+
+    def test_empty_base_url_matches_legacy_behavior(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            m.COOKIE_CACHE_DIR = Path(tmp)
+            # base_url 缺省时应与旧版（只哈希用户名）一致，保证老缓存仍可命中
+            import hashlib
+            expected = "cookie_" + hashlib.sha1("user1".encode()).hexdigest()[:12] + ".json"
+            self.assertEqual(m.cookie_cache_path("user1").name, expected)
+            self.assertEqual(m.cookie_cache_path("user1"), m.cookie_cache_path("user1", ""))
+
+    def test_per_domain_roundtrip(self):
+        import requests
+        with tempfile.TemporaryDirectory() as tmp:
+            m.COOKIE_CACHE_DIR = Path(tmp)
+            s = requests.Session()
+            s.cookies.set("sid", "abc", domain="a.com", path="/")
+            self.assertTrue(m.save_cookies_to_cache(s, "u", "https://a.com"))
+            self.assertEqual(m.load_cookies_from_cache("u", "https://a.com")[0]["name"], "sid")
+            # 另一个域名不该命中
+            self.assertIsNone(m.load_cookies_from_cache("u", "https://b.com"))
+            m.remove_cookie_cache("u", "https://a.com")
+            self.assertIsNone(m.load_cookies_from_cache("u", "https://a.com"))
+
+
+class TestFetchPageAgeGate(unittest.TestCase):
+    """fetch_page 命中网关页时应置 cookie 并重试一次。"""
+
+    class _GateSession:
+        """首次返回网关页，置 cookie 后返回正常页。"""
+
+        def __init__(self):
+            self._timeout = 30
+            self.cookies = _CookieJar()
+            self.calls = 0
+
+        def get(self, url, **kw):
+            self.calls += 1
+            if self.cookies.has(m.AGE_GATE_COOKIE_NAME):
+                return _FakeResp(_LOGIN_PAGE, url)
+            return _FakeResp(_AGE_GATE_PAGE, url)
+
+    class _StubbornSession(_GateSession):
+        """置了 cookie 仍返回网关页，应抛 AgeGateBlocked。"""
+
+        def get(self, url, **kw):
+            self.calls += 1
+            return _FakeResp(_AGE_GATE_PAGE, url)
+
+    def test_retries_after_setting_cookie(self):
+        sess = self._GateSession()
+        r = m.fetch_page(sess, "https://a.com/login", "https://a.com")
+        self.assertEqual(sess.calls, 2)          # 网关页 -> 置 cookie -> 重试
+        self.assertIn("formhash", r.text)
+
+    def test_raises_when_still_gated(self):
+        with self.assertRaises(m.AgeGateBlocked):
+            m.fetch_page(self._StubbornSession(), "https://a.com/login", "https://a.com")
+
+    def test_normal_page_passes_through(self):
+        class _Plain:
+            _timeout = 30
+            cookies = _CookieJar()
+            calls = 0
+
+            def get(self, url, **kw):
+                self.calls += 1
+                return _FakeResp(_LOGIN_PAGE, url)
+
+        sess = _Plain()
+        r = m.fetch_page(sess, "https://a.com/login", "https://a.com")
+        self.assertEqual(sess.calls, 1)          # 非网关页不该重试
+        self.assertIn("formhash", r.text)
+
+
+class _CookieJar:
+    """最小 cookie 容器，模拟 requests.cookies.RequestsCookieJar 的 set/has。"""
+
+    def __init__(self):
+        self._items = {}
+
+    def set(self, name, value, domain="", path="/"):
+        self._items[name] = (value, domain, path)
+
+    def has(self, name):
+        return name in self._items
+
+    def __bool__(self):
+        return bool(self._items)
+
+    def clear(self):
+        self._items.clear()
+
+    def __iter__(self):
+        return iter([])
+
+
+class TestProbeBaseUrls(unittest.TestCase):
+    """探测应跳过被拦的域名，采用第一个可用的。"""
+
+    def _patch_fetch(self, responses):
+        """按 URL 里的域名返回预设响应（模拟不同域名被拦/可用）。"""
+        def fake_fetch(session, url, base_url, debug=False, **kw):
+            for domain, resp in responses.items():
+                if domain in url:
+                    return resp
+            return _FakeResp("", url)
+        return mock.patch.object(m, "fetch_page", side_effect=fake_fetch)
+
+    def test_skips_blocked_picks_second(self):
+        candidates = ["https://blocked.com", "https://good.com"]
+        responses = {
+            "blocked.com": _FakeResp(_CF_PAGE, "https://blocked.com/login"),
+            "good.com": _FakeResp(_LOGIN_PAGE, "https://good.com/login"),
+        }
+        with self._patch_fetch(responses):
+            with mock.patch.object(m, "build_session", return_value=object()):
+                base, records = m.probe_base_urls(candidates, "", 30)
+        self.assertEqual(base, "https://good.com")
+        self.assertEqual(len(records), 2)
+        self.assertIn("Cloudflare", records[0][1])
+        self.assertEqual(records[1][1], "可用")
+
+    def test_all_blocked_returns_empty(self):
+        candidates = ["https://a.com", "https://b.com"]
+        responses = {d: _FakeResp(_CF_PAGE, f"{d}/login") for d in ("a.com", "b.com")}
+        with self._patch_fetch(responses):
+            with mock.patch.object(m, "build_session", return_value=object()):
+                base, records = m.probe_base_urls(candidates, "", 30)
+        self.assertEqual(base, "")
+        self.assertEqual(len(records), 2)
+
+    def test_network_error_tries_next(self):
+        import requests as _rq
+        candidates = ["https://dead.com", "https://good.com"]
+
+        def fake_fetch(session, url, base_url, debug=False, **kw):
+            if "dead.com" in url:
+                raise _rq.exceptions.ConnectionError("boom")
+            return _FakeResp(_LOGIN_PAGE, url)
+
+        with mock.patch.object(m, "fetch_page", side_effect=fake_fetch):
+            with mock.patch.object(m, "build_session", return_value=object()):
+                base, records = m.probe_base_urls(candidates, "", 30)
+        self.assertEqual(base, "https://good.com")
+        self.assertIn("网络异常", records[0][1])
+
+
+class TestRetryableDomainBlock(unittest.TestCase):
+    def test_domain_block_errors_are_retryable(self):
+        # 换域名就能恢复，必须纳入重试集合，否则 main() 的重试分支直接放弃
+        self.assertTrue(m.is_retryable_error("Cloudflare 拦截（当前出口 IP 被质询）"))
+        self.assertTrue(m.is_retryable_error("年龄确认网关拦截"))
+
+
+class TestRunOneAccountLoginNotSkipped(unittest.TestCase):
+    """
+    回归：预置 is_agree cookie 后 session.cookies 恒非空，
+    若用 `if not session.cookies` 判断是否已登录，登录会被静默跳过。
+    """
+
+    def test_login_still_runs_when_gate_cookie_preset(self):
+        calls = {"login": 0}
+
+        def fake_login(session, base_url, username, password, debug, retry):
+            calls["login"] += 1
+            return True, "登录成功"
+
+        with mock.patch.object(m, "build_session", return_value=_StubSession()), \
+             mock.patch.object(m, "login_with_requests", side_effect=fake_login), \
+             mock.patch.object(m, "sign_with_requests",
+                               return_value={"success": True, "message": "签到成功"}), \
+             mock.patch.object(m, "fetch_sign_stats", return_value={}):
+            result = m.run_one_account("u", "p", "https://a.com", "", 30, False, 3, False)
+
+        self.assertEqual(calls["login"], 1)          # 必须真的走登录
+        self.assertTrue(result["success"])
+
+
+class _StubSession:
+    """供 run_one_account 使用的最小会话：cookies 可 set/clear，可判空。"""
+
+    _timeout = 30
+
+    def __init__(self):
+        self.cookies = _CookieJar()
 
 
 if __name__ == "__main__":

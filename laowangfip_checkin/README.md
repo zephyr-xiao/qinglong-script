@@ -2,7 +2,11 @@
 
 适配青龙面板的老王论坛（laowang.vip）每日签到脚本，纯 `requests` 实现登录、滑块验证与签到。
 
-站点默认地址：`https://laowang.vip`
+候选域名（按序探测、主域名被拦自动降级）：
+
+```text
+https://laowang.vip,https://laowangfip372.vip
+```
 
 ## 为什么可以纯 requests
 
@@ -34,7 +38,8 @@ task laowangfip_checkin/laowangfip_checkin.py
 | `LWFIP_ACCOUNTS` | ✅ | - | `用户名#密码`，多账号用 `&` 或换行分隔 |
 | `LWFIP_PROXY` | 否 | - | HTTP 代理，站点被墙建议配置，如 `http://172.17.0.1:7890`；留空时自动回退青龙全局代理 |
 | `LWFIP_PROXY_REQUIRED` | 否 | `false` | 设为 `true` 时缺代理直接报错退出（默认缺代理仅告警并直连尝试） |
-| `LWFIP_BASE_URL` | 否 | `https://laowang.vip` | 站点换域名时覆盖 |
+| `LWFIP_BASE_URLS` | 否 | `https://laowang.vip,https://laowangfip372.vip` | 候选域名，逗号分隔，按顺序探测，首个可用即采用；主域名被拦时自动降级 |
+| `LWFIP_BASE_URL` | 否 | - | 兼容旧配置；设置后**只用该域名、不做降级** |
 | `LWFIP_NOTIFY` | 否 | `true` | 是否调用青龙 `notify.py` 推送 |
 | `LWFIP_NOTIFY_ONLY_FAIL` | 否 | `false` | `true` 时仅在有账号失败时才推送 |
 | `LWFIP_TIMEOUT` | 否 | `30` | 请求超时，单位秒 |
@@ -90,6 +95,38 @@ export LWFIP_NOTIFY=false
 python laowangfip_checkin.py
 ```
 
+## 域名降级（主域名被 Cloudflare 拦截时）
+
+站点主域名 `laowang.vip` 挂在 Cloudflare 后面，**会对部分代理出口 IP 整站拦截**，返回 `403` 的 `Just a moment...` 质询页。该页里没有 `formhash`/`loginhash`，登录必然失败。备用域名 `laowangfip372.vip` 是同一套后端，但没被拦。
+
+实测对照（2026-11-21，同一代理 `:7890`）：
+
+| 域名 | 登录页 |
+|---|---|
+| `laowang.vip` | 403 × 6/6（CF 质询页） |
+| `laowangfip372.vip` | 200 × 10/10，`formhash` 正常 |
+
+脚本的两层处理：
+
+1. **启动探测**：按 `LWFIP_BASE_URLS` 顺序请求登录页，第一个能解析出 `formhash` + `loginhash` 的域名被采用。全部不可用则推送告警并退出。
+2. **运行中降级**：任务执行期间若又遇到 CF 拦截（例如代理节点轮换导致出口 IP 变了），自动切到下一个候选域名立即重试，不空等重试间隔。
+
+判定 CF 拦截的依据是页面特征 `Just a moment...` 或 `window._cf_chl_opt`，不依赖状态码——实测同一出口下 `curl` 返回 403 而 `requests` 返回 200（TLS 指纹差异），只看状态码会误判。
+
+> ⚠️ **换代理解决不了这个问题**。`is_agree` 之类的 Cookie 同样无效（实测 3/3 仍 403）——Cloudflare 质询与站点自身的年龄网关是两件独立的事。
+
+## 年龄确认网关自动放行
+
+站点在**根路径 `/`** 投放「性材料警告」页，需要点「同意 / I Agree」置 `is_agree=1` 才放行。该页没有业务内容，若被当作登录页解析就会得到「formhash 缺失」这类误导性错误。
+
+脚本的处理：
+
+- 每个会话预先置 `is_agree=1`（精确到当前域名，不会泄漏给别的域）；
+- 所有业务页面请求走 `fetch_page()` 包装器，命中网关页时补置 Cookie 并重试一次；
+- 重试后仍是网关页则抛 `AgeGateBlocked`，由上层换域名或明确报错。
+
+实测（2026-11-21）：`laowang.vip/` 与 `laowangfip372.vip/` 裸请求都返回网关页，经 `fetch_page` 后网关页消失。目前 `forum.php` / `member.php` / `plugin.php` 并不拦，此处属防御性处理，防止站点日后扩大拦截范围。
+
 ## 重试策略
 
 账号级重试（`LWFIP_MAX_RETRY` 次，间隔 `LWFIP_RETRY_INTERVAL` 秒固定）：
@@ -99,16 +136,18 @@ python laowangfip_checkin.py
 | 网络 / 超时 / 代理 | ✅ | 连接超时、proxy error、SSLError、连接被拒 |
 | 滑块验证码失败 | ✅ | 缺口识别失败、服务端判定未通过、验证码弹窗未出现 |
 | 签到流程异常 | ✅ | 未到达验证页、提交后仍在验证页、签到结果未知、找不到签到按钮 |
+| 域名被拦截 | ✅ | Cloudflare 质询、年龄网关未放行（**自动换域名立即重试，不等待间隔**） |
 | 业务错误 | ❌ | 密码错误、用户名不存在、账号禁用（重试无意义且加剧风控） |
 
 间隔保持固定（不做指数退避）：多账号最坏时长可控（如默认 5 次重试、4 个间隔 × 60 秒 = 4 分钟），避免任务跨 cron 周期。
 
 ## 会话 Cookie 复用
 
-登录成功后脚本把会话 Cookie 保存到脚本目录下 `cookie_<哈希>.json`（文件名按账号哈希，不含明文，已被仓库 `.gitignore` 覆盖）：
+登录成功后脚本把会话 Cookie 保存到脚本目录下 `cookie_<哈希>.json`（文件名按「账号 + 域名」哈希，不含明文，已被仓库 `.gitignore` 覆盖）：
 
 - **当天重试**：账号级重试直接带 Cookie 直通签到，不再重过滑块；
 - **后续 cron 任务**：Cookie 有效期内直接签到，登录频率大幅降低、防风控；
+- **域名隔离**：不同域名的 Cookie 分文件存放。Cookie 与域名绑定，共用一份会在切换域名时互相覆盖且加载后无效；
 - Cookie 失效自动重新登录并覆盖缓存，无需人工干预；
 - 关闭方式：`LWFIP_COOKIE_CACHE=false`。
 
