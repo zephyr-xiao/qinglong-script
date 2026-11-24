@@ -7,9 +7,11 @@
 
 ## 功能特点
 
-- **Cookie 认证,轻量无浏览器依赖**(仅 `requests`)
+- **Cookie 认证,轻量无浏览器依赖**(`requests`;装了 `curl_cffi` 时自动优先使用)
+- **内置浏览器 TLS 指纹**:站点前置 Cloudflare managed challenge,判定依据是客户端 TLS 指纹而非 IP——
+  普通 `requests` 的 OpenSSL 指纹必被拦(403 `Just a moment`),`curl_cffi` 的 Chrome 指纹可直接通过。
+  已装 `curl_cffi` 时自动启用,缺失时回退 `requests`(会被 CF 拦,脚本会如实告警)
 - **四类失败分开判定与告警**:Cookie 失效 / Cloudflare 拦截 / 网络异常 / 页面疑似改版,不再笼统报「失败」
-  - CF 挑战页(403 `Just a moment`)以前会被误判成「Cookie 有效」,再报一句「无法提取 formhash」,把拦截伪装成解析失败;现在单独归类,并提示 `cf_clearance` 与抓取时的出口 IP/UA 绑定
 - **广告任务按接口成败判定**:流程为 `do=click` → 等广告页真实倒计时 → `do=update` → **`do=check` 校验**,
   只有校验响应出现「检查成功」才计为完成。不再用「整页正文含『成功』二字」这种会误判的判据
 - **广告观看时长取自广告页真实倒计时**(`var count=N`),不再写死 4 秒
@@ -36,6 +38,9 @@ task zodgame_checkin/zodgame_checkin.py
 ```
 
 (每天上午 9:30,与脚本头部 `cron:` 一致)
+
+Python 依赖:`requests`;建议同时在青龙「依赖管理 → Python」安装 `curl_cffi`(装到 data 目录,容器重建后仍保留)。
+缺少 `curl_cffi` 时脚本仍可运行,但会被 Cloudflare 拦。
 
 ## 环境变量
 
@@ -64,9 +69,9 @@ task zodgame_checkin/zodgame_checkin.py
 3. 刷新页面,点击任意 `forum.php` 请求
 4. 在「请求标头」中找到 `Cookie:`,复制完整值(包含 `qhMq_2132_auth`、`cf_clearance` 等所有键值对)
 
-> 💡 关键 Cookie 是 `qhMq_2132_auth`(登录态)和 `cf_clearance`(Cloudflare 放行)。
-> `cf_clearance` 与**抓取时的出口 IP 与 UA 绑定**:换代理、换网络、改 UA 后必须重新抓取,
-> 否则会以「被 Cloudflare 拦截」告警。论坛 Cookie 本身长期有效。
+> 💡 关键是 `qhMq_2132_auth`(登录态)。`cf_clearance` 现在可有可无——脚本用 `curl_cffi` 的浏览器
+> TLS 指纹通过 Cloudflare,不依赖 cf_clearance;抓到的 cf_clearance 即使过期,留在 Cookie 里也无害。
+> 论坛 Cookie 长期有效,只有退出登录 / 改密码才需要重抓。
 
 多账号格式(换行分隔):
 
@@ -126,8 +131,9 @@ task zodgame_checkin/zodgame_checkin.py --check
 A: 浏览器重新登录论坛,F12 抓取新 Cookie 更新 `ZODGAME_COOKIE` 环境变量。
 
 ### Q: 提示「被 Cloudflare 拦截」?
-A: `cf_clearance` 与抓取时的出口 IP/UA 绑定。换了代理或网络后,用新出口 IP 重新抓一次 Cookie;
-或把 `ZODGAME_PROXY` 设成与抓取时相同的出口。
+A: 先确认青龙「依赖管理 → Python」装了 `curl_cffi`——脚本启动会打印 `🧩 请求栈: curl_cffi/chrome`。
+没装时回退 `requests`,其 OpenSSL 指纹会被 CF 的 managed challenge 拦死,装上即可。
+若已装仍被拦,再考虑更换 `ZODGAME_PROXY` 的出口节点。
 
 ### Q: 提示「疑似改版」?
 A: 脚本只认站点明确文案。签到页 title 异常、或任务列表区块消失/无链接又无「暂时没有广告任务可执行」时,

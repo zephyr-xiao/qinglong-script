@@ -26,7 +26,8 @@ Cookie 失效 / 被 Cloudflare 拦截 / 网络异常 / 页面改版 四类情况
   python3 zodgame_checkin.py           正常签到
   python3 zodgame_checkin.py --check   自检:不签到、不执行广告任务,只验环境与登录态
 
-依赖:requests
+依赖:requests;curl_cffi(建议安装,用于提供 Chrome TLS 指纹过 Cloudflare,
+      缺失时自动回退 requests,但会被 CF managed challenge 拦)
 
 作者: zephyr_xiao
 """
@@ -58,6 +59,22 @@ try:
 except ImportError:
     print("❌ 缺少 requests 库,请在青龙面板「依赖管理」-「Python」中安装 requests")
     sys.exit(1)
+
+# ZodGame 前置 Cloudflare managed challenge,判定依据是客户端 TLS 指纹:
+# 普通 requests 的 OpenSSL 指纹会被挑战(403 Just a moment),curl_cffi 的
+# Chrome 指纹可以直连通过。已装 curl_cffi 时优先用它,否则回退 requests。
+try:
+    from curl_cffi import requests as cffi_requests
+
+    HTTP_IMPERSONATE = "chrome"
+except ImportError:
+    cffi_requests = None
+    HTTP_IMPERSONATE = None
+
+# 两套库的异常体系互不继承,重试与容错必须同时覆盖
+NETWORK_ERRORS = (requests.RequestException,)
+if cffi_requests is not None:
+    NETWORK_ERRORS += (cffi_requests.errors.RequestsError,)
 
 # ============================ 常量 ============================
 
@@ -261,7 +278,7 @@ def request_with_retry(session: requests.Session, method: str, url: str, **kwarg
             if DEBUG:
                 print(f"   🔍 {method} {url[:80]} → {resp.status_code} ({len(resp.text)}B)")
             return resp
-        except requests.RequestException as e:
+        except NETWORK_ERRORS as e:
             last_exc = e
             if attempt < MAX_RETRIES:
                 delay = RETRY_BASE_DELAY * attempt
@@ -282,7 +299,10 @@ def http_post(session: requests.Session, url: str, **kwargs) -> requests.Respons
 # ============================ 会话构建 ============================
 
 def build_session(cookie_str: str) -> requests.Session:
-    session = requests.Session()
+    if cffi_requests is not None:
+        session = cffi_requests.Session(impersonate=HTTP_IMPERSONATE)
+    else:
+        session = requests.Session()
     session.cookies.update(parse_cookies(cookie_str))
     session.headers.update({
         "User-Agent": DEFAULT_UA,
@@ -617,7 +637,7 @@ def run_bux_tasks(session: requests.Session, page_html: str = None) -> dict:
             check_resp = http_get(session, _build_check_url(task),
                                   headers={"Referer": JNBUX_URL})
             debug_dump(f"06_task{cid}_check.xml", check_resp.text)
-        except requests.RequestException:
+        except NETWORK_ERRORS:
             # 网络层错误向上抛,由账号级流程归类为「网络异常」
             raise
         except Exception as e:
@@ -669,7 +689,7 @@ def run_one_account(cookie_str: str, index: int) -> dict:
     # 1. 取签到页,判定 Cookie / CF
     try:
         resp = http_get(session, SIGN_PAGE_URL)
-    except requests.RequestException as e:
+    except NETWORK_ERRORS as e:
         flags[CAT_NETWORK] = True
         result["message"] = f"网络异常: {type(e).__name__}: {e}"[:80]
         print(f"   ❌ {result['message']}")
@@ -709,7 +729,7 @@ def run_one_account(cookie_str: str, index: int) -> dict:
         result["sign"] = sign["message"]
         result["sign_ok"] = sign["status"] in ("success", "duplicate")
         print(f"   📝 签到: {sign['message']}")
-    except requests.RequestException as e:
+    except NETWORK_ERRORS as e:
         flags[CAT_NETWORK] = True
         result["sign"] = f"签到网络异常: {type(e).__name__}"
         print(f"   ❌ {result['sign']}")
@@ -735,7 +755,7 @@ def run_one_account(cookie_str: str, index: int) -> dict:
             result["bux"] = f"完成 {bux['done']}/{bux['task_count']} 个任务 (+{bux['earned']:g} 点币)"
             result["bux_ok"] = bux["done"] > 0
             print(f"   📺 BUX: {result['bux']},余额 {result['points']} 点币")
-    except requests.RequestException as e:
+    except NETWORK_ERRORS as e:
         flags[CAT_NETWORK] = True
         result["bux"] = f"BUX 网络异常: {type(e).__name__}"
         print(f"   ❌ {result['bux']}")
@@ -769,7 +789,7 @@ def run_check(cookie_list: list) -> int:
         session = build_session(cookie_str)
         try:
             resp = http_get(session, SIGN_PAGE_URL)
-        except requests.RequestException as e:
+        except NETWORK_ERRORS as e:
             print(f"   ❌ 签到页请求失败: {type(e).__name__}: {e}")
             print()
             continue
@@ -809,7 +829,7 @@ def run_check(cookie_list: list) -> int:
             else:
                 print("   ❌ 任务列表解析不到链接且无『无任务』文案(疑似改版)")
                 account_ok = False
-        except requests.RequestException as e:
+        except NETWORK_ERRORS as e:
             print(f"   ❌ BUX 页请求失败: {type(e).__name__}: {e}")
             account_ok = False
 
@@ -894,6 +914,7 @@ def main(argv=None) -> int:
     notify_only_fail = env_bool("ZODGAME_NOTIFY_ONLY_FAIL", False)
 
     print(f"🚀 ZodGame 签到启动,共 {len(cookie_list)} 个账号")
+    print(f"🧩 请求栈: {'curl_cffi/' + HTTP_IMPERSONATE if cffi_requests else 'requests'}")
 
     results = []
     for i, cookie_str in enumerate(cookie_list):

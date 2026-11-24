@@ -285,6 +285,32 @@ class TestProxy(unittest.TestCase):
             self.assertEqual(zg.resolve_proxy(), (None, None))
 
 
+# ============================ 请求栈(curl_cffi / requests) ============================
+
+class TestRequestStack(unittest.TestCase):
+    def test_prefers_curl_cffi_when_available(self):
+        # 装了 curl_cffi 时必须用浏览器指纹,否则会被 CF managed challenge 拦
+        fake_module = mock.Mock()
+        with mock.patch.object(zg, "cffi_requests", fake_module), \
+                mock.patch.object(zg, "HTTP_IMPERSONATE", "chrome"):
+            session = zg.build_session("qhMq_2132_auth=x")
+        fake_module.Session.assert_called_once_with(impersonate="chrome")
+        self.assertIs(session, fake_module.Session.return_value)
+
+    def test_falls_back_to_requests(self):
+        with mock.patch.object(zg, "cffi_requests", None), \
+                mock.patch.dict(os.environ, {}, clear=True):
+            session = zg.build_session("qhMq_2132_auth=x")
+        self.assertIsInstance(session, zg.requests.Session)
+        self.assertEqual(session.cookies.get("qhMq_2132_auth"), "x")
+
+    def test_network_errors_cover_both_stacks(self):
+        # 两套库异常互不继承,漏掉 curl_cffi 的异常会让重试失效、直接崩栈
+        self.assertIn(zg.requests.RequestException, zg.NETWORK_ERRORS)
+        if zg.cffi_requests is not None:
+            self.assertIn(zg.cffi_requests.errors.RequestsError, zg.NETWORK_ERRORS)
+
+
 # ============================ 页面判定 ============================
 
 class TestPageVerdict(unittest.TestCase):
