@@ -9,7 +9,7 @@ cron: 8 8 * * *
 支持站点：
   - 可萌中转站      (api456.me, New API)               Bearer Token
   - 哈基米 API 站   (api.gemai.cc, New API)            New-Api-User Header
-  - DZZI.AI 大肘子API (api.dzzi.ai, New API)            Bearer Token
+  - DZZI.AI 大肘子API (api.dzzi.ai, New API)            Bearer Token（登录含算术图形验证码）
   - 自定义任意 API 站                                    通过 QZD_CUSTOM JSON 配置
 
 环境变量：
@@ -21,6 +21,11 @@ cron: 8 8 * * *
   QZD_NOTIFY_ONLY_FAIL  true/false  默认 false，true 时仅在有失败时推送
   QZD_TIMEOUT   秒          默认 30，HTTP 请求超时
   QZD_PROXY     代理地址    默认空，如 http://172.17.0.1:7890
+  QZD_VLM       视觉模型配置，格式 base_url#api_key#model（DZZI 图形验证码必填）
+  QZD_VLM_TIMEOUT   秒          默认 90，视觉模型请求超时（思考型模型会更慢）
+  QZD_VLM_MAX_TOKENS 默认 3000，视觉模型最大输出（思考型模型给小了会只思考不回答）
+  QZD_VLM_PROXY     代理地址    默认空，仅视觉模型请求使用
+  QZD_CAPTCHA_ATTEMPTS  默认 3，图形验证码最多重试次数
 
 作者: zephyr_xiao（基于源项目改写）
 """
@@ -34,6 +39,7 @@ import time
 import traceback
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import urlencode
 
 # 强制 stdout 使用 UTF-8，避免 Windows GBK 控制台无法输出 emoji
 # （青龙容器为 Linux + UTF-8，无副作用）
@@ -154,7 +160,27 @@ SITE_PRESETS = {
             "login_method": "POST",
             "login_body_template": '{"username": "{{username}}", "password": "{{password}}"}',
             "login_content_type": "application/json",
+            # 站点开启了 login_captcha（算术图形验证码）：登录必须带 captcha_id + 答案，
+            # 答案由视觉模型读图得出（见下方 visual captcha 一节）
+            "captcha_config": {
+                "url": "https://api.dzzi.ai/api/captcha",
+                "id_field": "data.captcha_id",
+                "image_field": "data.image",
+                # turnstile 站点未启用但要求该键存在，空值也要保留在 query 里
+                "login_query": {
+                    "turnstile": "",
+                    "captcha_id": "{{captcha_id}}",
+                    "captcha": "{{captcha}}",
+                },
+                "error_codes": ["CAPTCHA_INVALID", "CAPTCHA_REQUIRED"],
+            },
+            # 会话 Cookie 换新 access_token 的接口，不需要验证码；用于减少验证码触发次数
+            "refresh_url": "https://api.dzzi.ai/api/user/auth/refresh",
+            "session_sid_path": "data.session.sid",
+            "token_type_path": "data.token_type",
             "token_path": "data.access_token",
+            "token_path_fallback": ["access_token", "data.token"],
+            "token_expires_path": "data.access_expires_at",
             "signin_url": "https://api.dzzi.ai/api/user/checkin",
             "signin_method": "POST",
             "signin_body": "{}",
@@ -313,17 +339,29 @@ def _cache_is_valid(cached: dict) -> bool:
 
 def _build_cache_payload(session, config: dict, token: str, login_data) -> dict:
     """
-    构造三合一缓存内容：token + 会话 Cookie 快照 + 可选过期时间。
+    构造缓存内容：token + 会话 Cookie 快照 + 可选过期时间 / 会话 sid / token 类型。
 
     session Cookie 对 New API 传统版（gemai）是必需凭证，
-    只存 token 的旧格式会导致缓存命中后仍要重新登录。
+    只存 token 的旧格式会导致缓存命中后仍要重新登录；
+    session_sid 用于之后调 refresh 接口时带 X-Auth-Session 头（带验证码的站点靠它免验证码续期）。
     """
     payload = {"token": token, "cookies": _snapshot_cookies(session)}
-    expires_path = (config.get("token_expires_path") or "").strip()
-    if expires_path and isinstance(login_data, dict):
-        expires_at = _extract_field(login_data, expires_path)
-        if isinstance(expires_at, (int, float)):
-            payload["expires_at"] = int(expires_at)
+    if isinstance(login_data, dict):
+        expires_path = (config.get("token_expires_path") or "").strip()
+        if expires_path:
+            expires_at = _extract_field(login_data, expires_path)
+            if isinstance(expires_at, (int, float)):
+                payload["expires_at"] = int(expires_at)
+        sid_path = (config.get("session_sid_path") or "").strip()
+        if sid_path:
+            sid = _extract_field(login_data, sid_path)
+            if sid:
+                payload["session_sid"] = str(sid)
+        type_path = (config.get("token_type_path") or "").strip()
+        if type_path:
+            token_type = _extract_field(login_data, type_path)
+            if token_type:
+                payload["token_type"] = str(token_type)
     return payload
 
 
@@ -485,11 +523,29 @@ def execute_signin(site_key: str, api_config: dict, username: str, password: str
             _restore_cookies(session, cached.get("cookies"))
             print(f"  🍪 命中缓存凭证，跳过登录")
         else:
-            ok, login_token, err, login_data = _do_login(session, config, username, password)
-            if not ok:
-                return {"success": False, "error": err}
-            token = login_token
-            save_token_cache(cache_path, _build_cache_payload(session, config, token, login_data))
+            refreshed = False
+            # 先试会话刷新：带验证码的站点（DZZI）靠它避免每次都过验证码
+            if cached.get("cookies") and (config.get("refresh_url") or "").strip():
+                _restore_cookies(session, cached.get("cookies"))
+                new_token, expires_at, refresh_err = _try_refresh_token(session, config, cached)
+                if new_token:
+                    token = new_token
+                    refreshed = True
+                    payload = dict(cached)
+                    payload["token"] = new_token
+                    payload["cookies"] = _snapshot_cookies(session)
+                    if expires_at:
+                        payload["expires_at"] = int(expires_at)
+                    save_token_cache(cache_path, payload)
+                    print("  🔄 已用会话刷新 token，跳过登录")
+                else:
+                    print(f"  ↪ 会话刷新不可用，改为完整登录: {refresh_err}")
+            if not refreshed:
+                ok, login_token, err, login_data = _do_login(session, config, username, password)
+                if not ok:
+                    return {"success": False, "error": err}
+                token = login_token
+                save_token_cache(cache_path, _build_cache_payload(session, config, token, login_data))
 
     # =============== Step 1.5: 签到前余额（用于计算今日签到奖励） ===============
     quota_before = _fetch_quota(session, config, token, username)
@@ -523,8 +579,337 @@ def execute_signin(site_key: str, api_config: dict, username: str, password: str
 
 
 def _do_login(session, config, username, password):
-    """登录并提取 token，返回 (ok, token, error, login_data)。login_data 供调用方提取过期时间等字段。"""
-    login_url = config.get("login_url", "").strip()
+    """登录并提取 token，返回 (ok, token, error, login_data)。
+
+    站点配置了 captcha_config（如 DZZI 的算术图形验证码）时改走验证码分支，
+    其余站点逻辑完全不变，调用方无需感知。
+    """
+    if (config.get("captcha_config") or {}) and (config.get("login_url") or "").strip():
+        return _do_login_with_captcha(session, config, username, password)
+    return _post_login(session, config, username, password)
+
+
+# ====================== 图形验证码（视觉模型识别） ======================
+
+CAPTCHA_PROMPT = (
+    "这是一张算术验证码图片，内容是两位数以内的四则运算，形如 a+b=?、a-b=?、a×b=?、a÷b=?。"
+    "请仔细识别图中的算式并算出结果，只输出 JSON，不要输出解释或代码块标记："
+    '{"expression": "11-3", "answer": 8}'
+)
+
+
+def _parse_vlm_env(raw: str):
+    """解析 QZD_VLM：base_url#api_key#model，返回 (settings, error)。"""
+    parts = [part.strip() for part in (raw or "").split("#")]
+    if len(parts) != 3 or not all(parts):
+        return None, "QZD_VLM 格式应为 base_url#api_key#model（三段都不能为空）"
+    return {"base_url": parts[0], "api_key": parts[1], "model": parts[2]}, ""
+
+
+def _vlm_settings():
+    """读取视觉模型配置，返回 (settings, error)。缺配置或格式不对都明确报错，不猜默认值。"""
+    raw = (os.environ.get("QZD_VLM") or "").strip()
+    if not raw:
+        return None, "未配置 QZD_VLM（格式：base_url#api_key#model），无法识别图形验证码"
+    settings, err = _parse_vlm_env(raw)
+    if not settings:
+        return None, err
+    settings["timeout"] = env_int("QZD_VLM_TIMEOUT", 90)
+    # 思考型视觉模型会先把 token 花在思考过程上，max_tokens 太小会导致 content 为空
+    settings["max_tokens"] = max(64, env_int("QZD_VLM_MAX_TOKENS", 3000))
+    settings["proxy"] = (os.environ.get("QZD_VLM_PROXY") or "").strip()
+    return settings, ""
+
+
+def _eval_arith(expression: str):
+    """把 a+b / a-b / a×b / a÷b 算出整数结果；表达式非法或除不尽返回 None。"""
+    if not isinstance(expression, str):
+        return None
+    text = (
+        expression.replace(" ", "")
+        .replace("−", "-")
+        .replace("x", "×")
+        .replace("X", "×")
+        .replace("*", "×")
+        .replace("/", "÷")
+    )
+    match = re.fullmatch(r"(\d{1,3})([+\-×÷])(\d{1,3})", text)
+    if not match:
+        return None
+    left, op, right = int(match.group(1)), match.group(2), int(match.group(3))
+    if op == "+":
+        return left + right
+    if op == "-":
+        return left - right
+    if op == "×":
+        return left * right
+    if right == 0 or left % right != 0:
+        return None
+    return left // right
+
+
+def _parse_captcha_answer(content: str):
+    """从模型回复里解析 (answer, expression, error)，并用本地复算兜住模型的算术失误。"""
+    text = (content or "").strip()
+    if not text:
+        return None, "", "视觉模型返回空内容"
+    fenced = re.search(r"```(?:json)?\s*(.+?)\s*```", text, re.S)
+    if fenced:
+        text = fenced.group(1).strip()
+
+    data = None
+    object_match = re.search(r"\{.*\}", text, re.S)
+    if object_match:
+        try:
+            data = json.loads(object_match.group(0))
+        except Exception:
+            data = None
+
+    expression = ""
+    raw_answer = text
+    if isinstance(data, dict):
+        expression = str(data.get("expression") or "").strip()
+        raw_answer = data.get("answer", data.get("result", ""))
+
+    try:
+        answer = int(float(str(raw_answer).strip()))
+    except Exception:
+        answer = None
+
+    computed = _eval_arith(expression) if expression else None
+    if computed is not None:
+        # 模型看对了但算错了这种情况，复算能兜住，所以以复算值为准
+        if answer is not None and answer != computed:
+            print(f"  ⚠️ 视觉模型答案 {answer} 与算式 {expression}={computed} 不一致，采用复算值")
+        return computed, expression, ""
+    if answer is not None:
+        return answer, expression, ""
+    if not isinstance(data, dict):
+        # 模型没按 JSON 回，但回复里带了完整算式（如 "11-3=8"）时也能算出来
+        expr_match = re.search(r"\d{1,3}\s*[+\-×÷xX*/]\s*\d{1,3}", text)
+        if expr_match:
+            fallback_expr = expr_match.group(0).replace(" ", "")
+            fallback_value = _eval_arith(fallback_expr)
+            if fallback_value is not None:
+                return fallback_value, fallback_expr, ""
+    return None, expression, f"无法从模型回复解析答案: {text[:120]}"
+
+
+def _solve_captcha_with_vlm(image_data_uri: str):
+    """调用视觉模型读图，返回 (answer, expression, error)。"""
+    settings, err = _vlm_settings()
+    if not settings:
+        return None, "", err
+
+    url = settings["base_url"].rstrip("/") + "/chat/completions"
+    payload = {
+        "model": settings["model"],
+        "temperature": 0,
+        "max_tokens": settings["max_tokens"],
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": CAPTCHA_PROMPT},
+                    {"type": "image_url", "image_url": {"url": image_data_uri}},
+                ],
+            }
+        ],
+    }
+    headers = {
+        "Authorization": f"Bearer {settings['api_key']}",
+        "Content-Type": "application/json",
+        "User-Agent": DEFAULT_UA,
+    }
+    proxies = None
+    if settings["proxy"]:
+        proxies = {"http": settings["proxy"], "https": settings["proxy"]}
+
+    # 视觉模型多为内网地址，不能用站点那套 trust_env=False + QZD_PROXY 的会话，
+    # 否则 QZD_PROXY 会被误用到内网请求上
+    session = requests.Session()
+    session.trust_env = False
+    session.verify = True
+    try:
+        if proxies:
+            resp = session.post(url, json=payload, headers=headers,
+                                timeout=settings["timeout"], proxies=proxies)
+        else:
+            resp = session.post(url, json=payload, headers=headers, timeout=settings["timeout"])
+    except requests.Timeout:
+        return None, "", "视觉模型接口超时"
+    except requests.ConnectionError:
+        return None, "", "视觉模型接口连接失败"
+    except Exception as e:
+        return None, "", f"视觉模型请求异常: {str(e)[:200]}"
+    finally:
+        try:
+            session.close()
+        except Exception:
+            pass
+
+    if resp.status_code != 200:
+        return None, "", f"视觉模型返回 HTTP {resp.status_code}: {(resp.text or '')[:200]}"
+    try:
+        message = resp.json()["choices"][0]["message"]
+    except Exception:
+        return None, "", f"视觉模型响应结构异常: {(resp.text or '')[:200]}"
+
+    content = message.get("content")
+    if isinstance(content, list):  # 少数网关把 content 返回成分段数组
+        content = "".join(
+            part.get("text", "") for part in content if isinstance(part, dict)
+        )
+    content = (content or "").strip()
+    if content:
+        return _parse_captcha_answer(content)
+
+    # 思考型模型（如 nemotron-vl）可能把内容全放在 reasoning_content 里
+    reasoning = str(message.get("reasoning_content") or message.get("reasoning") or "").strip()
+    if reasoning:
+        answer, expression, _ = _parse_captcha_answer(reasoning)
+        if answer is not None:
+            print("  ⚠️ 视觉模型只返回了思考内容，已从思考过程里解析答案")
+            return answer, expression, ""
+
+    return None, "", (
+        f"视觉模型返回空内容（当前 max_tokens={settings['max_tokens']}，"
+        "思考型模型被截断时就是这样，可用 QZD_VLM_MAX_TOKENS 调大）"
+    )
+
+
+def _fetch_captcha(session, captcha_config: dict):
+    """拉取图形验证码，返回 (captcha_id, image_data_uri, error)。"""
+    url = (captcha_config.get("url") or "").strip()
+    if not url:
+        return "", "", "验证码配置缺少 url"
+    try:
+        resp = session.get(url, timeout=DEFAULT_TIMEOUT)
+    except requests.Timeout:
+        return "", "", "验证码接口超时"
+    except requests.ConnectionError:
+        return "", "", "验证码接口连接失败"
+    except Exception as e:
+        return "", "", f"验证码请求异常: {str(e)[:200]}"
+    if resp.status_code != 200:
+        return "", "", f"验证码接口返回 HTTP {resp.status_code}: {(resp.text or '')[:200]}"
+    try:
+        data = resp.json()
+    except Exception:
+        return "", "", "验证码接口返回非 JSON"
+
+    captcha_id = _extract_field(data, captcha_config.get("id_field") or "data.captcha_id")
+    image = _extract_field(data, captcha_config.get("image_field") or "data.image")
+    if not captcha_id or not image:
+        return "", "", f"验证码响应缺少 id 或图片: {(resp.text or '')[:200]}"
+    image = str(image)
+    if not image.startswith("data:"):
+        image = "data:image/png;base64," + image
+    return str(captcha_id), image, ""
+
+
+def _build_captcha_login_url(login_url: str, captcha_config: dict, captcha_id: str, captcha) -> str:
+    """把验证码参数拼到登录 URL 的 query 上；空值参数（如 turnstile=）也要保留。"""
+    query = captcha_config.get("login_query") or {}
+    if not isinstance(query, dict) or not query:
+        return login_url
+    variables = {"captcha_id": captcha_id, "captcha": captcha}
+    pairs = [(key, _apply_template(str(value), variables)) for key, value in query.items()]
+    joiner = "&" if "?" in login_url else "?"
+    return f"{login_url}{joiner}{urlencode(pairs)}"
+
+
+def _is_captcha_error(resp_data, captcha_config: dict) -> bool:
+    """判断登录响应是否为“验证码错误/缺失”，这类错误应换图重试而不是直接判死。"""
+    if not isinstance(resp_data, dict):
+        return False
+    codes = set(captcha_config.get("error_codes") or [])
+    code = str(resp_data.get("code") or resp_data.get("error_code") or "")
+    if code and code in codes:
+        return True
+    message = str(resp_data.get("message") or resp_data.get("message_key") or "").lower()
+    return "captcha" in message
+
+
+def _do_login_with_captcha(session, config, username, password):
+    """带图形验证码的登录：取图 -> 视觉模型算答案 -> 提交，验证码错误则换图重试。"""
+    captcha_config = config.get("captcha_config") or {}
+    attempts = max(1, env_int("QZD_CAPTCHA_ATTEMPTS", 3))
+    last_error = ""
+    for attempt in range(1, attempts + 1):
+        captcha_id, image_uri, err = _fetch_captcha(session, captcha_config)
+        if err:
+            last_error = err
+            print(f"  ⚠️ 拉取验证码失败 ({attempt}/{attempts}): {err}")
+            continue
+
+        answer, expression, err = _solve_captcha_with_vlm(image_uri)
+        if answer is None:
+            last_error = err or "视觉模型未能给出答案"
+            print(f"  ⚠️ 识别验证码失败 ({attempt}/{attempts}): {last_error}")
+            continue
+        print(f"  🧮 验证码识别: {expression or '?'} = {answer}")
+
+        login_url = _build_captcha_login_url(
+            (config.get("login_url") or "").strip(), captcha_config, captcha_id, answer
+        )
+        ok, token, err, login_data = _post_login(session, config, username, password, login_url=login_url)
+        if ok:
+            return True, token, "", login_data
+        if _is_captcha_error(login_data, captcha_config):
+            last_error = "站点判定答案不正确"
+            print(f"  🔁 验证码未通过，换一张重试 ({attempt}/{attempts})")
+            continue
+        return False, "", err, login_data
+
+    if last_error == "站点判定答案不正确":
+        return False, "", f"图形验证码未通过（已重试 {attempts} 次）", {}
+    return False, "", last_error or f"图形验证码登录失败（已重试 {attempts} 次）", {}
+
+
+def _try_refresh_token(session, config, cached: dict):
+    """用缓存的会话 Cookie 换新 access_token（该接口不需要验证码）。返回 (token, expires_at, error)。"""
+    refresh_url = (config.get("refresh_url") or "").strip()
+    if not refresh_url:
+        return "", None, "未配置 refresh_url"
+    headers = {"Content-Type": "application/json", "User-Agent": DEFAULT_UA}
+    sid = cached.get("session_sid")
+    if sid:
+        headers["X-Auth-Session"] = str(sid)
+    try:
+        resp = session.post(refresh_url, headers=headers, timeout=DEFAULT_TIMEOUT)
+    except requests.Timeout:
+        return "", None, "刷新 token 超时"
+    except requests.ConnectionError:
+        return "", None, "刷新 token 连接失败"
+    except Exception as e:
+        return "", None, f"刷新 token 异常: {str(e)[:200]}"
+    if resp.status_code != 200:
+        return "", None, f"刷新 token 返回 HTTP {resp.status_code}"
+    try:
+        data = resp.json()
+    except Exception:
+        return "", None, "刷新 token 返回非 JSON"
+    if isinstance(data, dict) and data.get("success") is False:
+        return "", None, f"刷新 token 被拒绝: {str(data.get('message') or data)[:150]}"
+
+    # 该接口的返回可能是 {"access_token":...} 直接铺在顶层，也可能包一层 data
+    token = _extract_field(data, config.get("token_path") or "data.access_token") \
+        or _extract_field(data, "access_token") \
+        or _extract_field(data, "data.token")
+    if not token:
+        return "", None, "刷新响应缺少 access_token"
+    expires = _extract_field(data, config.get("token_expires_path") or "data.access_expires_at")
+    if not isinstance(expires, (int, float)):
+        expires = _extract_field(data, "access_expires_at")
+    if not isinstance(expires, (int, float)):
+        expires = None
+    return str(token), expires, ""
+
+
+def _post_login(session, config, username, password, login_url=None):
+    """真正发起登录请求并解析 token；login_url 可被调用方覆盖（用于附加验证码参数）。"""
+    login_url = (login_url if login_url is not None else config.get("login_url", "")).strip()
     login_method = (config.get("login_method") or "POST").upper()
     login_body_template = config.get("login_body") or config.get("login_body_template", "{}")
     content_type = config.get("login_content_type", "application/json")
@@ -572,6 +957,9 @@ def _do_login(session, config, username, password):
     if isinstance(login_data, dict) and login_data.get("success") is False:
         biz_msg = str(login_data.get("message") or "")[:200]
         if biz_msg:
+            # 验证码错误必须排在密码错误之前：站点文案里也含 "incorrect"，否则会被误判成密码错
+            if _is_captcha_error(login_data, config.get("captcha_config") or {}):
+                return False, "", f"图形验证码未通过: {biz_msg}", login_data
             if "password" in biz_msg.lower() or "密码" in biz_msg or "incorrect" in biz_msg.lower():
                 return False, "", f"密码错误或账号被禁: {biz_msg}", login_data
             return False, "", f"登录失败: {biz_msg}", login_data
