@@ -30,6 +30,7 @@
 | [百度网盘签到](baiduwangpan_checkin/README.md) | 网页端成长值 + App 金币任务中心 | `task baiduwangpan_checkin/baiduwangpan_checkin.py` |
 | [夸克网盘签到](quark_checkin/README.md) | 移动端签名参数签到领空间 | `task quark_checkin/quark_checkin.py` |
 | [MiniMax Code 签到](minimax_checkin/README.md) | 每日 400 积分，自带 OAuth device flow | `task minimax_checkin/minimax_checkin.py` |
+| [Breeze 积分签到](breeze_checkin/README.md) | BreezeBlue 每日免费积分，多账号 Cookie | `task breeze_checkin/breeze_checkin.py` |
 
 ## 使用方式
 
@@ -67,3 +68,4 @@
 | 百度网盘签到 | [awakaze/cf-netdisk-signin](https://github.com/awakaze/cf-netdisk-signin) + [jujiunofly/baidu-signin](https://github.com/jujiunofly/baidu-signin) |
 | 夸克网盘签到 | [Liu8Can/Quark_Auto_Check_In](https://github.com/Liu8Can/Quark_Auto_Check_In) + [PLA888/kuake_qiandao](https://github.com/PLA888/kuake_qiandao) |
 | MiniMax Code 签到 | [Minatoxiaohu/agent-auto-signin](https://github.com/Minatoxiaohu/agent-auto-signin) |
+| Breeze 积分签到 | [mi-tuan/dsh-breeze-claim](https://github.com/mi-tuan/dsh-breeze-claim) |
