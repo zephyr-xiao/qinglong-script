@@ -1,46 +1,43 @@
 # whos.tv 签到
 
-适配青龙面板的 whos.tv 签到脚本，支持 **Cookie** 和 **账号密码** 两种认证方式。
+青龙面板的 whos.tv 每日签到脚本，支持 Cookie 与账号密码两种认证。站点启用了 Cloudflare Managed Challenge：纯 HTTP 库伪造 UA/Cookie/TLS 指纹仍会被 403，headless 也被拦，因此脚本用 Patchright（未检测版 Playwright）驱动有头 chromium 通过挑战，再在浏览器会话内调用接口（接口自动探测，支持「已签到」幂等识别）。
 
-> ⚠️ **浏览器方案说明**：whos.tv 已启用 Cloudflare Managed Challenge 人机验证，
-> 纯 HTTP 库（`requests` / `curl_cffi`）即使伪造 UA、Cookie、TLS 指纹也会被
-> 403 挑战页拦截（已实测）。因此脚本改为 **Patchright（未检测版 Playwright）
-> 驱动真实浏览器内核**——无 `Runtime.enable` 等 CDP 自动化痕迹，可通过托管挑战；
-> 原版 Playwright 会被识别。自动通过挑战后，再在浏览器会话内调用接口。
-> 这是目前唯一可行的方案。
+## 青龙任务命令
 
-站点：`https://whos.tv/`
+```text
+xvfb-run -a task whos_tv_checkin/whos_tv_checkin.py
+```
 
-签到页：`https://whos.tv/points-center/tasks`
+定时建议 `15 8 * * *`。必须带 `xvfb-run -a`：容器没有显示器，headless 实测被 Cloudflare 拦截，只有 xvfb 虚拟显示 + 有头模式能过挑战。
 
-## 功能特点
+## 环境变量
 
-- 支持 **Cookie 认证**（直接复制 Cookie 字符串）；
-- 支持 **账号密码认证**（自动登录获取 Cookie，无需手动维护）；
-- 两种方式可同时使用；
-- 支持多账号，使用 `&` 或换行分隔；
-- 支持代理，适合大陆网络访问受限场景；
-- 自动通过 Cloudflare 人机验证挑战，可区分「挑战中」与「硬拦截」；
-- 挑战中途失效时自动补过一轮挑战并重试该账号；
-- 运行锁防止同一端口并发执行互相劫持浏览器；
-- 自动探测签到接口；
-- 支持"已签到"幂等识别；
-- 支持青龙 `notify.py` 推送；
-- Debug 模式可输出探测路径、状态码和响应片段（响应体中的令牌会自动打码）。
+| 变量 | 必填 | 默认 | 说明 |
+|---|---|---|---|
+| `WHOSTV_COOKIE` | 二选一 | - | 完整 Cookie 字符串，多账号用 `&` 或换行分隔；串里的 `cf_clearance` / `__cf*` 会被自动忽略 |
+| `WHOSTV_ACCOUNT` | 二选一 | - | 账号密码，格式 `用户名#密码`，多账号用 `&` 或换行分隔 |
+| `WHOSTV_PROXY` | 建议 | - | HTTP/SOCKS 代理，支持 `http://`、`socks5://`、`socks5h://` 与 `http://user:pass@host:port`；留空回退青龙全局代理（`HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY`） |
+| `WHOSTV_BROWSER_PATH` | 否 | 自动探测 | 指定 chromium 可执行文件路径 |
+| `WHOSTV_NOTIFY` | 否 | `true` | 是否调用青龙 `notify.py` 推送 |
+| `WHOSTV_NOTIFY_ONLY_FAIL` | 否 | `false` | 仅当存在失败时才推送（需 `WHOSTV_NOTIFY=true`，全部成功则静默） |
+| `WHOSTV_TIMEOUT` | 否 | `30` | 接口请求超时（秒，最小 `1`，更小值回退默认） |
+| `WHOSTV_BROWSER_WAIT` | 否 | `180` | 等待 chromium 就绪的最大秒数（同时是 Patchright 启动超时，最小 `10`） |
+| `WHOSTV_BROWSER_PORT` | 否 | `9222` | 浏览器调试端口；端口决定 profile 目录与运行锁，被占用就换一个 |
+| `WHOSTV_CHALLENGE_ROUNDS` | 否 | `4` | Cloudflare 挑战总轮数（最小 `1`）；轮数越多低信誉出口 IP 抽中放行概率越高、最坏耗时越长 |
+| `WHOSTV_DEBUG` | 否 | `false` | 输出探测路径、状态码与响应片段（响应体中的令牌自动打码） |
 
-## 环境要求
+`WHOSTV_COOKIE` 与 `WHOSTV_ACCOUNT` 至少配一个；两者都配时 Cookie 账号先执行、账号密码账号后执行，可混用：
 
-| 依赖 | 说明 |
-|---|---|
-| Python 包 | `patchright`（青龙「依赖管理」-「Python」中安装） |
-| 系统 | `chromium` + `xvfb`（青龙容器内执行下面的安装命令） |
+```text
+WHOSTV_COOKIE=cookie1&cookie2
+WHOSTV_ACCOUNT=user3@example.com#password3
+```
 
-> 脚本用 Patchright 的 `launch_persistent_context` 有头启动 chromium（启动超时上限
-> `WHOSTV_BROWSER_WAIT` 秒，失败时自动输出浏览器 stderr 摘要定位原因）；容器必需参数
-> （`--no-sandbox`、`--disable-dev-shm-usage` 等）已在 Patchright 默认参数表中，无需手动配置。
-> 若端口已有上次异常退出遗留的浏览器实例，脚本会走 CDP 接管复用，省一次冷启动。
+网络级失败（超时 / 代理断连，拿不到任何 HTTP 响应）会自动重发最多 2 次、间隔 3 秒；首跳导航被断/重置也会重试 2 次（间隔 5 秒），但导航自身超时不重试。
 
-青龙容器内安装命令：
+多账号共用同一浏览器实例；切换账号时会清空业务 Cookie 但保留 `cf_clearance`（与浏览器指纹绑定，清掉会重新触发挑战）。
+
+## 依赖安装
 
 ```bash
 docker exec -it qinglong bash
@@ -48,307 +45,50 @@ apt-get update && apt-get install -y chromium xvfb
 pip install patchright
 ```
 
-> `chromium` 包会自动带齐浏览器运行所需的系统依赖库。
+`chromium` 包会带齐浏览器运行库；`--no-sandbox`、`--disable-dev-shm-usage` 等容器必需参数已在 Patchright 默认参数表中，无需手动配置。同一 `WHOSTV_BROWSER_PORT` 只允许一个实例运行（profile 目录下有运行锁）；上次异常退出留下的残留锁会按「持有进程是否存活」自动接管，无需手工清理。端口已有遗留浏览器实例时脚本会走 CDP 接管复用，省一次冷启动。
 
-## 青龙任务命令
-
-> ⚠️ **必须用 `xvfb-run` 运行**：headless 无头模式实测会被 Cloudflare 拦截，
-> 青龙容器内没有显示器，需要用 xvfb 提供虚拟显示，浏览器以有头模式运行。
-
-```text
-xvfb-run -a task whos_tv_checkin/whos_tv_checkin.py
-```
-
-建议定时：
-
-```text
-15 8 * * *
-```
-
-## 环境变量
-
-| 变量名 | 必填 | 默认值 | 说明 |
-|---|---:|---|---|
-| `WHOSTV_COOKIE` | 二选一 | - | 完整 Cookie 字符串，多账号用 `&` 或换行分隔；串里的 `cf_clearance` / `__cf*` 会被忽略（见下文） |
-| `WHOSTV_ACCOUNT` | 二选一 | - | 账号密码，格式 `用户名#密码`，多账号用 `&` 或换行分隔 |
-| `WHOSTV_PROXY` | 建议 | - | HTTP/SOCKS 代理，国内网络建议配置；留空时自动回退青龙全局代理（`HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY`）。支持 `http://`、`socks5://`、`socks5h://` 与 `http://user:pass@host:port` 写法 |
-| `WHOSTV_BROWSER_PATH` | 否 | 自动探测 | 指定 chromium 可执行文件路径（默认自动查找） |
-| `WHOSTV_NOTIFY` | 否 | `true` | 是否调用青龙 `notify.py` 推送 |
-| `WHOSTV_NOTIFY_ONLY_FAIL` | 否 | `false` | 仅当存在失败时才推送（需 `WHOSTV_NOTIFY=true`，全部成功则静默） |
-| `WHOSTV_TIMEOUT` | 否 | `30` | 接口请求超时时间，单位秒（最小 `1`，更小的值会回退默认） |
-| `WHOSTV_BROWSER_WAIT` | 否 | `180` | 启动 chromium 后等待就绪的最大秒数（受限容器冷启动可能较慢，同时作为 Patchright 启动超时；最小 `10`） |
-| `WHOSTV_BROWSER_PORT` | 否 | `9222` | 浏览器调试端口，被其他进程占用时换一个（profile 目录与运行锁随端口生成） |
-| `WHOSTV_CHALLENGE_ROUNDS` | 否 | `4` | Cloudflare 挑战总轮数（最小 `1`）。轮数越多，低信誉出口 IP 抽中放行的概率越高，但最坏耗时也越长 |
-| `WHOSTV_DEBUG` | 否 | `false` | 输出探测细节（试过哪些路径、状态码、响应片段） |
-
-> **网络级失败自动重试**：请求拿不到任何 HTTP 响应（超时 / 代理抖动断连）时自动重发
-> 最多 2 次（间隔 3 秒）；服务器已有响应（含 403/500）属业务结果不重复请求。
-> 首跳导航（打开站点）遇到连接被断/重置等网络错误同样自动重试 2 次（间隔 5 秒），
-> 但导航自身超时不重试（链路极慢时重发无意义）。
-> 网络失败的具体原因（超时 / Failed to fetch 等）无论是否开启 DEBUG 都会打印，
-> 且已知签到接口网络失败时会直接短路返回，不再白跑十几个候选接口逐个超时。
-
-> `WHOSTV_COOKIE` 和 `WHOSTV_ACCOUNT` 至少配置一个。两者都配时，Cookie 账号先执行，账号密码账号后执行。
-
-代理示例：
-
-```text
-WHOSTV_PROXY=http://172.17.0.1:7890
-```
-
-或：
-
-```text
-WHOSTV_PROXY=socks5://172.17.0.1:7891
-```
-
-## 耗时预期
-
-脚本每次运行都会启动一次真实浏览器并等待 Cloudflare 挑战通过（实测单轮通过约
-5~150 秒，波动很大），所以总耗时随出口 IP 信誉变化明显：
-
-| 情形 | 大致耗时 |
-|---|---|
-| 一轮就通过（常见） | 约 1~4 分钟 |
-| 每多抽一轮 | +3~4 分钟 |
-| 挑战抽到最后一轮才通过 | 约 30 分钟 + 账号处理时间 |
-
-挑战能否通过取决于出口 IP 信誉：同一环境实测放行率约 1/3 且随机，因此脚本用
-「多轮 + 轮间隔刷新」抽签，而不是单轮死等；轮数可用 `WHOSTV_CHALLENGE_ROUNDS` 调。
-若 4 轮全部未通过，脚本会在约 30 分钟后直接失败退出，不会进入账号处理。
-
-## 并发保护
-
-同一 `WHOSTV_BROWSER_PORT`（即同一 profile 目录）同时只允许一个实例运行。脚本会在
-profile 目录下创建运行锁，抢不到锁的实例直接退出并提示，避免两个任务共用同一个
-浏览器、互相 `Browser.close` 造成串号或半途失败。上次异常退出留下的残留锁会被自动
-接管——判定以「持有进程是否还活着」为主（崩溃的实例 pid 已死，下一次运行立刻能接管），
-锁文件时间戳（2 小时）只是 pid 被复用时兜底，不需要手工清理。
-
-## 退出码
-
-- `0`：全部账号成功；
-- `1`：任一账号失败（含部分失败），便于外部监控区分。
-
-> 青龙面板本身不按退出码判定任务成败，这条约定只对自行做监控的场景有意义。
-
-## 认证方式
-
-### 方式一：Cookie 认证
-
-1. 浏览器登录 `https://whos.tv/`；
-2. 打开开发者工具；
-3. 进入 Network / 网络；
-4. 刷新页面或打开任务页；
-5. 找到请求头中的 `Cookie`；
-6. 复制完整 Cookie 字符串到青龙环境变量 `WHOSTV_COOKIE`。
-
-多账号示例：
-
-```text
-WHOSTV_COOKIE=cookie_for_account_1&cookie_for_account_2
-```
-
-> **Cookie 串里的 `cf_clearance` / `__cf*` 会被自动忽略**：这些是 Cloudflare 与浏览器
-> 指纹绑定的会话值，由脚本启动的浏览器自己维护。若把从别处复制的旧值一起写回去，
-> 反而会覆盖掉会话里刚拿到的新鲜值、重新触发挑战。所以直接整段复制即可，不必手工剔除。
-
-### 方式二：账号密码认证
-
-直接配置账号和密码，脚本自动登录后签到，无需手动复制 Cookie。
-
-格式：`用户名#密码`，多账号用 `&` 分隔：
-
-```text
-WHOSTV_ACCOUNT=user1@mail.com#password1&user2@mail.com#password2
-```
-
-> 用户名可以是注册邮箱或用户名（与网页登录框一致，支持"邮箱 / 用户名"输入）。
-> 密码中如果包含 `#` 或 `&` 特殊字符，请确保青龙环境变量保存完整，不要换行截断。
-
-### 混合使用
-
-两种方式可同时配置，例如有 2 个 Cookie 账号 + 1 个账号密码：
-
-```text
-WHOSTV_COOKIE=cookie1&cookie2
-WHOSTV_ACCOUNT=user3@mail.com#password3
-```
-
-## 本地调试
-
-Linux / macOS：
+本地调试（有真实显示器，无需 xvfb，会弹出浏览器窗口）：
 
 ```bash
-export WHOSTV_ACCOUNT="user@mail.com#password"
+export WHOSTV_ACCOUNT="user@example.com#password"
 export WHOSTV_PROXY="http://127.0.0.1:7890"
 export WHOSTV_NOTIFY=false
-export WHOSTV_DEBUG=true
 python whos_tv_checkin.py
 ```
 
-Windows PowerShell：
+Windows 下脚本会依次查找 PATH 与 `C:\Program Files\Google\Chrome\Application\chrome.exe` 等常见路径，特殊安装位置用 `WHOSTV_BROWSER_PATH` 指定；profile 目录用系统临时目录，多端口天然隔离。
 
-```powershell
-$env:WHOSTV_ACCOUNT="user@mail.com#password"
-$env:WHOSTV_PROXY="http://127.0.0.1:7890"
-$env:WHOSTV_NOTIFY="false"
-$env:WHOSTV_DEBUG="true"
-python .\whos_tv_checkin.py
-```
+## 凭证获取
 
-> 本地运行会弹出浏览器窗口，属正常现象（headless 会被 Cloudflare 拦截）。
-
-## 通知
-
-- 青龙环境中自动复用青龙 `notify.py`；
-- 设置 `WHOSTV_NOTIFY=false` 可关闭推送；
-- 标题按成败分档显示：`✅ 全部成功（N/N）` / `⚠️ 部分失败（M/N）` / `❌ 全部失败（0/N）`；
-- 正文为 Markdown 分组格式，顶部带 ⏰ 执行时间、📊 账号统计，结果按「成功 / 失败」分组列出；
-- 设置 `WHOSTV_NOTIFY_ONLY_FAIL=true` 可在本次全部成功时静默不推送（仅在有失败时才通知）；
-- 推送失败会自动重试最多 3 次；
-- 本地运行找不到 `notify.py` 时会跳过推送。
+- Cookie：浏览器登录 `https://whos.tv/` → F12 → Network → 刷新页面或打开任务页 → 复制请求头里的完整 `Cookie` 到 `WHOSTV_COOKIE`。`cf_clearance` / `__cf*` 由脚本浏览器自己维护，直接整段复制即可，不必手工剔除；回填别处复制的旧值反而会覆盖新鲜值、重新触发挑战。
+- 账号密码：填 `用户名#密码`（用户名可填注册邮箱或用户名），脚本自动登录拿 Cookie；密码含 `#` 或 `&` 时确认青龙变量保存完整、没被换行截断。
+- 退出码：`0` = 全部账号成功；`1` = 任一账号失败（含部分失败），便于外部监控。青龙本身不按退出码判定任务成败。
 
 ## 常见问题
 
-### 报错"浏览器启动或挑战失败: Timeout 180000ms exceeded"？
+- **`浏览器启动或挑战失败: Timeout 180000ms exceeded`** → 先确认容器装了 chromium + xvfb、命令带 `xvfb-run -a`；再结合报错里的 stderr 摘要与脚本输出的磁盘/内存/浏览器进程数/代理连通性判断。CPU 受限可把 `WHOSTV_BROWSER_WAIT` 调到 300；代理不可达会打印「代理 ... 不可达」。开 `WHOSTV_DEBUG=true` 重跑会输出完整环境诊断（chromium 路径 / xvfb / DISPLAY / /dev/shm / 磁盘 / 内存 / 进程数 / 代理连通性），据此定位。
+- 也可进容器手动验证 chromium 能否启动：
 
-这是 chromium 启动超时（Patchright 等待 `WHOSTV_BROWSER_WAIT` 秒后放弃，报错自带
-浏览器 stderr 摘要）。请按顺序排查：
-
-1. **确认容器已装 chromium 和 xvfb**（见上文"环境要求"），任务命令带 `xvfb-run -a` 前缀；
-2. **启动超时**：结合报错中的 stderr 摘要，以及脚本输出的**磁盘 / 内存 / 浏览器进程数 /
-   代理连通性**判断。常见原因：
-   - 磁盘满或内存不足（chromium 写 profile / 临时文件卡住）→ 清理容器空间；
-   - 容器 CPU 受限导致冷启动极慢 → 把 `WHOSTV_BROWSER_WAIT` 调大到 300；
-   - 代理不可达（脚本会输出"❌ 代理 ... 不可达"）→ 改用容器内可达的代理地址，如 `http://172.17.0.1:7890`。
-3. 开启 `WHOSTV_DEBUG=true` 重跑，失败时脚本会输出**完整环境诊断**（chromium 路径 /
-   xvfb / DISPLAY / /dev/shm / 磁盘 / 内存 / 进程数 / 代理连通性），据此定位；
-4. 也可进容器手动验证 chromium 能否启动：
-
-```bash
-# 容器内手动试启动 chromium 并 curl 调试端口：
-xvfb-run -a timeout 30 chromium --no-sandbox --disable-dev-shm-usage \
-  --headless=new --remote-debugging-port=9223 about:blank & sleep 8; \
-  curl -s http://127.0.0.1:9223/json/version | head -3; \
+  ```bash
+  xvfb-run -a timeout 30 chromium --no-sandbox --disable-dev-shm-usage \
+    --headless=new --remote-debugging-port=9223 about:blank & sleep 8
+  curl -s http://127.0.0.1:9223/json/version | head -3
   kill %1 2>/dev/null
-```
+  ```
 
-### 报错"登录失败: 响应非 JSON (HTTP 403)"？
+- **`登录失败: 响应非 JSON (HTTP 403)`** → 这不是普通状态码，是 Cloudflare 挑战页。脚本按页面特征识别后会自动补过一轮挑战并重试该账号；仍失败说明出口 IP 已不被 CF 接受，需要换代理节点。
+- **`响应非 JSON (HTTP 0)` / `登录网络异常`** → 根本没拿到服务器响应：`__TIMEOUT__` 是代理链路太慢或不通，`__NETWORK__|Failed to fetch` 是拒连/DNS/代理瞬断；重试耗尽后检查容器到 `WHOSTV_PROXY` 的连通性。
+- **`Cloudflare 挑战在 N 轮内均未通过`** → 默认 180 秒 × 4 轮，约 30 分钟后直接失败退出、不进入账号处理；换低风险出口 IP 或调大 `WHOSTV_CHALLENGE_ROUNDS`。
+- **`出口 IP 被 Cloudflare 硬拦截（Access denied / Error 1020）`** → 与「挑战未通过」不同，CF 直接拒绝该 IP，重试无用，只能换节点；脚本识别到这类页面会立即失败退出、不再空耗轮数。
+- **签到中途提示「被 Cloudflare 拦截（挑战已失效）」** → 多账号连续执行时 `cf_clearance` 可能中途过期，脚本自动补过一轮挑战并重试该账号；仍失败就换代理节点重跑。
+- **Cookie 失效** → Cookie 模式重新登录抓完整 Cookie；账密模式的 Cookie 由脚本获取，一般不会遇到，若出现多为账密错误或封禁。
+- **请求超时 / 连接失败** → whos.tv 在大陆网络通常需要代理，确认 `WHOSTV_PROXY` 或青龙全局代理在容器内可访问（Docker 青龙常用 `http://172.17.0.1:7890`）。
+- 耗时预期：每次运行都会启动一次真实浏览器并等待挑战通过，单轮实测 5~150 秒波动很大，总耗时随出口 IP 信誉变化：
 
-这是 Cloudflare 人机验证拦截了请求。请确认：
+  | 情形 | 大致耗时 |
+  |---|---|
+  | 一轮就通过（常见） | 约 1~4 分钟 |
+  | 每多抽一轮 | +3~4 分钟 |
+  | 抽到最后一轮才通过 | 约 30 分钟 + 账号处理时间 |
 
-- 青龙容器已安装 `chromium` 和 `xvfb`（见上文"环境要求"）；
-- 任务命令使用 `xvfb-run -a` 前缀（headless 无头模式会被拦截）；
-- `WHOSTV_PROXY` 配置正确，代理出口 IP 信誉正常。
-
-> 脚本能识别出"这是 CF 页而不是站点响应"，会自动补过一轮挑战再重试该账号；
-> 若重试后仍报同样的错，说明出口 IP 已不被 CF 接受，需要换代理节点。
-
-### 报错"响应非 JSON (HTTP 0)"或"登录网络异常"？
-
-HTTP 0 表示请求根本没拿到服务器响应（不是站点拒绝），脚本会打印具体原因并自动重试：
-
-- **`__TIMEOUT__|30s 内未收到响应`**：代理链路太慢或不通，检查 `WHOSTV_PROXY` 是否可达；
-- **`__NETWORK__|TypeError: Failed to fetch`**：连接被拒 / DNS 解析失败 / 代理瞬断，
-  重试仍失败说明网络持续异常，检查容器到代理的连通性；
-- 若日志出现"网络异常无法完成签到……请检查代理 WHOSTV_PROXY 与容器网络"，
-  说明已知接口和候选探测都拿不到响应，优先恢复代理再跑。
-
-### 报错"ERR_CONNECTION_CLOSED / ERR_CONNECTION_RESET"（启动阶段）？
-
-浏览器首跳打开站点时代理链路瞬时抖动，脚本会自动重试最多 2 次（间隔 5 秒），
-一般无需干预；若重试耗尽仍失败，按上一条的思路检查代理连通性后重跑即可。
-注意"Timeout xxx ms exceeded"形式的导航超时不属于此列（不重试），按启动超时排查。
-
-### 本地 Windows 调试提示
-
-- Chrome 自动探测：脚本会依次查找 PATH 及 `C:\Program Files\Google\Chrome\Application\chrome.exe`
-  等 Windows 常见安装路径，一般无需手动设置；特殊安装位置可用
-  `WHOSTV_BROWSER_PATH` 指定；
-- 无需 xvfb（有真实显示），直接 `python whos_tv_checkin.py` 即可，浏览器会弹窗；
-- profile 目录用系统临时目录（`%TEMP%\whostv_profile\<端口>`），多端口天然隔离；
-  若启动报错提示已有实例占用，换一个 `WHOSTV_BROWSER_PORT` 即可。
-
-### 报错"Cloudflare 挑战在 N 轮内均未通过"？
-
-脚本会等待挑战最长 180 秒 × `WHOSTV_CHALLENGE_ROUNDS` 轮（默认 4 轮）。若仍失败：
-
-- 检查代理是否可用、出口 IP 是否被 Cloudflare 判定为高风险（共享/机房 IP 更容易触发）；
-- 换一个代理节点后重试，或调大 `WHOSTV_CHALLENGE_ROUNDS` 多抽几轮；
-- 可开启 `WHOSTV_DEBUG=true` 观察浏览器启动与挑战状态。
-
-### 报错"出口 IP 被 Cloudflare 硬拦截（Access denied / Error 1020）"？
-
-这和"挑战未通过"不是一回事：CF 直接拒绝了这个出口 IP，重试多少次都没用，只能换代理节点。
-脚本识别到这类页面会立即失败退出，不再空耗轮数。
-
-### 签到中途提示"被 Cloudflare 拦截（挑战已失效）"？
-
-多账号连续执行时 `cf_clearance` 可能中途失效，签到请求拿到的就是 CF 页面而不是业务响应。
-脚本会自动重新过一轮挑战并重试该账号；若仍失败，会提示换代理节点后重跑。
-
-### 请求超时或连接失败？
-
-whos.tv 在大陆网络通常需要代理。脚本按 `WHOSTV_PROXY` → 青龙全局代理（`HTTPS_PROXY` /
-`HTTP_PROXY` / `ALL_PROXY`）的顺序取代理，两者都没有则直连。请确认脚本取到的代理
-在青龙容器内可访问。
-
-Docker 青龙常见代理值：
-
-```text
-http://172.17.0.1:7890
-```
-
-### 提示 Cookie 失效？
-
-- **Cookie 模式**：重新登录 whos.tv，复制新的完整 Cookie 字符串并更新 `WHOSTV_COOKIE`。
-- **账号模式**：Cookie 由脚本自动登录获取，一般不会出现此问题。如果遇到，可能是账号密码错误或被封禁，检查日志中的具体错误信息。
-
-### 账号密码登录失败？
-
-常见原因：
-
-- **密码错误**：日志会明确提示"登录失败: 密码错误"
-- **账号不存在**：检查用户名是否拼写正确
-- **网络不通**：确保代理（`WHOSTV_PROXY` 或青龙全局代理）配置正确且容器内可达
-- **账号被封禁**：日志会提示"账号已被封禁"
-
-### 不知道脚本试了哪些接口？
-
-开启：
-
-```text
-WHOSTV_DEBUG=true
-```
-
-脚本会输出探测路径、状态码和响应片段，便于排查站点接口变化。
-
-### 多账号怎么配置？
-
-两种模式的分隔符一致：`&` 或换行都可以。
-
-Cookie 模式：
-
-```text
-WHOSTV_COOKIE=cookie1&cookie2&cookie3
-```
-
-账号密码模式，每个账号内部用 `#` 分隔用户名和密码：
-
-```text
-WHOSTV_ACCOUNT=user1@mail.com#pass1&user2@mail.com#pass2
-```
-
-> 多账号共用同一浏览器实例，切换账号时会清空业务 Cookie 但保留
-> `cf_clearance`（与浏览器指纹绑定，清掉会重新触发挑战）。
-> 若某个账号签到途中 `cf_clearance` 失效，脚本会自动补过一轮挑战再重试该账号。
-
-### 怎么跑本地测试？
-
-纯函数单测（不启动浏览器、不访问站点）：
-
-```bash
-pip install pytest
-python -m pytest tests -q
-```
+  4 轮全部未通过时脚本约 30 分钟后直接失败退出，不会进入账号处理。挑战能否通过取决于出口 IP 信誉：同一环境实测放行率约 1/3 且随机，所以脚本用「多轮 + 轮间隔刷新」抽签而不是单轮死等，轮数可用 `WHOSTV_CHALLENGE_ROUNDS` 调。
