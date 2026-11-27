@@ -40,6 +40,10 @@ class Config:
         "renew_threshold_days": 3,
         "min_points_reserve": 5000,
         
+        # 签到配置（2026-11 改版：每日签到弹窗需二选一）
+        # point = 500 积分（默认，可提现/抵扣续费）；ticket = 抽奖券 × 1
+        "sign_reward_type": "point",
+
         # 其他配置
         "points_to_cny_rate": 2000,
         "cookie_cache": True,   # 会话 Cookie 落盘复用：命中则跳过登录 + 验证码（默认开启）
@@ -78,6 +82,7 @@ class Config:
             logger.info(f"⚙️  续费天数: {merged_config['renew_days']}天")
             logger.info(f"⚙️  续费阈值: 剩余{merged_config['renew_threshold_days']}天时触发")
             logger.info(f"⚙️  保留积分: {merged_config['min_points_reserve']}分")
+            logger.info(f"⚙️  签到奖励: {merged_config.get('sign_reward_type', 'point')}（point=积分 / ticket=抽奖券）")
             logger.info(f"⚙️  Cookie 缓存: {'✅ 开启' if merged_config.get('cookie_cache', True) else '⛔ 关闭'}")
             logger.info(f"⚙️  反检测脚本路径: {merged_config['stealth_js_path']}")
             

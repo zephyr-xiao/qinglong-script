@@ -432,6 +432,11 @@ export PUSH_PLUS_TOKEN="你的token"
 </tr>
 <tr><td colspan="3"><strong>其他配置</strong></td></tr>
 <tr>
+<td><code>sign_reward_type</code></td>
+<td><code>point</code></td>
+<td>每日签到二选一：<code>point</code>=500 积分（默认，可提现/抵扣续费），<code>ticket</code>=抽奖券 × 1</td>
+</tr>
+<tr>
 <td><code>points_to_cny_rate</code></td>
 <td>2000</td>
 <td>积分兑换比率（2000分=1元）</td>
@@ -465,6 +470,9 @@ export PUSH_PLUS_TOKEN="你的token"
 
 # 保守策略保留1万积分
 {"min_points_reserve":10000}
+
+# 每日签到改领抽奖券（默认领 500 积分）
+{"sign_reward_type":"ticket"}
 ```
 
 ---
@@ -704,6 +712,21 @@ RainYun/
 ---
 
 ## 📝 更新日志
+
+### v2.0.6 (2026-11-27)
+
+<div style="background: #e8f5e9; padding: 15px; border-radius: 8px; border-left: 4px solid #4caf50;">
+
+**🎁 适配雨云新版每日签到（二选一 + CAP 人机验证）**
+
+- 🔴 修复签到失败：新版「每日签到」改为独立卡片，标签后的兄弟节点是奖励说明「积分或抽奖券」；旧脚本把它误读成状态，直接报「当前不可领取」退出
+- 🔴 状态改读卡片内徽标（去签到 / 已完成），并保留旧版「领取奖励」定位方式兼容
+- 🔴 新增二选一弹窗处理：默认领 500 积分，可用 `sign_reward_type=ticket` 改领抽奖券 × 1
+- 🟡 人机验证由腾讯 TCaptcha 换成自研 `cap.rainyun.cn` PoW（浏览器自动完成），签到不再等待 `tcaptcha_iframe_dy`；等待窗口放宽到 90 秒，失败刷新页面最多重试 3 次
+- 🟡 成功判定兜底：弹窗「已领取 / 今日已签到」、卡片徽标「已完成」、积分增加，三者任一即算成功
+- 🟢 新增配置 `sign_reward_type`（默认 `point`）
+
+</div>
 
 ### v2.0.5 (2026-11-14)
 
