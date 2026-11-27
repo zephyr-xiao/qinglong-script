@@ -135,12 +135,48 @@ COOKIE_DIR_NAME = "cookies"   # Cookie 缓存目录（脚本同目录下，青�
 # 赚取积分页顶部「积分」卡片的数值
 POINTS_XPATH = '//*[@id="app"]/div[1]/div[3]/div[2]/div/div/div[2]/div[1]/div[1]/div/p/div/h3'
 
-# 赚取积分页「每日签到」行（行容器 → 标签 → 右侧状态 span）
+# ---------------------------------------------------------------------------
+# 每日签到：2026-11 雨云改版后的新版 UI
+# ---------------------------------------------------------------------------
+# 改版后「每日签到」是独立卡片 button.daily-check-in-task：
+#   <button class="card-header daily-check-in-task">
+#     <span class="h4">每日签到 <span class="badge">去签到/已完成</span></span>
+#     <span class="mr-1 font-weight-bolder">积分或抽奖券</span>   ← 奖励说明，不是状态
+#   </button>
+# 旧脚本用 following-sibling::span[1] 取到的正是「积分或抽奖券」，因此误判失败。
+# 点击卡片会弹出二选一弹窗（500 积分 / 抽奖券 × 1），提交走
+# POST /user/reward/tasks {task_name:"每日签到", reward:"point"|"ticket"}，
+# 人机验证已由腾讯 TCaptcha 换成自研 cap.rainyun.cn 的 PoW（浏览器自动完成）。
+SIGN_TASK_BUTTON_XPATH = "//button[contains(@class,'daily-check-in-task')]"
+SIGN_TASK_BADGE_XPATH = (
+    "//button[contains(@class,'daily-check-in-task')]"
+    "//span[contains(@class,'badge')]"
+)
+SIGN_REWARD_LIST_XPATH = "//div[contains(@class,'daily-check-in__rewards')]"
+SIGN_REWARD_BUTTON_XPATH = "//button[contains(@class,'daily-check-in__reward')]"
+SIGN_REWARD_POINT_XPATH = (
+    SIGN_REWARD_BUTTON_XPATH
+    + "[.//span[contains(@class,'daily-check-in__icon--point')]]"
+)
+SIGN_REWARD_TICKET_XPATH = (
+    SIGN_REWARD_BUTTON_XPATH
+    + "[.//span[contains(@class,'daily-check-in__icon--ticket')]]"
+)
+SIGN_REWARD_TITLE_XPATH = "//h4[contains(@class,'daily-check-in__title')]"
+SIGN_REWARD_STATUS_XPATH = "//p[contains(@class,'daily-check-in__status')]"
+
+# 旧版（改版前）定位方式，保留兼容，站点回滚时仍可签到
 SIGN_ROW_XPATH = '//*[@id="app"]/div[1]/div[3]/div[2]/div/div/div[2]/div[2]/div/div/div/div[1]/div'
 
-# 签到状态文案（来自页面 JS：Status=1/0/2）
-SIGN_STATUS_CLAIM = "领取奖励"
-SIGN_STATUS_DONE = "已完成"
+# 状态文案（页面 JS：Status=1 可领取 / 2 已完成 / 0 未达成）
+SIGN_STATUS_CLAIM = "领取奖励"        # 旧版
+SIGN_STATUS_NEW_CLAIM = "去签到"      # 新版
+SIGN_STATUS_DONE = "已完成"           # 新旧版一致
+SIGN_REWARD_HINT = "积分或抽奖券"      # 新版奖励说明，读到了也不能当状态
+
+# 新版 CAP 人机验证（PoW）耗时较长，给足等待时间
+CAP_SIGN_WAIT_SECONDS = 90
+CAP_SIGN_MAX_RETRY = 3
 
 
 # ---------------------------------------------------------------------------
@@ -578,32 +614,75 @@ def read_points(ctx: RuntimeContext, wait_seconds: float = 5) -> int:
         time.sleep(0.5)
 
 
+def find_optional(ctx: RuntimeContext, xpath: str):
+    """按 XPath 找元素，找不到返回 None（新版 DOM 节点不稳定，不能直接抛异常中断流程）。"""
+    try:
+        return ctx.driver.find_element(By.XPATH, xpath)
+    except Exception:
+        return None
+
+
 def find_sign_status_element(ctx: RuntimeContext):
-    """定位「每日签到」右侧的状态元素（其下含领取奖励链接）。"""
+    """旧版：定位「每日签到」右侧的状态元素（其下含领取奖励链接）。"""
     row = ctx.driver.find_element(By.XPATH, SIGN_ROW_XPATH)
     label = row.find_element(By.XPATH, './/span[contains(text(),"每日签到")]')
     return label.find_element(By.XPATH, './following-sibling::span[1]')
 
 
-def wait_sign_status(ctx: RuntimeContext, timeout: float = 10) -> str:
-    """轮询等待签到状态文本渲染出来；超时返回最后一次读到的值（可能为空）。"""
+def find_sign_state(ctx: RuntimeContext):
+    """识别当前签到状态与页面版本。
+
+    Returns:
+        (state, ui, text)  state: "done" | "claim" | "unknown"
+                           ui: "new" | "legacy" | ""
+    新版状态在卡片内的徽标里；紧跟标签的「积分或抽奖券」只是奖励说明，必须忽略。
+    """
+    # 新版：徽标文本最精确
+    badge = find_optional(ctx, SIGN_TASK_BADGE_XPATH)
+    if badge is not None:
+        text = (badge.text or "").strip()
+        if SIGN_STATUS_DONE in text:
+            return "done", "new", text
+        if SIGN_STATUS_NEW_CLAIM in text:
+            return "claim", "new", text
+
+    # 新版兜底：徽标未单独渲染时读整张卡片
+    button = find_optional(ctx, SIGN_TASK_BUTTON_XPATH)
+    if button is not None:
+        text = (button.text or "").strip()
+        if SIGN_STATUS_DONE in text:
+            return "done", "new", text
+        if SIGN_STATUS_NEW_CLAIM in text:
+            return "claim", "new", text
+
+    # 旧版：右侧状态 span
+    try:
+        text = find_sign_status_element(ctx).text.strip()
+    except Exception:
+        text = ""
+    if text and text != SIGN_REWARD_HINT:
+        if SIGN_STATUS_DONE in text:
+            return "done", "legacy", text
+        if SIGN_STATUS_CLAIM in text:
+            return "claim", "legacy", text
+    return "unknown", "", text
+
+
+def wait_sign_state(ctx: RuntimeContext, timeout: float = 10):
+    """轮询等待签到状态渲染完成，返回 (state, ui, text)。"""
     deadline = time.time() + timeout
-    last_text = ""
+    last = ("unknown", "", "")
     while True:
-        try:
-            text = find_sign_status_element(ctx).text.strip()
-            last_text = text
-            if text:
-                return text
-        except Exception:
-            pass
+        last = find_sign_state(ctx)
+        if last[0] != "unknown":
+            return last
         if time.time() >= deadline:
-            return last_text
+            return last
         time.sleep(0.5)
 
 
 def wait_sign_status_until(ctx: RuntimeContext, target: str, timeout: float = 20) -> str:
-    """轮询等待签到状态变成目标文案；超时返回最后读到的值。"""
+    """旧版：轮询等待签到状态变成目标文案；超时返回最后读到的值。"""
     deadline = time.time() + timeout
     last_text = ""
     while True:
@@ -618,6 +697,157 @@ def wait_sign_status_until(ctx: RuntimeContext, target: str, timeout: float = 20
         if time.time() >= deadline:
             return last_text
         time.sleep(0.5)
+
+
+def wait_new_sign_result(ctx: RuntimeContext, timeout: float = CAP_SIGN_WAIT_SECONDS):
+    """等待新版二选一弹窗的签到结果。
+
+    CAP 人机验证由页面在浏览器里自动完成（PoW + WASM），无需人工/AI 点选，
+    但耗时比腾讯验证码长，所以这里统一轮询弹窗文案和卡片徽标。
+
+    Returns:
+        (ok, detail)
+    """
+    deadline = time.time() + timeout
+    last = ""
+    tick = 0
+    while time.time() < deadline:
+        # 成功：弹窗标题「今日已签到」或状态「已领取 500 积分，明天再来」
+        for xpath in (SIGN_REWARD_TITLE_XPATH, SIGN_REWARD_STATUS_XPATH):
+            el = find_optional(ctx, xpath)
+            if el is None:
+                continue
+            text = (el.text or "").strip()
+            if text:
+                last = text
+            if "今日已签到" in text or "已领取" in text:
+                return True, text
+
+        # 成功：后端状态已刷新，卡片徽标变成「已完成」
+        badge = find_optional(ctx, SIGN_TASK_BADGE_XPATH)
+        if badge is not None and SIGN_STATUS_DONE in (badge.text or ""):
+            return True, "任务状态：已完成"
+
+        # 明确的失败提示（CAP 加载/验证失败），交给上层刷新重试；
+        # 每 3 秒检测一次即可，避免频繁序列化整页 DOM
+        tick += 1
+        if tick % 6 == 0:
+            try:
+                body_text = ctx.driver.find_element(By.TAG_NAME, "body").text or ""
+            except Exception:
+                body_text = ""
+            for err in ("人机验证失败", "验证组件加载失败", "当前浏览器无法完成人机验证"):
+                if err in body_text:
+                    return False, err
+
+        time.sleep(0.5)
+    return False, last or "等待签到结果超时"
+
+
+def do_sign_in_new_ui(ctx: RuntimeContext, reward_type: str) -> bool:
+    """新版签到：打开卡片弹窗 → 选择奖励（积分/抽奖券）→ 等待 CAP 验证与提交结果。"""
+    label = "500 积分" if reward_type == "point" else "抽奖券 × 1"
+    logger.info(f"🎁 签到奖励选择: {label}（sign_reward_type={reward_type}）")
+
+    button = WebDriverWait(ctx.driver, 10).until(
+        EC.element_to_be_clickable((By.XPATH, SIGN_TASK_BUTTON_XPATH))
+    )
+    logger.info("🎯 打开每日签到弹窗")
+    button.click()
+
+    # 已经领取过：弹窗直接显示「今日已签到」，没有奖励按钮
+    time.sleep(1)
+    title = find_optional(ctx, SIGN_REWARD_TITLE_XPATH)
+    if title is not None and "今日已签到" in (title.text or ""):
+        logger.info("📌 今日已签到，无需重复签到")
+        return True
+
+    try:
+        WebDriverWait(ctx.driver, 15).until(
+            EC.presence_of_element_located((By.XPATH, SIGN_REWARD_LIST_XPATH))
+        )
+    except TimeoutException:
+        logger.error("❌ 每日签到弹窗未出现（任务可能未达成条件或页面结构再次变化）")
+        return False
+
+    option_xpath = SIGN_REWARD_TICKET_XPATH if reward_type == "ticket" else SIGN_REWARD_POINT_XPATH
+    for attempt in range(1, CAP_SIGN_MAX_RETRY + 1):
+        if attempt > 1:
+            # CAP 失败会留下错误 toast，直接重点会被残留提示干扰；
+            # 刷新页面还能拿到服务端最新任务状态（可能上一次其实已成功）。
+            logger.info("🔄 刷新签到页后重试...")
+            ctx.driver.get(EARN_URL)
+            time.sleep(2)
+            state, _, _ = wait_sign_state(ctx, 10)
+            if state == "done":
+                logger.info("✅ 任务状态已变为「已完成」，判定签到成功")
+                return True
+            WebDriverWait(ctx.driver, 10).until(
+                EC.element_to_be_clickable((By.XPATH, SIGN_TASK_BUTTON_XPATH))
+            ).click()
+            WebDriverWait(ctx.driver, 15).until(
+                EC.presence_of_element_located((By.XPATH, SIGN_REWARD_LIST_XPATH))
+            )
+
+        option = find_optional(ctx, option_xpath)
+        if option is None:
+            # 二选一区域消失通常意味着已经领取成功
+            ok, detail = wait_new_sign_result(ctx, timeout=5)
+            if ok:
+                logger.info(f"✅ 签到奖励领取成功（{detail}）")
+                return True
+            logger.error("❌ 未找到奖励选项按钮")
+            return False
+        if not option.is_enabled():
+            logger.warning("⚠️ 奖励选项不可点击（任务状态非「可领取」），等待状态刷新...")
+            time.sleep(2)
+            continue
+
+        logger.info(f"🎯 第 {attempt}/{CAP_SIGN_MAX_RETRY} 次领取: {label}")
+        option.click()
+        # CAP 挑战需要先加载 WASM，给页面一点启动时间再开始判定
+        time.sleep(2)
+        ok, detail = wait_new_sign_result(ctx)
+        if ok:
+            logger.info(f"✅ 签到奖励领取成功（{detail}）")
+            return True
+        logger.warning(f"⚠️ 第 {attempt} 次未确认签到结果: {detail}")
+        if attempt < CAP_SIGN_MAX_RETRY:
+            time.sleep(3)
+
+    logger.error("❌ 签到奖励领取失败（已重试 %d 次）", CAP_SIGN_MAX_RETRY)
+    return False
+
+
+def do_sign_in_legacy_ui(ctx: RuntimeContext) -> bool:
+    """旧版签到：点击「领取奖励」链接 → 腾讯点选验证码 → 等待状态变为「已完成」。"""
+    earn_btn = find_sign_status_element(ctx).find_element(By.XPATH, './a')
+    logger.info("🎯 开始领取签到奖励")
+    earn_btn.click()
+
+    time.sleep(2)
+    from captcha import process_captcha
+    try:
+        WebDriverWait(ctx.driver, 8).until(
+            EC.visibility_of_element_located((By.ID, "tcaptcha_iframe_dy"))
+        )
+        ctx.driver.switch_to.frame("tcaptcha_iframe_dy")
+        logger.info("⚠️  触发签到验证码")
+        if not process_captcha(ctx, ctx.config):
+            logger.error("❌ 签到验证码处理失败")
+            return False
+        ctx.driver.switch_to.default_content()
+    except TimeoutException:
+        logger.info("✅ 未触发签到验证码，继续检查签到结果")
+
+    logger.info("⏳ 等待签到结果...")
+    final_status = wait_sign_status_until(ctx, SIGN_STATUS_DONE, 20)
+    logger.info(f"📌 签到后状态: {final_status or '未读取到'}")
+    if final_status == SIGN_STATUS_DONE:
+        logger.info("✅ 签到奖励领取成功")
+        return True
+    logger.error("❌ 未能确认签到结果，本次按失败处理")
+    return False
 
 
 def do_sign_in(ctx: RuntimeContext, result: AccountResult) -> bool:
@@ -642,63 +872,49 @@ def do_sign_in(ctx: RuntimeContext, result: AccountResult) -> bool:
                     f"（约 {page_points / ctx.config['points_to_cny_rate']:.2f} 元）"
                 )
 
-        # 查找签到按钮
-        logger.info("🔍 查找每日签到按钮...")
+        # 查找签到入口（自动识别新版二选一 / 旧版领取奖励）
+        logger.info("🔍 查找每日签到入口...")
         try:
-            status_text = wait_sign_status(ctx, 10)
-            if not status_text:
-                logger.error("❌ 未能读取签到状态（页面可能未加载完成）")
+            state, ui, status_text = wait_sign_state(ctx, 10)
+            ui_tag = {"new": "（新版二选一）", "legacy": "（旧版）"}.get(ui, "")
+            logger.info(f"📌 签到状态: {status_text or '未读取到'}{ui_tag}")
+
+            if state == "unknown":
+                logger.error(
+                    f"❌ 未能识别签到状态（页面可能未加载完成，读到: {status_text or '空'}）"
+                )
                 return False
-
-            logger.info(f"📌 签到状态: {status_text}")
-
-            if status_text == SIGN_STATUS_DONE:
+            if state == "done":
                 logger.info("📌 今日已签到，无需重复签到")
                 return True
-            if status_text != SIGN_STATUS_CLAIM:
-                logger.error(f"❌ 签到状态为「{status_text}」，当前不可领取")
-                return False
 
-            earn_btn = find_sign_status_element(ctx).find_element(By.XPATH, './a')
-            logger.info("🎯 开始领取签到奖励")
-            earn_btn.click()
-
-            # 签到验证码不是每次都会出现：先短等待 iframe 可见，出现才处理
-            time.sleep(2)
-            from captcha import process_captcha
-            try:
-                WebDriverWait(ctx.driver, 8).until(
-                    EC.visibility_of_element_located((By.ID, "tcaptcha_iframe_dy"))
-                )
-                ctx.driver.switch_to.frame("tcaptcha_iframe_dy")
-                logger.info("⚠️  触发签到验证码")
-                if not process_captcha(ctx, ctx.config):
-                    logger.error("❌ 签到验证码处理失败")
-                    return False
-                ctx.driver.switch_to.default_content()
-            except TimeoutException:
-                logger.info("✅ 未触发签到验证码，继续检查签到结果")
-
-            # 只有状态变成「已完成」（或积分增加）才算签到成功，避免假成功上报
-            logger.info("⏳ 等待签到结果...")
-            final_status = wait_sign_status_until(ctx, SIGN_STATUS_DONE, 20)
-            logger.info(f"📌 签到后状态: {final_status or '未读取到'}")
-            if final_status == SIGN_STATUS_DONE:
-                logger.info("✅ 签到奖励领取成功")
+            if ui == "new":
+                reward_type = str(ctx.config.get("sign_reward_type", "point")).strip().lower()
+                if reward_type not in ("point", "ticket"):
+                    logger.warning(f"⚠️  sign_reward_type={reward_type!r} 无效，已回退为 point")
+                    reward_type = "point"
+                signed = do_sign_in_new_ui(ctx, reward_type)
             else:
-                current_points = read_points(ctx, wait_seconds=3)
-                if result.points_before > 0 and current_points > result.points_before:
-                    logger.info(
-                        f"✅ 积分已增加（{result.points_before} → {current_points}），判定签到成功"
-                    )
+                signed = do_sign_in_legacy_ui(ctx)
+
+            if not signed:
+                # 兜底：状态已刷新或积分已增加也算成功，避免「页面提示没抓到」误报失败
+                new_state, _, new_text = wait_sign_state(ctx, 5)
+                if new_state == "done":
+                    logger.info(f"✅ 任务状态已变为「{new_text}」，判定签到成功")
                 else:
-                    logger.error("❌ 未能确认签到结果，本次按失败处理")
-                    return False
+                    current_points = read_points(ctx, wait_seconds=3)
+                    if result.points_before > 0 and current_points > result.points_before:
+                        logger.info(
+                            f"✅ 积分已增加（{result.points_before} → {current_points}），判定签到成功"
+                        )
+                    else:
+                        return False
 
             return True
 
         except (TimeoutException, NoSuchElementException):
-            logger.error("❌ 未找到签到按钮")
+            logger.error("❌ 未找到签到按钮/奖励选项")
             return False
 
     except Exception as e:
