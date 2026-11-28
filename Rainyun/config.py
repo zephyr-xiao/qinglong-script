@@ -47,8 +47,18 @@ class Config:
         # 路径配置（相对于主脚本的路径）
         "stealth_js_path": "./stealth.min.js",  # 默认在当前目录
 
-        # chromedriver 路径（空字符串=自动探测：环境变量 CHROMEDRIVER_PATH → PATH → 青龙固定路径）
-        "chrome_driver_path": ""
+        # 浏览器配置（Playwright）
+        # 留空=自动探测 Playwright 自带 Chromium → 系统 Chrome
+        "chrome_binary_path": "",
+        # 是否用 Xvfb 虚拟显示跑有头浏览器。必须保持 True：
+        # 雨云 Cap 会检测 headless 特征，无头浏览器过不了人机验证
+        "use_xvfb": True,
+        # 伪装 CPU 核数（报 2 核）。Cap 按核数开 PoW worker，容器里并行太多
+        # 会把 instrumentation 采集挤到 20 秒硬超时之外
+        "limit_cpu_cores": True,
+        # 是否注入 stealth.min.js。默认关闭：Cap 的 instrumentation 会校验
+        # 原生函数是否被篡改，stealth 改写原型链会触发校验失败
+        "use_stealth_js": False,
     }
     
     def __init__(self):

@@ -12,10 +12,7 @@ from urllib.parse import parse_qs, urlparse
 import cv2
 import numpy as np
 import requests
-from selenium.common import TimeoutException, NoSuchElementException
-from selenium.webdriver import ActionChains
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support import expected_conditions as EC
+from playwright.sync_api import TimeoutError as PWTimeout
 
 logger = logging.getLogger(__name__)
 
@@ -165,18 +162,17 @@ def process_captcha(ctx, config: dict) -> bool:
 
             # 提交验证码
             logger.info("📤 提交验证码")
-            confirm = ctx.wait.until(
-                EC.element_to_be_clickable((By.XPATH, "//div[@id='tcStatus']/div[2]/div[2]/div/div"))
-            )
+            root = ctx.frame if getattr(ctx, "frame", None) else ctx.page
+            confirm = root.locator("//div[@id='tcStatus']/div[2]/div[2]/div/div")
+            confirm.wait_for(state="visible", timeout=20000)
             confirm.click()
             logger.info("⏳ 等待验证结果...")
             time.sleep(5)
 
             # 校验结果
-            result_el = ctx.wait.until(
-                EC.visibility_of_element_located((By.ID, "tcOperation"))
-            )
-            if "show-success" in result_el.get_attribute("class"):
+            result_el = root.locator("#tcOperation")
+            result_el.wait_for(state="visible", timeout=20000)
+            if "show-success" in (result_el.get_attribute("class") or ""):
                 logger.info("✅ 验证码验证通过")
                 return True
             else:
@@ -208,10 +204,11 @@ def download_captcha_img(ctx, config: dict) -> bool:
         # 清空旧文件
         clear_temp_dir(ctx.temp_dir)
 
+        root = ctx.frame if getattr(ctx, "frame", None) else ctx.page
+
         # 下载背景图
-        slide_bg = ctx.wait.until(
-            EC.visibility_of_element_located((By.ID, "slideBg"))
-        )
+        slide_bg = root.locator("#slideBg")
+        slide_bg.wait_for(state="visible", timeout=20000)
         img1_style = slide_bg.get_attribute("style")
         img1_url = get_url_from_style(img1_style)
 
@@ -222,9 +219,8 @@ def download_captcha_img(ctx, config: dict) -> bool:
         logger.info("   ✓ 背景图下载成功")
 
         # 下载碎片图
-        sprite = ctx.wait.until(
-            EC.visibility_of_element_located((By.XPATH, "//div[@id='instruction']//img"))
-        )
+        sprite = root.locator("//div[@id='instruction']//img")
+        sprite.wait_for(state="visible", timeout=20000)
         img2_url = sprite.get_attribute("src")
 
         logger.info(f"   验证码碎片图: {_brief_url(img2_url)}")
@@ -235,7 +231,7 @@ def download_captcha_img(ctx, config: dict) -> bool:
 
         return True
 
-    except TimeoutException:
+    except PWTimeout:
         logger.error("❌ 验证码图片加载超时")
         return False
     except Exception as e:
@@ -719,9 +715,9 @@ def validate_assignment(
 
 def click_captcha(ctx, result: dict, captcha_img):
     """点击验证码图案"""
-    slide_bg = ctx.wait.until(
-        EC.visibility_of_element_located((By.ID, "slideBg"))
-    )
+    root = ctx.frame if getattr(ctx, "frame", None) else ctx.page
+    slide_bg = root.locator("#slideBg")
+    slide_bg.wait_for(state="visible", timeout=20000)
     style = slide_bg.get_attribute("style")
 
     # 获取显示尺寸
@@ -730,9 +726,9 @@ def click_captcha(ctx, result: dict, captcha_img):
         height = get_height_from_style(style)
         logger.info(f"   验证码显示尺寸: {width}x{height} px")
     except ValueError:
-        size = slide_bg.size
-        width = float(size.get("width", 300))
-        height = float(size.get("height", 150))
+        box = slide_bg.bounding_box() or {}
+        width = float(box.get("width", 300))
+        height = float(box.get("height", 150))
         logger.info(f"   验证码显示尺寸（元素获取）: {width}x{height} px")
 
     # 原始图片尺寸
@@ -747,18 +743,20 @@ def click_captcha(ctx, result: dict, captcha_img):
 
         logger.info(f"🎯 图案 {i+1} 坐标({x},{y})，匹配率：{sim:.4f}")
 
-        # 计算实际点击坐标（适配缩放）
-        x_offset = -width / 2
-        y_offset = -height / 2
-        final_x = int(x_offset + x / width_raw * width) + random.randint(-1, 1)
-        final_y = int(y_offset + y / height_raw * height) + random.randint(-1, 1)
+        # 换算到元素内的相对坐标：Playwright 用 bounding_box 的左上角 + 偏移
+        box = slide_bg.bounding_box()
+        if not box:
+            raise CaptchaRetryableError("验证码背景图不可见")
+        rel_x = x / width_raw * width
+        rel_y = y / height_raw * height
+        final_x = box["x"] + rel_x + random.randint(-1, 1)
+        final_y = box["y"] + rel_y + random.randint(-1, 1)
 
-        logger.info(f"   实际点击坐标: ({final_x}, {final_y})")
+        logger.info(f"   实际点击坐标: ({final_x:.0f}, {final_y:.0f})")
 
-        # 点击
-        ActionChains(ctx.driver).move_to_element_with_offset(
-            slide_bg, final_x, final_y
-        ).click().perform()
+        ctx.page.mouse.move(final_x, final_y, steps=random.randint(3, 7))
+        ctx.page.wait_for_timeout(random.randint(80, 200))
+        ctx.page.mouse.click(final_x, final_y)
 
         time.sleep(random.uniform(0.5, 1))
 
@@ -830,15 +828,16 @@ def _match_ratio(descriptors1, descriptors2, norm) -> Tuple[float, int]:
 def refresh_captcha(ctx) -> bool:
     """刷新验证码"""
     try:
-        reload_btn = ctx.driver.find_element(By.ID, "reload")
+        root = ctx.frame if getattr(ctx, "frame", None) else ctx.page
+        reload_btn = root.locator("#reload")
+        if reload_btn.count() == 0:
+            logger.error("❌ 验证码刷新按钮未找到")
+            return False
         time.sleep(2)
-        reload_btn.click()
+        reload_btn.first.click()
         time.sleep(2)
         logger.info("✅ 验证码已刷新")
         return True
-    except NoSuchElementException:
-        logger.error("❌ 验证码刷新按钮未找到")
-        return False
     except Exception as e:
         logger.error(f"❌ 刷新验证码失败: {e}")
         return False

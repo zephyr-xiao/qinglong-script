@@ -1,6 +1,8 @@
 # 雨云自动签到
 
-基于 Selenium + ddddocr 的雨云每日签到脚本，支持多账号、点选验证码识别，并可按账号开关服务器自动续费。需要 Chrome/Chromium ≥ 109 与配套 chromedriver，目录内还需 `stealth.min.js`。
+基于 **Playwright + Xvfb 有头 Chromium** 的雨云每日签到脚本，支持多账号、点选验证码识别，并可按账号开关服务器自动续费。需要 Playwright 自带的 Chromium 与系统 `Xvfb`。
+
+> **为什么是有头浏览器**：雨云签到提交强制走 Cap（cap.rainyun.cn）人机验证，服务端校验 instrumentation 采集的浏览器行为数据。无头浏览器会被判为自动化；Xvfb 提供虚拟显示让 Chromium 以有头模式运行，才能通过验证。
 
 ## 青龙任务命令
 
@@ -10,13 +12,36 @@ task Rainyun/main.py
 
 定时建议 `0 9 * * *`（每天 9 点）。用青龙「订阅管理」拉取本仓库时任务会自动创建，无需手动添加。
 
+**退出码语义**：任一账号签到失败时脚本以 `exit 1` 结束，青龙面板会标红；全部成功才返回 0。未解析到任何账号（配置写错）同样按失败处理。失败原因会写进汇总报告与通知（如「未找到每日签到卡片」「签到弹窗内未找到奖励」「人机验证被拦」），便于区分是页面改版还是验证失败。
+
+## 签到流程说明
+
+雨云签到页已改为「卡片 + 弹窗选奖励」形态，脚本流程：
+
+1. 打开赚取积分页，定位「每日签到」卡片头；卡片显示「已完成」则直接判定今日已签（幂等，可重复运行）
+2. 点击卡片头打开签到弹窗，读取弹窗标题；显示「今日已签到」同样直接成功
+3. 在弹窗里按奖励名点击对应按钮，默认选 **500 积分**（`main.py` 的 `SIGN_REWARD_DEFAULT`）
+4. 提交时雨云强制走 Cap（cap.js）人机验证（HashWX PoW + 浏览器行为采集，由页面自身在后台求解）。脚本先静默 25 秒把 CPU 让给采集，再开始轮询，**单次等待上限 90 秒**；未成功则刷新页面重试一次，**单账号最坏约 3 分钟**
+5. 判定成功依据：弹窗状态出现「已领取」→ 卡片变「已完成」→ 积分比签到前增加（兜底）
+
+Cap 验证依赖真实浏览器环境。脚本用 **Xvfb + 有头 Chromium** 运行，并注入最小反检测补丁（`navigator.webdriver`、`languages`、`window.chrome`），提交时用带轨迹的拟人鼠标点击。
+
+> **不要注入 `stealth.min.js`**（默认已关闭，`use_stealth_js: false`）。Cap 的 instrumentation 会遍历 21 个原生函数校验 `[native code]` 标记，stealth 大量改写原型链会触发该校验，导致 `instr_timeout` 采集超时。实测：开启 stealth 时稳定超时，关闭后一次通过。
+
+**注意：雨云已在 Cap 上启用行为检测**（challenge 响应里含 `instrumentation` 挑战与 `behavior: true`，阈值 0.75），会采集指针移动与按键节奏。无头浏览器即使通过 PoW，仍可能因行为分不足被拒。若签到失败，日志会打出：
+
+- `🎯 选择奖励: ... (disabled=?, class=?)` —— 按钮是否可点
+- `🔍 诊断：捕获到 N 条签到提交记录` 及其 HTTP 状态与响应体
+- `🔍 浏览器控制台最近 N 条日志` —— Cap 的具体报错
+
+据此判断是「压根没提交」还是「提交被行为检测拒了」。
+
 ## 环境变量
 
 | 变量 | 必填 | 默认 | 说明 |
 |---|---|---|---|
 | `RAINYUN_ACCOUNT` | 是 | - | 账号 JSON 数组，每个子数组为 `[账号, 密码, 续费开关, API Key]`，后两项可省略 |
 | `RAINYUN_CONFIG` | 否 | `{}` | 高级配置 JSON 对象，可调键见下表 |
-| `CHROMEDRIVER_PATH` | 否 | 空（自动探测） | chromedriver 路径；也可用 `RAINYUN_CONFIG.chrome_driver_path` 指定 |
 
 `RAINYUN_ACCOUNT` 子数组字段：
 
@@ -58,35 +83,42 @@ RAINYUN_ACCOUNT=[["user1@example.com","pwd1","true","key1"],["user2@example.com"
 | `renew_threshold_days` | `3` | 剩余天数 ≤ 此值时触发续费 |
 | `min_points_reserve` | `5000` | 续费后余额需 ≥ 此值 |
 | `points_to_cny_rate` | `2000` | 积分兑换比率（2000 分 = 1 元） |
-| `cookie_cache` | `true` | 会话 Cookie 落盘复用（`cookies/rainyun_{hash}.json`），命中则跳过登录与验证码；注入前先访问首页落到目标域，否则 `add_cookie` 报 invalid cookie domain |
-| `stealth_js_path` | `./stealth.min.js` | 反检测脚本路径（相对/绝对） |
-| `chrome_driver_path` | 空 | chromedriver 路径；留空探测顺序：`CHROMEDRIVER_PATH` → PATH → 青龙固定路径 → Selenium Manager |
+| `cookie_cache` | `true` | 会话 Cookie 落盘复用（`cookies/rainyun_{hash}.json`），命中则跳过登录 |
+| `chrome_binary_path` | 空 | 浏览器路径；留空自动探测 Playwright 自带 Chromium → 系统 Chrome |
+| `use_xvfb` | `true` | 用 Xvfb 虚拟显示跑有头浏览器。**必须保持 true**，无头会被 Cap 判为自动化 |
+| `limit_cpu_cores` | `true` | 伪装 `hardwareConcurrency=2`，减少 Cap 的并行 PoW worker，给 instrumentation 采集留 CPU |
+| `use_stealth_js` | `false` | **建议保持 false**。开启会注入 `stealth.min.js`，但其原型链改写会触发 Cap 的原生函数校验，导致 `instr_timeout` |
+| `stealth_js_path` | `./stealth.min.js` | 仅在 `use_stealth_js: true` 时生效 |
 
 ## 依赖安装
 
 青龙「依赖管理 → Python」安装（或容器内 pip）：
 
 ```bash
-pip3 install selenium opencv-python-headless ddddocr requests
+pip3 install playwright opencv-python-headless ddddocr requests
 ```
 
-系统包（安装 Chrome/Chromium 与 ChromeDriver）：
+安装 Playwright 自带的 Chromium（装到青龙数据卷，容器重建不丢）：
 
 ```bash
-apt update && apt install -y chromium-driver
+export PLAYWRIGHT_BROWSERS_PATH=/ql/data/.cache/ms-playwright
+playwright install chromium
 ```
 
-Chrome/Chromium 必须 ≥ 109，过低会报 `DevToolsActivePort file doesn't exist`。先确认版本：
+系统包（虚拟显示器，有头浏览器必需）：
 
 ```bash
-for b in chromedriver chromium chromium-browser google-chrome google-chrome-stable; do
-  command -v "$b" >/dev/null 2>&1 && { echo "--- $b ---"; "$b" --version | head -1; }
-done
+apt update && apt install -y xvfb
 ```
 
-版本过老或未安装时，可从 Chrome for Testing 下载同版本 chrome + chromedriver 到 `/ql/data/scripts/Rainyun/chrome-for-testing/`（青龙数据卷，容器重建不丢），再软链到 `/usr/local/bin/google-chrome` 与 `/usr/local/bin/chromedriver`。最新 Stable 报 `GLIBC_2.x not found` 时改用固定老版本号（如 `128.0.6613.84`）。
+> `xvfb` 是系统包，重建容器会丢。建议写进青龙「依赖管理 → Linux」或 `extra.sh` 持久化。
 
-`stealth.min.js` 必须放在 `main.py` 同目录（或用 `stealth_js_path` 指定），可从 [puppeteer-extra 仓库](https://raw.githubusercontent.com/berstend/puppeteer-extra/master/packages/puppeteer-extra-plugin-stealth/evasions/stealth.min.js) 下载。
+确认就绪：
+
+```bash
+python3 -c "import playwright; print('playwright ok')"
+which Xvfb && ls /ql/data/.cache/ms-playwright/
+```
 
 ## 凭证获取
 
@@ -96,9 +128,11 @@ done
 
 ## 常见问题
 
-- **验证码识别率低** → 先看 `captcha_debug/<时间戳>/annotated.jpg` 与 `meta.json`，区分「检测框没找到图标」还是「匹配分数偏低」；可降低 `similarity_threshold`（如 0.3）或设 `captcha_retry_limit: -1`。
+- **验证码识别率低** → 先看 `captcha_debug/<时间戳>/annotated.jpg` 与 `meta.json`，区分「检测框没找到图标」还是「匹配分数偏低」；可降低 `similarity_threshold`（如 0.3）或设 `captcha_retry_limit: -1`。注意这套点选验证码只用于**登录**，签到用的是 Cap PoW。
+- **签到失败且日志出现 `instr_timeout` / `Instrumentation timed out`** → Cap 的浏览器行为采集有前端硬编码 20 秒超时。常见原因：① 开了 `use_stealth_js`（原型链改写触发原生校验）② 容器 CPU 太紧张。脚本已内置 25 秒静默期 + 自动重试一次。
+- **签到报「未找到每日签到卡片」或「未找到奖励 500 积分」** → 雨云前端再次改版，页面选择器需要更新（`main.py` 顶部 `SIGN_*` 常量）。
 - **积分充足但续费失败** → 检查续费后余额是否 ≥ `min_points_reserve`、API Key 是否有效、服务器是否已到期。签到每天约 500 积分，7 天续费约需 2258 积分，注意留足余额。
-- **`session not created: DevToolsActivePort file doesn't exist`** → Chrome < 109、chromedriver 与 Chrome 主版本不一致、缺系统库（`ldd $(which chromium) | grep "not found"`）、僵尸进程（`pkill -9 -f chromedriver`），或 `/tmp` 满/挂载 noexec。
+- **浏览器起不来 / `Missing X server`** → 容器缺 `Xvfb`（`apt install -y xvfb`），或 Playwright 的 Chromium 未装到持久目录（`PLAYWRIGHT_BROWSERS_PATH=/ql/data/.cache/ms-playwright playwright install chromium`）。
 - **通知没收到** → 检查青龙 `config.sh` 中变量名（区分大小写）与 Key 是否有效，改完重启容器。
 - 多账号串行执行：每个账号前有 0–5 分钟随机延时、账号间隔 3–6 秒，属正常防风控行为。
 

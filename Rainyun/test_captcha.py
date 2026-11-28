@@ -7,11 +7,53 @@ import os
 import sys
 import tempfile
 import time
+import types
 
 import cv2
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+
+def _install_playwright_stub():
+    """离线单测环境可能没装 playwright/ddddocr，注入最小 stub 让模块能导入。
+
+    captcha.py 与 main.py 顶层都 import playwright，缺依赖会在 import 阶段直接失败。
+    这里只补齐导入所需的名字，不参与任何实际逻辑。
+
+    仅在真实依赖确实缺失时注入：已安装 playwright 的环境不应被假模块遮蔽，
+    否则将来想测真实依赖的用例会拿到 stub。
+    """
+    import importlib.util
+
+    class _Dummy:
+        def __init__(self, *args, **kwargs):
+            pass
+
+    class _StubTimeoutError(Exception):
+        """模拟 playwright.sync_api.TimeoutError。"""
+
+    def _stub(name, attrs=None):
+        module = types.ModuleType(name)
+        for attr, value in (attrs or {}).items():
+            setattr(module, attr, value)
+        sys.modules.setdefault(name, module)
+
+    # ddddocr 与 playwright 独立判断：装了 playwright 但没装 ddddocr 的环境
+    # （全新开发机常见）同样需要 ddddocr stub，不能被前面的提前 return 跳过
+    if importlib.util.find_spec("ddddocr") is None:
+        _stub("ddddocr", {"DdddOcr": _Dummy})
+
+    if importlib.util.find_spec("playwright") is not None:
+        return
+    _stub("playwright")
+    _stub("playwright.sync_api", {
+        "TimeoutError": _StubTimeoutError,
+        "sync_playwright": _Dummy,
+    })
+
+
+_install_playwright_stub()
 import captcha
 
 
@@ -339,6 +381,178 @@ def test_debug_dump(tmp):
         captcha._debug_dir = original_debug_dir
 
 
+def _load_main_module():
+    """导入 main.py 用于纯函数测试（依赖 stub 已由模块顶部注入）。"""
+    import main
+    return main
+
+
+def test_chromium_version_pick():
+    """Chromium 目录必须按版本号数字排序取最新，不能被字典序骗到旧版。
+
+    字典序下 "chromium-998" > "chromium-1248"，Playwright 升级后旧目录不删，
+    按字符串排序会静默选到旧版浏览器。
+    """
+    import browser as browser_layer
+
+    original_candidates = browser_layer.CHROMIUM_BINARY_CANDIDATES
+    try:
+        with tempfile.TemporaryDirectory(prefix="pw-ver-") as base:
+            # 造两个版本目录，只有 998 和 1248；必须选 1248
+            for version in ("998", "1248"):
+                exe_dir = os.path.join(base, f"chromium-{version}", "chrome-linux64")
+                os.makedirs(exe_dir, exist_ok=True)
+                exe = os.path.join(exe_dir, "chrome")
+                with open(exe, "w", encoding="utf-8") as f:
+                    f.write("#!/bin/sh\n")
+                os.chmod(exe, 0o755)
+
+            browser_layer.CHROMIUM_BINARY_CANDIDATES = [base]
+            picked = browser_layer._detect_playwright_chromium()
+            assert picked, "未找到任何 Chromium"
+            assert "chromium-1248" in picked, f"选错了版本: {picked}"
+    finally:
+        browser_layer.CHROMIUM_BINARY_CANDIDATES = original_candidates
+
+
+def test_classify_sign_state():
+    """签到状态文案归一：已完成/去签到/未知三态判定。"""
+    main = _load_main_module()
+
+    # 卡片 badge 已完成
+    assert main.classify_sign_state(badge_text="每日签到 已完成 积分或抽奖券") == main.SIGN_STATE_DONE
+    # 模态框标题「今日已签到」
+    assert main.classify_sign_state(modal_title="今日已签到") == main.SIGN_STATE_DONE
+    # 状态行「已领取 500 积分，明天再来」
+    assert main.classify_sign_state(status_text="已领取 500 积分，明天再来") == main.SIGN_STATE_DONE
+    # 可领取：卡片 badge 去签到
+    assert main.classify_sign_state(badge_text="每日签到 去签到 积分或抽奖券") == main.SIGN_STATE_CLAIMABLE
+    # 可领取：模态框标题选择今日奖励
+    assert main.classify_sign_state(modal_title="选择今日奖励") == main.SIGN_STATE_CLAIMABLE
+    # 未知文案（页面改版时的兜底，不能误判为可领取）
+    assert main.classify_sign_state(badge_text="积分或抽奖券") == main.SIGN_STATE_UNKNOWN
+    assert main.classify_sign_state() == main.SIGN_STATE_UNKNOWN
+    # 多来源合并：任一出现已完成文案即 done
+    assert main.classify_sign_state(badge_text="去签到", status_text="已领取 500 积分") == main.SIGN_STATE_DONE
+    # 近似反例：「今日可领取」「未领取」都含「领取」字样，不能被误判成 done
+    assert main.classify_sign_state(status_text="今日可领取") == main.SIGN_STATE_UNKNOWN
+    assert main.classify_sign_state(status_text="未领取") == main.SIGN_STATE_UNKNOWN
+
+
+class FakeLocator:
+    """模拟 Playwright Locator 的最小接口，供被测函数使用。"""
+
+    def __init__(self, text="", children=None, count=1, raises=False):
+        self._text = text
+        self._children = children or {}
+        self._count = count
+        self._raises = raises
+
+    @property
+    def first(self):
+        return self
+
+    def count(self):
+        if self._raises:
+            raise RuntimeError("locator dead")
+        return self._count
+
+    def nth(self, index):
+        return self
+
+    def locator(self, selector):
+        if self._raises:
+            raise RuntimeError("locator dead")
+        if selector in self._children:
+            return self._children[selector]
+        raise LookupError(f"no child for {selector}")
+
+    def inner_text(self, timeout=None):
+        if self._raises:
+            raise RuntimeError("locator dead")
+        return self._text
+
+
+class FakePage:
+    """按选择器返回预置 locator，模拟签到弹窗的 DOM。"""
+
+    def __init__(self, elements=None, raises=False):
+        self._elements = elements or {}
+        self._raises = raises
+
+    def locator(self, selector):
+        if self._raises:
+            raise RuntimeError("page dead")
+        if selector in self._elements:
+            return self._elements[selector]
+        # 未预置的选择器视为不存在（count 为 0）
+        return FakeLocator(count=0, raises=False)
+
+
+def test_find_reward_button():
+    """奖励按钮匹配：应容忍空白/全角空格差异，且不能把 1500 误配成 500。"""
+    main = _load_main_module()
+
+    def rewards(amount_texts):
+        buttons = []
+        for text in amount_texts:
+            btn = FakeLocator(children={main.SIGN_REWARD_AMOUNT_CSS: FakeLocator(text)})
+            buttons.append(btn)
+        return FakeLocator(count=len(buttons), children={})
+
+    class MultiLocator(FakeLocator):
+        """支持 nth() 返回不同按钮的列表 locator。"""
+
+        def __init__(self, items):
+            super().__init__(count=len(items))
+            self._items = items
+
+        def nth(self, index):
+            return self._items[index]
+
+    def page_with(amount_texts):
+        items = [
+            FakeLocator(children={main.SIGN_REWARD_AMOUNT_CSS: FakeLocator(t)})
+            for t in amount_texts
+        ]
+        return FakePage({main.SIGN_REWARD_BTN_CSS: MultiLocator(items)})
+
+    # 普通空格
+    ctx = type("Ctx", (), {"page": page_with(["500 积分", "抽奖券 × 1"])})()
+    assert main.find_reward_button(ctx, "500 积分") is not None
+
+    # 全角空格 + 不换行空格 + 多空格，都应命中
+    for variant in ("500　积分", "500\u00a0积分", "500   积分", " 500 积分 "):
+        ctx = type("Ctx", (), {"page": page_with([variant])})()
+        assert main.find_reward_button(ctx, "500 积分") is not None, variant
+
+    # 前缀相同的 1500 积分不能被误配成 500 积分
+    ctx = type("Ctx", (), {"page": page_with(["1500 积分"])})()
+    assert main.find_reward_button(ctx, "500 积分") is None
+
+    # 页面异常时安全返回 None
+    ctx = type("Ctx", (), {"page": FakePage(raises=True)})()
+    assert main.find_reward_button(ctx, "500 积分") is None
+
+
+def test_wait_sign_result_timeout():
+    """所有成功信号都缺失时必须按时超时返回 False，不能死循环。"""
+    main = _load_main_module()
+
+    ctx = type("Ctx", (), {
+        "page": FakePage(raises=True),
+        "config": {"points_to_cny_rate": 2000},
+    })()
+    result = main.AccountResult(username="demo@example.com", points_before=0)
+
+    started = time.time()
+    # quiet_seconds=0 跳过静默期，只验证轮询本身会按时超时
+    ok = main.wait_sign_result(ctx, result, timeout=1, quiet_seconds=0)
+    elapsed = time.time() - started
+    assert ok is False
+    assert elapsed < 8, elapsed  # 必须在超时附近返回，不能无限轮询
+
+
 def main():
     with tempfile.TemporaryDirectory(prefix="captcha-test-") as tmp:
         test_assignment()
@@ -365,6 +579,14 @@ def main():
         print("helpers: ok")
         test_debug_dump(tmp)
         print("debug dump/prune: ok")
+        test_classify_sign_state()
+        print("classify sign state: ok")
+        test_chromium_version_pick()
+        print("chromium version pick: ok")
+        test_find_reward_button()
+        print("find reward button: ok")
+        test_wait_sign_result_timeout()
+        print("wait sign result timeout: ok")
     print("ALL_TESTS_PASSED")
 
 

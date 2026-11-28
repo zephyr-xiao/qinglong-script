@@ -3,7 +3,6 @@ import os
 import random
 import re
 import shutil
-import subprocess
 import sys
 import tempfile
 import time
@@ -20,18 +19,13 @@ except Exception:
     pass
 
 import ddddocr
-from selenium import webdriver
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.wait import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.common import TimeoutException, NoSuchElementException
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.chrome.service import Service
+from playwright.sync_api import TimeoutError as PWTimeout
 
 from config import CONFIG
 from account_parser import parse_accounts, Account
 from api_client import RainyunAPI
 from server_manager import ServerManager
+import browser as browser_layer
 
 logger = logging.getLogger(__name__)
 
@@ -93,12 +87,30 @@ class AccountResult:
 @dataclass
 class RuntimeContext:
     """运行时上下文"""
-    driver: webdriver.Chrome
-    wait: WebDriverWait
+    session: object            # browser.BrowserSession，持有 page/context/browser
     det: ddddocr.DdddOcr
     temp_dir: str
     config: dict
-    
+    console_logs: list = None  # 浏览器 console 日志收集器（失败诊断用）
+    net_logs: list = None      # 4xx/5xx 与失败请求收集器（失败诊断用）
+    frame: object = None       # 验证码 iframe 作用域（frame_locator），非验证码场景为 None
+
+    def __post_init__(self):
+        if self.console_logs is None:
+            self.console_logs = []
+        if self.net_logs is None:
+            self.net_logs = []
+
+    @property
+    def page(self):
+        """当前页面对象（Playwright Page）。"""
+        return self.session.page
+
+    @property
+    def context(self):
+        """浏览器上下文（Playwright BrowserContext），Cookie 操作走这里。"""
+        return self.session.context
+
     def temp_path(self, filename: str) -> str:
         """获取临时文件路径"""
         return os.path.join(self.temp_dir, filename)
@@ -129,238 +141,166 @@ def init_logger():
 # ---------------------------------------------------------------------------
 LOGIN_URL = "https://app.rainyun.com/auth/login"
 EARN_URL = "https://app.rainyun.com/account/reward/earn"
-HOME_URL = "https://app.rainyun.com/"   # 注入 Cookie 前需先落到该域，否则 add_cookie 报 invalid cookie domain
 COOKIE_DIR_NAME = "cookies"   # Cookie 缓存目录（脚本同目录下，青龙数据卷持久化）
 
 # 赚取积分页顶部「积分」卡片的数值
 POINTS_XPATH = '//*[@id="app"]/div[1]/div[3]/div[2]/div/div/div[2]/div[1]/div[1]/div/p/div/h3'
 
-# 赚取积分页「每日签到」行（行容器 → 标签 → 右侧状态 span）
-SIGN_ROW_XPATH = '//*[@id="app"]/div[1]/div[3]/div[2]/div/div/div[2]/div[2]/div/div/div/div[1]/div'
+# 每日签到卡片头：点它打开签到模态框（右侧「积分或抽奖券」只是固定说明文案，不是状态）
+SIGN_CARD_XPATH = '//button[contains(@class,"daily-check-in-task")]'
 
-# 签到状态文案（来自页面 JS：Status=1/0/2）
-SIGN_STATUS_CLAIM = "领取奖励"
-SIGN_STATUS_DONE = "已完成"
+# 签到模态框内的结构（class 选择器比绝对 XPath 稳定）
+SIGN_MODAL_CSS = ".daily-check-in"
+SIGN_MODAL_TITLE_CSS = ".daily-check-in__title"
+SIGN_MODAL_STATUS_CSS = ".daily-check-in__status"
+SIGN_REWARDS_CSS = ".daily-check-in__rewards"
+SIGN_REWARD_BTN_CSS = ".daily-check-in__reward"
+SIGN_REWARD_AMOUNT_CSS = ".daily-check-in__amount"
 
-
-# ---------------------------------------------------------------------------
-# Chrome 启动探测与参数选择
-# ---------------------------------------------------------------------------
-# 背景：--headless=new 是 Chrome/Chromium 109+ 才支持的参数。青龙容器里 apt 装的
-# Debian chromium 版本可能过老（如 90），传该参数会导致 chrome 进程启动即退出、
-# DevToolsActivePort 文件写不出来（报 "session not created"）。因此这里自动探测
-# 浏览器二进制与版本、按版本选 headless 参数，启动失败再回退到另一个参数。
-
-# 候选浏览器二进制：优先 PATH 名，其次常见安装路径
-CHROME_BINARY_NAMES = [
-    "google-chrome-stable",
-    "google-chrome",
-    "chromium",
-    "chromium-browser",
-]
-CHROME_BINARY_PATHS = [
-    "/usr/bin/google-chrome-stable",
-    "/usr/bin/google-chrome",
-    "/usr/bin/chromium",
-    "/usr/bin/chromium-browser",
-    "/opt/google/chrome/chrome",                                          # google-chrome .deb 默认位置
-    "/opt/chrome-for-testing/chrome-linux64/chrome",                      # 手动安装位置
-    "/ql/data/scripts/Rainyun/chrome-for-testing/chrome-linux64/chrome",  # 青龙数据卷持久化安装
-]
-
-# chromedriver 手动安装路径（自动探测的补充，覆盖 chrome-for-testing 场景）
-CHROMEDRIVER_PATHS = [
-    "/ql/data/scripts/Rainyun/chrome-for-testing/chromedriver-linux64/chromedriver",
-    "/opt/chrome-for-testing/chromedriver-linux64/chromedriver",
-]
+# 卡片 badge 与模态框标题/状态里出现这些文案即视为「今天已领过」
+SIGN_DONE_TEXTS = ("已完成", "今日已签到", "已领取")
+# 默认领取的奖励名，必须与页面 .daily-check-in__amount 的文案一致
+SIGN_REWARD_DEFAULT = "500 积分"
 
 
-def _detect_chrome_binary() -> str:
-    """探测 Chrome/Chromium 可执行文件路径，找不到返回空字符串"""
-    for name in CHROME_BINARY_NAMES:
-        path = shutil.which(name)
-        if path:
-            return path
-    for path in CHROME_BINARY_PATHS:
-        if os.path.isfile(path):
-            return path
-    return ""
+
+# 签到提交接口路径片段：命中即记录请求与响应，用于定位「点击了但没生效」的真因
+SIGN_API_HINT = "/user/reward/tasks"
 
 
-def _run_version_cmd(binary: str) -> str:
-    """执行 <binary> --version 并提取版本号，失败返回空字符串"""
+def inject_api_recorder(page):
+    """在当前页面注入 fetch/XHR 钩子，把签到提交接口的状态码与响应体记到 window.__signApiLog。
+
+    签到失败时日志只能看到「状态没变」，无法区分是按钮 disabled（压根没发请求）、
+    还是请求发了被服务端拒绝（如 Cap 人机验证失败）。抓一次真实响应即可定性。
+
+    刻意用 page.evaluate 而不是 context.add_init_script：
+    add_init_script 会传播进 Cap 后续创建的 sandbox srcdoc iframe，把 fetch 和
+    XMLHttpRequest.prototype.open/send 包成非原生实现，而 Cap 的 instrumentation
+    会校验原生函数标记——这正是 stealth.min.js 导致 instr_timeout 的同一原因。
+    页面级 evaluate 只作用于当前文档，不污染 Cap 的采集帧。
+    """
+    script = """
+    (function () {
+      if (window.__signApiRecorderInstalled) return;
+      window.__signApiRecorderInstalled = true;
+      window.__signApiLog = [];
+      const HINT = "%s";
+
+      function record(entry) {
+        try {
+          window.__signApiLog.push(entry);
+          if (window.__signApiLog.length > 50) window.__signApiLog.shift();
+        } catch (e) {}
+      }
+
+      // 拦截 fetch
+      const origFetch = window.fetch;
+      if (origFetch) {
+        window.fetch = function (input, init) {
+          const url = typeof input === "string" ? input : (input && input.url) || "";
+          const p = origFetch.apply(this, arguments);
+          if (url.indexOf(HINT) !== -1) {
+            p.then(function (resp) {
+              resp.clone().text().then(function (body) {
+                record({via: "fetch", url: url, status: resp.status, body: body.slice(0, 2000)});
+              }).catch(function () {
+                record({via: "fetch", url: url, status: resp.status, body: "<读取失败>"});
+              });
+            }).catch(function (err) {
+              record({via: "fetch", url: url, status: 0, body: "请求异常: " + err});
+            });
+          }
+          return p;
+        };
+      }
+
+      // 拦截 XMLHttpRequest（axios 在老浏览器走这条）
+      const origOpen = XMLHttpRequest.prototype.open;
+      const origSend = XMLHttpRequest.prototype.send;
+      XMLHttpRequest.prototype.open = function (method, url) {
+        this.__signUrl = url || "";
+        return origOpen.apply(this, arguments);
+      };
+      XMLHttpRequest.prototype.send = function () {
+        const xhr = this;
+        if ((xhr.__signUrl || "").indexOf(HINT) !== -1) {
+          xhr.addEventListener("loadend", function () {
+            let body = "";
+            try { body = (xhr.responseText || "").slice(0, 2000); } catch (e) { body = "<读取失败>"; }
+            record({via: "xhr", url: xhr.__signUrl, status: xhr.status, body: body});
+          });
+        }
+        return origSend.apply(this, arguments);
+      };
+    })();
+    """ % SIGN_API_HINT
     try:
-        result = subprocess.run(
-            [binary, "--version"],
-            capture_output=True,
-            text=True,
-            timeout=20,
-        )
-        # stdout 与 stderr 都取：Debian 老版 chromium 可能把版本打到 stderr
-        output = (result.stdout or "") + (result.stderr or "")
-        match = re.search(r"\b(\d+)\.(\d+)\.(\d+)\.(\d+)", output)
-        return match.group(0) if match else ""
+        page.evaluate(script)
+    except Exception as e:
+        logger.warning(f"⚠️  注入签到接口记录器失败（不影响签到）: {e}")
+
+
+def read_api_log(page):
+    """取出注入钩子收集到的签到接口记录；没有则返回空列表。"""
+    try:
+        return page.evaluate("() => window.__signApiLog || []") or []
     except Exception:
-        return ""
+        return []
 
 
-def _pick_headless_flag(major: int) -> str:
-    """按 Chrome 主版本选择 headless 参数（>=109 用新模式，否则用旧模式）"""
-    if major >= 109:
-        return "--headless=new"
-    return "--headless"
+def _is_element_disabled(locator) -> bool:
+    """判断元素是否处于 disabled 状态。"""
+    try:
+        return bool(locator.is_disabled())
+    except Exception:
+        return False
 
 
-def _build_chrome_options(binary: str, headless_flag: str, ua_major: int = 0) -> Options:
-    """组装 Chrome 启动参数（容器必需配置 + 稳健性参数 + 反爬配置）"""
-    ops = Options()
-    # 容器必需配置
-    ops.add_argument("--no-sandbox")
-    ops.add_argument("--disable-dev-shm-usage")
-    ops.add_argument("--disable-gpu")
-    ops.add_argument(headless_flag)
-    ops.add_argument("--window-size=1920,1080")
+def human_like_click(page, locator) -> None:
+    """带指针轨迹的点击（委托给 browser 层实现）。"""
+    browser_layer.human_like_click(page, locator)
 
-    # 稳健性参数：避免首次运行引导、后台联网、扩展等干扰无头启动
-    ops.add_argument("--no-first-run")
-    ops.add_argument("--no-default-browser-check")
-    ops.add_argument("--disable-extensions")
-    ops.add_argument("--disable-background-networking")
-    ops.add_argument("--disable-sync")
-    ops.add_argument("--remote-debugging-port=0")
 
-    # UA 与探测到的浏览器主版本保持一致；版本未知时不覆盖，避免指纹矛盾
-    if ua_major:
-        ops.add_argument(
-            "--user-agent=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-            f"(KHTML, like Gecko) Chrome/{ua_major}.0.0.0 Safari/537.36"
+def _log_browser_console(ctx: RuntimeContext) -> None:
+    """打印已收集的浏览器控制台日志，用于暴露 Cap 人机验证被拒的真实原因。"""
+    logs = getattr(ctx, "console_logs", None) or []
+def _log_browser_console(ctx: RuntimeContext) -> None:
+    """打印已收集的浏览器控制台日志，用于暴露 Cap 人机验证被拒的真实原因。"""
+    logs = getattr(ctx, "console_logs", None) or []
+    if not logs:
+        logger.info("🔍 浏览器控制台无输出")
+    else:
+        logger.info(f"🔍 浏览器控制台最近 {min(len(logs), 20)} 条日志:")
+        for line in logs[-20:]:
+            logger.info(f"   {line}")
+
+    net_logs = getattr(ctx, "net_logs", None) or []
+    if net_logs:
+        logger.info(f"🔍 网络失败请求最近 {min(len(net_logs), 15)} 条:")
+        for line in net_logs[-15:]:
+            logger.info(f"   {line}")
+
+
+def _log_sign_api_result(ctx: RuntimeContext) -> None:
+    """把抓到的签到接口记录打到日志，用于区分失败真因。
+
+    没有任何记录 = 点击没触发提交（多半按钮 disabled）；有记录则打出状态码与响应体。
+    """
+    entries = read_api_log(ctx.page)
+    if not entries:
+        logger.error("🔍 诊断：未捕获到签到提交请求 —— 点击未触发提交")
+        logger.error("   可能原因：奖励按钮处于 disabled（任务 Status≠1，条件未满足）")
+        return
+    logger.error(f"🔍 诊断：捕获到 {len(entries)} 条签到提交记录")
+    for entry in entries:
+        logger.error(
+            f"   [{entry.get('via')}] {entry.get('url')} "
+            f"-> HTTP {entry.get('status')}"
         )
-
-    # 反爬配置
-    ops.add_experimental_option("excludeSwitches", ["enable-automation"])
-    ops.add_experimental_option('useAutomationExtension', False)
-    ops.add_argument("--disable-blink-features=AutomationControlled")
-
-    # 显式指定浏览器二进制，避免 ChromeDriver 找不到或找错浏览器
-    if binary:
-        ops.binary_location = binary
-    return ops
-
-
-def init_selenium(config: dict):
-    """初始化 Selenium 驱动（青龙面板专用，自动探测浏览器并兼容老版本 headless）"""
-    logger.info("🔧 开始初始化 Selenium WebDriver")
-
-    # 自动探测 chromedriver 路径：
-    # 1. 显式配置优先：RAINYUN_CONFIG 的 chrome_driver_path → 环境变量 CHROMEDRIVER_PATH
-    #    （显式配置必须存在，否则报错，避免用户写错路径被静默绕过）
-    # 2. 未配置时自动探测：PATH 中查找（本地调试）→ 青龙固定路径（容器内 apt 安装位置）
-    #    → 手动安装路径（chrome-for-testing 持久化）
-    # 3. 都找不到则交给 Selenium Manager 自动管理（selenium 4.6+ 自动下载匹配版本）
-    driver_path = config.get("chrome_driver_path") or os.getenv("CHROMEDRIVER_PATH")
-    if driver_path:
-        if not os.path.exists(driver_path):
-            logger.error(f"❌ 配置的 chromedriver 不存在: {driver_path}")
-            logger.error("请检查 RAINYUN_CONFIG 的 chrome_driver_path 或 CHROMEDRIVER_PATH")
-            raise FileNotFoundError(f"chromedriver not found at {driver_path}")
-        service = Service(executable_path=driver_path)
-        logger.info(f"   - ChromeDriver 路径: {driver_path}")
-    else:
-        auto_path = shutil.which("chromedriver") or "/usr/bin/chromedriver"
-        if not os.path.exists(auto_path):
-            # 补充手动安装路径，如 chrome-for-testing 持久化安装
-            for extra in CHROMEDRIVER_PATHS:
-                if os.path.exists(extra):
-                    auto_path = extra
-                    break
-        if os.path.exists(auto_path):
-            service = Service(executable_path=auto_path)
-            logger.info(f"   - ChromeDriver 路径: {auto_path}")
-        else:
-            service = Service()  # 交给 Selenium Manager 自动匹配下载
-            logger.info("   - ChromeDriver 路径: 自动管理（Selenium Manager）")
-
-    # 探测浏览器二进制与版本，按版本选择 headless 参数
-    binary = _detect_chrome_binary()
-    version = _run_version_cmd(binary) if binary else ""
-    major = int(version.split(".")[0]) if version else 0
-    if binary:
-        logger.info(f"   - Chrome 二进制: {binary}")
-        logger.info(f"   - Chrome 版本: {version or '解析失败（按老版本保守处理）'}")
-    else:
-        logger.warning("   - 未找到 Chrome/Chromium，交由 ChromeDriver 默认查找")
-
-    primary_flag = _pick_headless_flag(major)
-    fallback_flag = "--headless" if primary_flag == "--headless=new" else "--headless=new"
-
-    # 双 headless 参数回退：避免单一参数在特定版本上启动即崩溃
-    last_error = None
-    for flag in (primary_flag, fallback_flag):
-        try:
-            logger.info(f"   - 尝试 headless 参数: {flag}")
-            driver = webdriver.Chrome(
-                service=service, options=_build_chrome_options(binary, flag, major)
-            )
-            driver.delete_all_cookies()
-            logger.info("✅ Selenium WebDriver 初始化成功")
-            return driver
-        except Exception as e:
-            last_error = e
-            logger.warning(f"   - {flag} 启动失败: {e}")
-            try:
-                service.stop()  # 清理可能残留的 chromedriver 进程，避免占端口
-            except Exception:
-                pass
-            time.sleep(1)
-
-    # 全部失败：输出诊断信息，便于定位环境问题
-    logger.error("❌ Selenium 初始化失败（已尝试两种 headless 参数）")
-    logger.error(f"   最终错误: {last_error}")
-    logger.error(f"   Chrome 二进制: {binary or '未找到'}")
-    logger.error(f"   Chrome 版本: {version or '未知'}")
-    cd_bin = driver_path or shutil.which("chromedriver") or "/usr/bin/chromedriver"
-    logger.error(f"   ChromeDriver 路径: {cd_bin}")
-    logger.error(f"   ChromeDriver 版本: {_run_version_cmd(cd_bin) or '未知'}")
-    logger.error("   排查提示:")
-    logger.error("     1) 确认 chromium/google-chrome 版本 >= 109（容器内执行: chromium --version / google-chrome --version）")
-    logger.error("     2) 确认 chromedriver 与 chrome 主版本一致（chromedriver --version）")
-    logger.error("     3) 检查缺库: ldd $(which chromium) | grep 'not found'")
-    logger.error("     4) 检查空间: df -h /dev/shm /tmp")
-    logger.error("     5) 清理僵尸进程: pkill -9 -f chromedriver; pkill -9 -f 'chrome.*remote-debugging'")
-    raise last_error
-
-
-def inject_stealth_js(driver, config: dict):
-    """注入反检测脚本（支持相对路径）"""
-    # 获取主脚本所在目录
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    
-    # 从配置读取相对路径（默认与 config.py 的 DEFAULT_CONFIG 一致：主脚本同目录）
-    relative_path = config.get("stealth_js_path", "./stealth.min.js")
-    
-    # 拼接完整路径
-    script_path = os.path.join(script_dir, relative_path)
-    script_path = os.path.abspath(script_path)  # 转为绝对路径
-    
-    logger.info(f"🔧 检查反检测脚本: {script_path}")
-    
-    if not os.path.exists(script_path):
-        logger.error(f"❌ 未找到 stealth.min.js！")
-        logger.error(f"预期路径: {script_path}")
-        logger.error(f"主脚本目录: {script_dir}")
-        logger.error(f"配置的相对路径: {relative_path}")
-        logger.error("请检查以下几点：")
-        logger.error("  1. 文件是否已上传")
-        logger.error("  2. 文件名是否正确（区分大小写）")
-        logger.error("  3. 配置的相对路径是否正确")
-        logger.error("下载地址: https://raw.githubusercontent.com/berstend/puppeteer-extra/master/packages/puppeteer-extra-plugin-stealth/evasions/stealth.min.js")
-        sys.exit(1)
-    
-    with open(script_path, "r", encoding="utf-8") as f:
-        js = f.read()
-    
-    driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {"source": js})
-    logger.info("✅ 已注入 stealth.min.js 反检测脚本")
+        body = str(entry.get("body", ""))
+        if body:
+            logger.error(f"   响应: {body[:800]}")
 
 
 # ---------------------------------------------------------------------------
@@ -379,20 +319,21 @@ def save_cookies(ctx: RuntimeContext, username: str) -> bool:
         path = cookie_cache_path(username)
         os.makedirs(os.path.dirname(path), exist_ok=True)
         cookies = []
-        for c in ctx.driver.get_cookies():
-            # Selenium 读取用 expiry、注入用 expires；expiry 为 None 的是内存级 session cookie，
-            # 浏览器一关即失效，缓存无意义且 add_cookie 会拒收，直接丢弃
-            if c.get("expiry") is None:
+        for c in ctx.context.cookies():
+            # expires 为 -1 的是 session cookie，浏览器一关即失效，缓存无意义
+            if not c.get("expires") or c["expires"] < 0:
                 continue
             item = {
                 "name": c["name"],
                 "value": c["value"],
                 "domain": c.get("domain", ""),
                 "path": c.get("path", "/"),
-                "expires": c["expiry"],   # 秒级时间戳
+                "expires": c["expires"],   # 秒级时间戳（Playwright 与之一致）
             }
             if c.get("secure"):
                 item["secure"] = True
+            if c.get("httpOnly"):
+                item["httpOnly"] = True
             if c.get("sameSite"):
                 item["sameSite"] = c["sameSite"]
             cookies.append(item)
@@ -409,7 +350,11 @@ def save_cookies(ctx: RuntimeContext, username: str) -> bool:
 
 
 def load_cookies(ctx: RuntimeContext, username: str) -> bool:
-    """把缓存的 Cookie 逐条注入当前浏览器会话。返回是否成功。"""
+    """把缓存的 Cookie 注入当前浏览器上下文。返回是否成功。
+
+    Playwright 的 add_cookies 不需要先导航到目标域，也不需要 expiry/expires
+    键名转换（统一用 expires，秒级浮点），比 Selenium 简单。
+    """
     path = cookie_cache_path(username)
     if not os.path.exists(path):
         return False
@@ -417,25 +362,41 @@ def load_cookies(ctx: RuntimeContext, username: str) -> bool:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
         now = time.time()
-        injected = 0
+        cookies = []
         for c in data.get("cookies", []):
             # 已过期的 cookie 跳过（不删文件，可能只是部分过期）
             if c.get("expires") and c["expires"] < now:
                 continue
-            # get_cookies() 读出的键是 expires，add_cookie() 要求 expiry；
-            # 不转换的话过期时间会被驱动忽略，注入成会话级 Cookie
-            cookie = {k: v for k, v in c.items() if k != "expires"}
-            if c.get("expires"):
-                cookie["expiry"] = c["expires"]
-            ctx.driver.add_cookie(cookie)
-            injected += 1
+            cookies.append(c)
+        if not cookies:
+            return False
+
+        # 逐条注入：Playwright 的 add_cookies 是整批校验，任一条不合法（缺 domain、
+        # sameSite 取值异常、expires 类型不对）会整体抛 ValidationError，
+        # 导致一批有效 Cookie 全废。逐条注入可跳过坏条目保留其余。
+        injected = 0
+        for cookie in cookies:
+            try:
+                ctx.context.add_cookies([cookie])
+                injected += 1
+            except Exception as e:
+                logger.warning(f"⚠️ 跳过一条无效 Cookie({cookie.get('name')}): {e}")
         if injected == 0:
             return False
-        logger.info(f"🍪 已注入 {injected} 条缓存 Cookie")
+        logger.info(f"🍪 已注入 {injected}/{len(cookies)} 条缓存 Cookie")
         return True
     except Exception as e:
         logger.warning(f"⚠️ 读取/注入 Cookie 缓存失败: {e}")
         return False
+
+
+def is_auth_url(url: str) -> bool:
+    """判断 URL 是否落在雨云的鉴权区（/auth/login、/auth/verify 等）。
+
+    只判 login 会漏掉二次验证、错误页等同样属于未登录态的页面；反过来判
+    dashboard 又因默认落地页已改成积分页而失效。按 /auth/ 前缀判断最贴合现状。
+    """
+    return "/auth/" in (url or "")
 
 
 def _drop_cookie_cache(username: str) -> None:
@@ -454,19 +415,17 @@ def try_restore_session(ctx: RuntimeContext, account: Account) -> bool:
     if not os.path.exists(cookie_cache_path(account.username)):
         return False
     try:
-        # add_cookie 要求当前页面域与 Cookie 域匹配，about:blank 上注入会报
-        # "invalid cookie domain"，因此先落到雨云域再注入
-        ctx.driver.get(HOME_URL)
+        # Playwright 的 add_cookies 不需要先导航到目标域，直接注入即可
         if not load_cookies(ctx, account.username):
             # 全部过期或注入失败：清掉坏缓存，避免每次运行都白试一遍
             _drop_cookie_cache(account.username)
             return False
-        # 雨云为 SPA：登录失效时访问内部页会 302 回 /auth/login
-        ctx.driver.get(EARN_URL)
-        time.sleep(5)
-        url = ctx.driver.current_url
+        # 雨云为 SPA：登录失效时访问内部页会 302 回 /auth/ 下的登录或校验页
+        ctx.page.goto(EARN_URL, wait_until="domcontentloaded", timeout=45000)
+        time.sleep(4)
+        url = ctx.page.url
         logger.info(f"   缓存 Cookie 探测 URL: {url}")
-        if "login" in url:
+        if is_auth_url(url):
             logger.warning("🍪 缓存 Cookie 已失效，回退完整登录")
             _drop_cookie_cache(account.username)
             return False
@@ -483,68 +442,77 @@ def do_login(ctx: RuntimeContext, username: str, password: str) -> bool:
     try:
         logger.info("=" * 60)
         logger.info("⏳ 发起登录请求")
-        logger.info("🌐 访问雨云登录页: https://app.rainyun.com/auth/login")
-        ctx.driver.get(LOGIN_URL)
-        
-        logger.info(f"   当前页面标题: {ctx.driver.title}")
-        logger.info(f"   当前页面URL: {ctx.driver.current_url}")
-        
+        logger.info(f"🌐 访问雨云登录页: {LOGIN_URL}")
+        ctx.page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=45000)
+
+        logger.info(f"   当前页面标题: {ctx.page.title()}")
+        logger.info(f"   当前页面URL: {ctx.page.url}")
+
         logger.info("⏳ 等待登录表单元素加载...")
-        username_elem = ctx.wait.until(EC.visibility_of_element_located((By.NAME, "login-field")))
-        password_elem = ctx.wait.until(EC.visibility_of_element_located((By.NAME, "login-password")))
-        login_btn = ctx.wait.until(EC.element_to_be_clickable((By.XPATH, "//button[@type='submit' and contains(., '登')]")))
-        
+        timeout_ms = int(ctx.config.get("timeout", 20)) * 1000
+        username_elem = ctx.page.locator('[name="login-field"]')
+        password_elem = ctx.page.locator('[name="login-password"]')
+        login_btn = ctx.page.locator("button[type='submit']")
+        username_elem.wait_for(state="visible", timeout=timeout_ms)
+        password_elem.wait_for(state="visible", timeout=timeout_ms)
+        login_btn.wait_for(state="visible", timeout=timeout_ms)
+
         logger.info("✅ 登录表单元素加载完成")
         logger.info("📝 输入账号密码")
-        username_elem.send_keys(username)
-        password_elem.send_keys(password)
-        
+        username_elem.fill(username)
+        password_elem.fill(password)
+
         logger.info("🖱️  点击登录按钮")
         login_btn.click()
         logger.info("⏳ 正在登录中，耗时较长请稍等……")
         time.sleep(3)
-        
-        # 处理登录验证码
+
+        # 处理登录验证码（腾讯 tcaptcha 点选；雨云已逐步下线，出现才处理）
         try:
             logger.info("🔍 检查是否触发登录验证码...")
-            ctx.wait.until(EC.visibility_of_element_located((By.ID, "tcaptcha_iframe_dy")))
+            ctx.page.locator("#tcaptcha_iframe_dy").wait_for(state="visible", timeout=15000)
             logger.warning("⚠️  触发登录验证码！")
-            ctx.driver.switch_to.frame("tcaptcha_iframe_dy")
-            
+            # frame_locator 把后续定位限定在 iframe 内，无需手动切换上下文
+            ctx.frame = ctx.page.frame_locator("#tcaptcha_iframe_dy")
+
             from captcha import process_captcha
             if not process_captcha(ctx, ctx.config):
                 logger.error("❌ 登录验证码处理失败")
                 return False
-                
+
             logger.info("✅ 登录验证码处理成功")
-        except TimeoutException:
+        except PWTimeout:
             logger.info("✅ 未触发登录验证码")
-        
-        ctx.driver.switch_to.default_content()
+        finally:
+            ctx.frame = None
+
         logger.info("⏳ 等待页面跳转...")
         time.sleep(5)
-        
-        # 验证登录状态
-        current_url = ctx.driver.current_url
+
+        # 验证登录状态：雨云默认落地页是积分页（/account/reward/earn），不再固定跳 dashboard。
+        # 未登录时访问内部页会被 302 回 /auth/ 下的页面，因此只有仍落在鉴权区才算失败。
+        current_url = ctx.page.url
         logger.info(f"   跳转后URL: {current_url}")
-        logger.info(f"   当前页面标题: {ctx.driver.title}")
-        
-        if "dashboard" not in current_url:
-            logger.error(f"❌ 登录失败！未跳转到控制台页面")
+        logger.info(f"   当前页面标题: {ctx.page.title()}")
+
+        if is_auth_url(current_url):
+            logger.error("❌ 登录失败！仍停留在鉴权页")
             logger.error(f"   当前URL: {current_url}")
             return False
-        
+
         # 获取用户名
         try:
-            user_elem = ctx.driver.find_element(By.XPATH, '//*[@id="app"]/div[1]/nav/div[1]/ul/div[6]/li/a/div/div/p')
-            user_name = user_elem.text.strip()
+            user_elem = ctx.page.locator(
+                '//*[@id="app"]/div[1]/nav/div[1]/ul/div[6]/li/a/div/div/p'
+            )
+            user_name = user_elem.inner_text(timeout=5000).strip()
             logger.info(f"✅ 账号登录成功: {user_name}")
         except Exception:
             logger.info("✅ 登录成功！")
-        
+
         return True
-        
-    except TimeoutException:
+
+    except PWTimeout:
         logger.error("❌ 页面加载超时！")
         logger.error("   可能原因：")
         logger.error("   1. 网络连接问题")
@@ -556,83 +524,189 @@ def do_login(ctx: RuntimeContext, username: str, password: str) -> bool:
         return False
 
 
-def read_points(ctx: RuntimeContext, wait_seconds: float = 5) -> int:
+def read_points(ctx: RuntimeContext, wait_seconds: float = 5, quiet: bool = False) -> int:
     """读取赚取积分页顶部的当前积分；读取失败返回 0（0 同时表示“未知”）。
 
     积分数值是页面异步渲染的，元素出现时文本可能还是空的，因此在
     wait_seconds 内轮询等待，避免把「尚未加载」误判成「读取失败」。
+
+    quiet=True 时不打读取失败告警：签到结果轮询里会高频调用，否则会刷屏。
     """
     deadline = time.time() + wait_seconds
     last_error = None
     while True:
         try:
-            digits = re.findall(r"\d+", ctx.driver.find_element(By.XPATH, POINTS_XPATH).text)
+            digits = re.findall(r"\d+", ctx.page.locator(POINTS_XPATH).inner_text(timeout=2000))
             if digits:
                 return int("".join(digits))
         except Exception as e:
             last_error = e
         if time.time() >= deadline:
-            if last_error is not None:
+            if last_error is not None and not quiet:
                 logger.warning(f"⚠️  积分读取失败: {last_error}")
             return 0
         time.sleep(0.5)
 
 
-def find_sign_status_element(ctx: RuntimeContext):
-    """定位「每日签到」右侧的状态元素（其下含领取奖励链接）。"""
-    row = ctx.driver.find_element(By.XPATH, SIGN_ROW_XPATH)
-    label = row.find_element(By.XPATH, './/span[contains(text(),"每日签到")]')
-    return label.find_element(By.XPATH, './following-sibling::span[1]')
+SIGN_STATE_DONE = "done"
+SIGN_STATE_CLAIMABLE = "claimable"
+SIGN_STATE_UNKNOWN = "unknown"
 
 
-def wait_sign_status(ctx: RuntimeContext, timeout: float = 10) -> str:
-    """轮询等待签到状态文本渲染出来；超时返回最后一次读到的值（可能为空）。"""
+def classify_sign_state(badge_text: str = "", modal_title: str = "", status_text: str = "") -> str:
+    """把签到页面文案归为 done / claimable / unknown 三态。
+
+    页面文案有三个来源：卡片 badge（已完成 / 去签到）、模态框标题（选择今日奖励 /
+    今日已签到）、模态框状态行（已领取 500 积分，明天再来）。任一出现「已完成」类
+    文案即视为今天已领过，避免重复提交任务被服务端拒绝。
+    """
+    combined = " ".join(p for p in (badge_text, modal_title, status_text) if p)
+    for done_text in SIGN_DONE_TEXTS:
+        if done_text in combined:
+            return SIGN_STATE_DONE
+    if "去签到" in combined or "选择今日奖励" in combined:
+        return SIGN_STATE_CLAIMABLE
+    return SIGN_STATE_UNKNOWN
+
+
+def read_text(ctx: RuntimeContext, selector: str, timeout: float = 5.0) -> str:
+    """在 timeout 内轮询读取元素文本；读不到返回空串。
+
+    页面文案由 Vue 异步渲染，元素出现时文本可能还是空的，因此轮询而不是读一次。
+    selector 是 Playwright 选择器（支持 CSS 与 // 开头的 XPath）。
+    """
     deadline = time.time() + timeout
-    last_text = ""
     while True:
         try:
-            text = find_sign_status_element(ctx).text.strip()
-            last_text = text
+            text = ctx.page.locator(selector).first.inner_text(timeout=1000).strip()
             if text:
                 return text
         except Exception:
             pass
         if time.time() >= deadline:
-            return last_text
-        time.sleep(0.5)
+            return ""
+        time.sleep(0.3)
 
 
-def wait_sign_status_until(ctx: RuntimeContext, target: str, timeout: float = 20) -> str:
-    """轮询等待签到状态变成目标文案；超时返回最后读到的值。"""
-    deadline = time.time() + timeout
-    last_text = ""
-    while True:
+def find_sign_card(ctx: RuntimeContext, timeout: float = 20.0):
+    """等待并返回签到卡片头按钮；超时抛 PWTimeout。
+
+    返回 .first 收敛到单个元素：Playwright 默认 strict mode 下，locator 命中多个
+    元素时 inner_text/click 会直接抛 Error（不是 PWTimeout），而且 click(force=True)
+    也绕不过 strict。当前页面只有一个签到卡片，但收敛后不怕将来多出同名卡片。
+    """
+    locator = ctx.page.locator(SIGN_CARD_XPATH).first
+    locator.wait_for(state="attached", timeout=int(timeout * 1000))
+    return locator
+
+
+def normalize_label(text: str) -> str:
+    """归一化页面文案用于比较：去掉所有空白（含全角空格、不换行空格）。
+
+    页面文案里的空格可能是普通空格、全角空格或 &nbsp;，直接全等比较会因一个
+    不可见字符导致整体匹配失败，因此比较前统一抹掉空白。
+    """
+    return re.sub(r"\s+", "", text or "")
+
+
+def find_reward_button(ctx: RuntimeContext, reward_name: str):
+    """按奖励名（如「500 积分」）在模态框内找奖励按钮；找不到返回 None。
+
+    比较用归一化后的文案（忽略空白差异）。用全等而非子串匹配，避免「500 积分」
+    误配到「1500 积分」这类前缀相同的选项。
+    """
+    target = normalize_label(reward_name)
+    try:
+        buttons = ctx.page.locator(SIGN_REWARD_BTN_CSS)
+        count = buttons.count()
+    except Exception:
+        return None
+    for i in range(count):
+        btn = buttons.nth(i)
         try:
-            text = find_sign_status_element(ctx).text.strip()
-            if text:
-                last_text = text
-                if text == target:
-                    return text
+            amount = btn.locator(SIGN_REWARD_AMOUNT_CSS).inner_text(timeout=1000)
+        except Exception:
+            continue
+        if normalize_label(amount) == target:
+            return btn
+    return None
+
+
+def wait_sign_result(ctx: RuntimeContext, result: AccountResult, timeout: float = 90.0,
+                     quiet_seconds: float = 25.0) -> bool:
+    """轮询签到结果，任一条件命中即判定成功。timeout 是包含静默期在内的总时长。
+
+    签到要过 Cap 人机验证：4 个 HashWX PoW + 一段 instrumentation 环境采集。
+    后者的 finalize 超时是前端硬编码的 20 秒，而采集脚本要跑 WASM 编译探测、
+    指纹采集等重活——如果此时我们还在高频读 DOM，容器 CPU 会被抢走导致
+    `instr_timeout`。因此开头 quiet_seconds 内完全不碰页面，让 Cap 安心跑完。
+
+    判定依据按可靠性排序：模态框状态行出现「已领取」→ 卡片 badge 变「已完成」→
+    积分比签到前增加。
+    """
+    deadline = time.time() + timeout
+
+    # 静默期：只睡不查，把 CPU 全让给 Cap 的 PoW 与采集脚本
+    time.sleep(min(quiet_seconds, timeout))
+
+    last_status = ""
+    while True:
+        status_text = read_text(ctx, SIGN_MODAL_STATUS_CSS, 0.5)
+        if status_text:
+            last_status = status_text
+            if classify_sign_state(status_text=status_text) == SIGN_STATE_DONE:
+                logger.info(f"📌 签到状态: {status_text}")
+                return True
+
+        # 模态框可能已自动关闭，改看卡片 badge
+        try:
+            card_text = ctx.page.locator(SIGN_CARD_XPATH).first.inner_text(timeout=1000).strip()
+            if classify_sign_state(badge_text=card_text) == SIGN_STATE_DONE:
+                logger.info(f"📌 签到卡片: {card_text}")
+                return True
         except Exception:
             pass
+
+        # 积分增加兜底：领 500 积分时最直接的成功证据
+        if result.points_before > 0:
+            current = read_points(ctx, wait_seconds=0.5, quiet=True)
+            if current > result.points_before:
+                logger.info(f"📌 积分已增加（{result.points_before} → {current}）")
+                return True
+
         if time.time() >= deadline:
-            return last_text
-        time.sleep(0.5)
+            logger.info(f"📌 最后读到的签到状态: {last_status or '未读取到'}")
+            return False
+        time.sleep(1.5)
 
 
 def do_sign_in(ctx: RuntimeContext, result: AccountResult) -> bool:
-    """执行签到，并把页面积分回填到 result（未配置 API Key 时的积分来源）。"""
+    """执行签到，并把页面积分回填到 result（未配置 API Key 时的积分来源）。
+
+    雨云签到页改版后的流程：点「每日签到」卡片头打开模态框 → 在「500 积分」和
+    「抽奖券 × 1」里二选一 → 提交时强制过 Cap 人机验证（PoW，页面自动求解）。
+
+    失败时把具体原因写入 result.error_msg，让通知与退出码汇总能区分失败类型
+    （只写「签到失败」无法定位是页面改版还是人机验证被拦）。
+    """
+    def fail(reason: str) -> bool:
+        result.error_msg = reason
+        logger.error(f"❌ {reason}")
+        return False
+
     try:
         logger.info("=" * 60)
         logger.info(f"🌐 访问赚取积分页: {EARN_URL}")
-        ctx.driver.get(EARN_URL)
-        ctx.driver.implicitly_wait(5)
+        # Playwright 没有隐式等待概念，所有等待都是显式 timeout，轮询节奏可控
+        ctx.page.goto(EARN_URL, wait_until="domcontentloaded", timeout=45000)
+        # 接口记录器必须在当前文档上注入（不能进 init script，否则污染 Cap 的采集帧）
+        inject_api_recorder(ctx.page)
 
-        logger.info(f"   当前页面URL: {ctx.driver.current_url}")
-        logger.info(f"   当前页面标题: {ctx.driver.title}")
+        logger.info(f"   当前页面URL: {ctx.page.url}")
+        logger.info(f"   当前页面标题: {ctx.page.title()}")
 
         # 签到前积分：API 未提供（未配置 Key 或取数失败）时用页面值兜底，
-        # 通知里才能算出「本次获得」
+        # 通知里才能算出「本次获得」，同时作为签到成功的兜底证据
         if result.points_before == 0:
             page_points = read_points(ctx)
             if page_points > 0:
@@ -642,78 +716,123 @@ def do_sign_in(ctx: RuntimeContext, result: AccountResult) -> bool:
                     f"（约 {page_points / ctx.config['points_to_cny_rate']:.2f} 元）"
                 )
 
-        # 查找签到按钮
-        logger.info("🔍 查找每日签到按钮...")
+        logger.info("🔍 查找每日签到卡片...")
         try:
-            status_text = wait_sign_status(ctx, 10)
-            if not status_text:
-                logger.error("❌ 未能读取签到状态（页面可能未加载完成）")
-                return False
+            card = find_sign_card(ctx)
+        except PWTimeout:
+            return fail("未找到每日签到卡片（页面结构可能再次改版）")
 
-            logger.info(f"📌 签到状态: {status_text}")
-
-            if status_text == SIGN_STATUS_DONE:
-                logger.info("📌 今日已签到，无需重复签到")
-                return True
-            if status_text != SIGN_STATUS_CLAIM:
-                logger.error(f"❌ 签到状态为「{status_text}」，当前不可领取")
-                return False
-
-            earn_btn = find_sign_status_element(ctx).find_element(By.XPATH, './a')
-            logger.info("🎯 开始领取签到奖励")
-            earn_btn.click()
-
-            # 签到验证码不是每次都会出现：先短等待 iframe 可见，出现才处理
-            time.sleep(2)
-            from captcha import process_captcha
-            try:
-                WebDriverWait(ctx.driver, 8).until(
-                    EC.visibility_of_element_located((By.ID, "tcaptcha_iframe_dy"))
-                )
-                ctx.driver.switch_to.frame("tcaptcha_iframe_dy")
-                logger.info("⚠️  触发签到验证码")
-                if not process_captcha(ctx, ctx.config):
-                    logger.error("❌ 签到验证码处理失败")
-                    return False
-                ctx.driver.switch_to.default_content()
-            except TimeoutException:
-                logger.info("✅ 未触发签到验证码，继续检查签到结果")
-
-            # 只有状态变成「已完成」（或积分增加）才算签到成功，避免假成功上报
-            logger.info("⏳ 等待签到结果...")
-            final_status = wait_sign_status_until(ctx, SIGN_STATUS_DONE, 20)
-            logger.info(f"📌 签到后状态: {final_status or '未读取到'}")
-            if final_status == SIGN_STATUS_DONE:
-                logger.info("✅ 签到奖励领取成功")
-            else:
-                current_points = read_points(ctx, wait_seconds=3)
-                if result.points_before > 0 and current_points > result.points_before:
-                    logger.info(
-                        f"✅ 积分已增加（{result.points_before} → {current_points}），判定签到成功"
-                    )
-                else:
-                    logger.error("❌ 未能确认签到结果，本次按失败处理")
-                    return False
-
+        card_text = card.inner_text(timeout=5000).strip()
+        logger.info(f"📌 签到卡片文案: {card_text}")
+        if classify_sign_state(badge_text=card_text) == SIGN_STATE_DONE:
+            logger.info("📌 今日已签到，无需重复签到")
             return True
 
-        except (TimeoutException, NoSuchElementException):
-            logger.error("❌ 未找到签到按钮")
-            return False
+        logger.info("🖱️  点击签到卡片，打开签到弹窗")
+        try:
+            card.click(timeout=10000)
+        except Exception:
+            # 卡片头可能被浮层遮挡，force 穿透遮罩再点
+            card.click(force=True, timeout=10000)
+
+        # 先等弹窗容器出现再读标题：今日已签时弹窗不渲染奖励列表，
+        # 直接等 rewards 会把「已签」误判成「弹窗没打开」
+        try:
+            ctx.page.locator(SIGN_MODAL_CSS).first.wait_for(state="attached", timeout=10000)
+        except PWTimeout:
+            return fail("签到弹窗未打开")
+
+        modal_title = read_text(ctx, SIGN_MODAL_TITLE_CSS, 5)
+        logger.info(f"📌 签到弹窗标题: {modal_title or '未读取到'}")
+        if classify_sign_state(modal_title=modal_title) == SIGN_STATE_DONE:
+            logger.info("📌 今日已签到，无需重复签到")
+            return True
+
+        try:
+            ctx.page.locator(SIGN_REWARDS_CSS).first.wait_for(state="attached", timeout=10000)
+        except PWTimeout:
+            return fail("签到弹窗内未出现奖励选项")
+
+        reward_btn = find_reward_button(ctx, SIGN_REWARD_DEFAULT)
+        if reward_btn is None:
+            return fail(f"签到弹窗内未找到奖励「{SIGN_REWARD_DEFAULT}」")
+
+        # Cap 的 instrumentation 采集有前端硬编码 20 秒 finalize 超时，容器里
+        # 偶发跑不完（instr_timeout）。失败后重新点一次相当于重新发起挑战，
+        # 第二次通常能过——所以这里给两次机会。
+        max_attempts = 2
+        for attempt in range(1, max_attempts + 1):
+            # 每轮重读按钮状态：重试前页面已刷新，旧状态不再可信
+            btn_disabled = _is_element_disabled(reward_btn)
+            try:
+                btn_classes = (reward_btn.get_attribute("class") or "").strip()
+            except Exception:
+                btn_classes = ""
+            logger.info(
+                f"🎯 选择奖励: {SIGN_REWARD_DEFAULT}"
+                f"（disabled={btn_disabled}, class={btn_classes or '无'}）"
+            )
+            logger.info(
+                f"🖱️  点击奖励按钮"
+                f"（第 {attempt}/{max_attempts} 次，提交时页面会自动完成人机验证）"
+            )
+            try:
+                human_like_click(ctx.page, reward_btn)
+            except Exception as e:
+                logger.warning(f"⚠️  拟人点击失败({e})，回退普通点击")
+                try:
+                    reward_btn.click(timeout=10000)
+                except Exception:
+                    reward_btn.click(force=True, timeout=10000)
+
+            logger.info("⏳ 等待签到结果（含 25 秒静默期，总计最长 90 秒）...")
+            if wait_sign_result(ctx, result, timeout=90):
+                logger.info("✅ 签到奖励领取成功")
+                return True
+
+            _log_sign_api_result(ctx)
+            _log_browser_console(ctx)
+
+            if attempt < max_attempts:
+                # 刷新页面重新拉挑战，避免复用已超时的 Cap 会话
+                logger.warning("⚠️  本次未成功，刷新页面后重试一次")
+                try:
+                    ctx.page.goto(EARN_URL, wait_until="domcontentloaded", timeout=45000)
+                    inject_api_recorder(ctx.page)
+                    ctx.page.wait_for_timeout(3000)
+                    card = find_sign_card(ctx)
+                    if classify_sign_state(badge_text=card.inner_text(timeout=5000)) == SIGN_STATE_DONE:
+                        logger.info("📌 重试前检测到今日已签到")
+                        return True
+                    try:
+                        card.click(timeout=10000)
+                    except Exception:
+                        card.click(force=True, timeout=10000)
+                    # 先等弹窗容器，再确认不是「今日已签到」
+                    ctx.page.locator(SIGN_MODAL_CSS).first.wait_for(state="attached", timeout=10000)
+                    retry_title = read_text(ctx, SIGN_MODAL_TITLE_CSS, 5)
+                    if classify_sign_state(modal_title=retry_title) == SIGN_STATE_DONE:
+                        logger.info("📌 重试前检测到今日已签到")
+                        return True
+                    ctx.page.locator(SIGN_REWARDS_CSS).first.wait_for(state="attached", timeout=10000)
+                    reward_btn = find_reward_button(ctx, SIGN_REWARD_DEFAULT)
+                    if reward_btn is None:
+                        return fail(f"重试时未找到奖励「{SIGN_REWARD_DEFAULT}」")
+                except Exception as e:
+                    logger.warning(f"⚠️  重试准备失败: {e}")
+                    break
+
+        return fail("未能确认签到结果（人机验证超时或提交失败）")
 
     except Exception as e:
+        result.error_msg = f"签到异常: {e}"
         logger.error(f"❌ 签到异常: {e}", exc_info=True)
         return False
 
     finally:
-        # 验证码失败时可能仍停留在 iframe 内，先切回主文档再读积分
-        try:
-            ctx.driver.switch_to.default_content()
-        except Exception:
-            pass
         # 无论签到成功还是中途失败，只要登录态还在就刷新一次积分，
         # 保证通知里能看到账号当前余额（API Key 有值时后续以 API 值为准）
-        page_points = read_points(ctx)
+        page_points = read_points(ctx, quiet=True)
         if page_points > 0 and result.points_after == 0:
             result.points_after = page_points
 
@@ -753,7 +872,7 @@ def sign_in_rainyun(account: Account, config: dict) -> AccountResult:
         账号执行结果
     """
     result = AccountResult(username=account.username)
-    driver = None
+    session = None
     temp_dir = None
     
     try:
@@ -771,23 +890,26 @@ def sign_in_rainyun(account: Account, config: dict) -> AccountResult:
         logger.info("🔧 初始化 ddddocr 检测库")
         det = ddddocr.DdddOcr(det=True, show_ad=False)
         logger.info("✅ ddddocr 初始化成功")
-        
-        driver = init_selenium(config)
-        inject_stealth_js(driver, config)
-        wait = WebDriverWait(driver, config["timeout"])
-        
+
+        logger.info("🔧 启动 Playwright 浏览器（有头 + Xvfb）")
+        session = browser_layer.init_browser(config)
+        logger.info(f"✅ 浏览器已启动（{session.binary}）")
+
         # 创建临时目录
         temp_dir = tempfile.mkdtemp(prefix="rainyun-")
         logger.info(f"📁 临时目录: {temp_dir}")
-        
+
         # 构建上下文
         ctx = RuntimeContext(
-            driver=driver,
-            wait=wait,
+            session=session,
             det=det,
             temp_dir=temp_dir,
-            config=config
+            config=config,
         )
+        # console 监听必须在首个 goto 之前挂上，否则丢早期日志
+        browser_layer.attach_console_logger(ctx.page, ctx.console_logs)
+        # 网络失败监听同样要在导航前挂上，用于定位 4xx/5xx 来源
+        browser_layer.attach_network_logger(ctx.page, ctx.net_logs)
         
         # 记录签到前积分
         if account.api_key:
@@ -819,8 +941,9 @@ def sign_in_rainyun(account: Account, config: dict) -> AccountResult:
         # 执行签到
         result.sign_in_success = do_sign_in(ctx, result)
         if not result.sign_in_success:
-            result.error_msg = "签到失败"
-            logger.error("❌ 签到失败")
+            # do_sign_in 已写入具体失败原因，这里只在缺失时兜底，不覆盖
+            result.error_msg = result.error_msg or "签到失败"
+            logger.error(f"❌ 签到失败: {result.error_msg}")
             if result.points_after > 0:
                 logger.info(
                     f"💰 当前积分: {result.points_after} "
@@ -866,10 +989,10 @@ def sign_in_rainyun(account: Account, config: dict) -> AccountResult:
         
     finally:
         # 清理资源
-        if driver:
+        if session:
             try:
-                driver.quit()
-                logger.info(f"🔒 浏览器已关闭")
+                session.close()
+                logger.info("🔒 浏览器已关闭")
             except Exception as e:
                 logger.warning(f"⚠️  关闭浏览器失败: {e}")
         
@@ -1032,6 +1155,23 @@ def main():
     
     # 发送通知
     send_notification("雨云签到任务完成", summary_report)
+
+    # 退出码决定青龙面板显示成功还是失败：任一账号失败即返回非 0，
+    # 避免「全失败仍显示绿色成功」掩盖问题；账号列表为空同样算失败，
+    # 否则配置写错（如 RAINYUN_ACCOUNT=[]）也会显示绿色
+    failed = [r for r in all_results if not r.is_success()]
+    if not all_results:
+        logger.error("=" * 80)
+        logger.error("❌ 任务失败：未解析到任何账号，请检查 RAINYUN_ACCOUNT 配置")
+        logger.error("=" * 80)
+        sys.exit(1)
+    if failed:
+        logger.error("=" * 80)
+        logger.error(f"❌ 任务失败：{len(failed)}/{len(all_results)} 个账号未签到成功")
+        for r in failed:
+            logger.error(f"   - {r.username}: {r.error_msg or '未知原因'}")
+        logger.error("=" * 80)
+        sys.exit(1)
 
 
 if __name__ == "__main__":
